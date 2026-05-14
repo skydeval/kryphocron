@@ -9,20 +9,65 @@
 //! channel's sink takes a class-specific event enum.
 //!
 //! §6 commits the audit *vocabulary* — the concrete Rust enum
-//! shapes that flow through the pipeline. See
-//! [`crate::audit::UserAuditEvent`],
-//! [`crate::audit::ChannelAuditEvent`],
-//! [`crate::audit::SubstrateAuditEvent`],
-//! [`crate::audit::ModerationAuditEvent`], and
-//! [`crate::audit::FallbackAuditEvent`] for the per-channel
-//! variant catalogs; the §6.1 cross-cutting rules (`trace_id` /
-//! `at` / [`crate::TargetRepresentation`]) apply uniformly
-//! across all five. The
-//! [`crate::audit::UserAuditEvent`] rustdoc carries the §6.8
-//! ordering tiers and §6.9 schema-evolution discipline as the
-//! operator-facing source of truth.
+//! shapes that flow through the pipeline. The four channel
+//! enums plus fallback and inspection-notification:
 //!
-//! # Relationship between [`crate::audit::EVENT_SCHEMA_VERSION`] and the crate
+//! - [`crate::audit::UserAuditEvent`] (§6.2)
+//! - [`crate::audit::ChannelAuditEvent`] (§6.3)
+//! - [`crate::audit::SubstrateAuditEvent`] (§6.4)
+//! - [`crate::audit::ModerationAuditEvent`] (§6.5)
+//! - [`crate::audit::FallbackAuditEvent`] (§6.6)
+//! - [`crate::authority::InspectionNotification`] (§6.7)
+//!
+//! # §6.1 cross-cutting commitments
+//!
+//! Three discipline rules apply uniformly to every variant in
+//! every channel:
+//!
+//! - **Every event carries `trace_id: TraceId`.** The
+//!   [`TraceId`](crate::identity::TraceId) is the cross-channel
+//!   correlation key. A capability bind that emits to the user
+//!   channel may correlate with a substrate-class
+//!   [`crate::audit::SubstrateAuditEvent::DeprecatedWriteDuringGrace`], a
+//!   [`crate::audit::UserAuditEvent::CompositeRollbackMarker`], or an
+//!   [`crate::authority::InspectionNotification`] — all of which
+//!   share the originating operation's `trace_id`.
+//! - **Every event carries `at: SystemTime`.** The wallclock
+//!   timestamp at audit-event *emission*, not at the moment the
+//!   underlying action started. Cross-process correlation depends
+//!   on operator clock-discipline (NTP), which the substrate does
+//!   not enforce.
+//! - **Subject references use [`crate::TargetRepresentation`].**
+//!   Operators reading audit logs at routine privilege see the
+//!   structural layer only; forensic detail requires the
+//!   segregated audit-encryption key (§4.4 / §8.2). When no
+//!   encryption resolver is installed (v1 default per §8.5), the
+//!   sensitive layer is `None`.
+//!
+//! # §6.8 ordering and clock-domain reference
+//!
+//! `trace_id` provides set-membership across channels, **not**
+//! ordering. The three guarantee tiers:
+//!
+//! - **Within a channel:** events appear at the sink in emission
+//!   order. Each per-class buffer is a single FIFO (§4.9).
+//! - **Across channels within a substrate process:** no ordering
+//!   guarantee. The four sink traits are independent, with
+//!   independent buffer partitions and operator-implemented
+//!   backends. Two events from a single bind that emit to two
+//!   different channels arrive at the respective sinks in
+//!   nondeterministic order.
+//! - **Across substrate processes:** operator-managed via NTP.
+//!   The substrate does not enforce clock discipline.
+//!
+//! Some cross-channel pairs have a semantically-recoverable order
+//! (e.g., a `CapabilityBound` for a grace-window write was emitted
+//! *before* the `DeprecatedWriteDuringGrace` partner per §4.3's
+//! pipeline order). Operators rely on this only when they have
+//! substrate-knowledge of which event is causally first; it is
+//! not recoverable from event content alone.
+//!
+//! # §6.9 schema-evolution discipline
 //!
 //! [`crate::audit::EVENT_SCHEMA_VERSION`] tracks the audit-event vocabulary on
 //! a separate cadence from the crate version per §6.9. The two
@@ -31,10 +76,10 @@
 //! - **Schema-major bump** (variant removed, field type changed,
 //!   semantics altered) **always coincides** with a crate-major
 //!   bump because audit events are part of the public API.
-//! - **The converse is not true:** a crate-major bump for
-//!   reasons unrelated to audit events (§4.8 wire reshape, §5
-//!   lexicon strategy, build-system changes) leaves
-//!   `EVENT_SCHEMA_VERSION` unchanged.
+//! - **The converse is not true:** a crate-major bump for reasons
+//!   unrelated to audit events (§4.8 wire reshape, §5 lexicon
+//!   strategy, build-system changes) leaves
+//!   [`crate::audit::EVENT_SCHEMA_VERSION`] unchanged.
 //! - **Schema-minor bump** (new variant on a `#[non_exhaustive]`
 //!   enum, new field on an existing variant) may coincide with
 //!   any crate-version bump.
