@@ -111,11 +111,28 @@ pub struct PublicKey {
 /// Operators federating with broader ATProto ecosystems opt into
 /// ECDSA variants explicitly via
 /// [`crate::verification::JwtVerificationConfig::accepted_algorithms`].
+///
+/// `Es256` and `Es256K` are recognized by the JWT parser and the
+/// allowlist mechanism but Phase 4a does not ship the underlying
+/// signature primitives — operators configuring them in
+/// `accepted_algorithms` will see verification fail with
+/// [`crate::verification::JwtVerificationError::UnsupportedAlgorithm`]
+/// at the signature-dispatch step. A later sub-phase will add the
+/// `p256` / `k256` crate dependencies; chainlinks track the work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SignatureAlgorithm {
-    /// Ed25519 (EdDSA over Curve25519). v1 default.
+    /// Ed25519 (EdDSA over Curve25519). v1 default. JWT `alg`
+    /// header value: `"EdDSA"` (RFC 8037).
     Ed25519,
+    /// ECDSA over the NIST P-256 curve. JWT `alg` header value:
+    /// `"ES256"`. Phase 4a recognizes the variant; signature
+    /// verification stubs with `UnsupportedAlgorithm`.
+    Es256,
+    /// ECDSA over the secp256k1 curve. JWT `alg` header value:
+    /// `"ES256K"`. Phase 4a recognizes the variant; signature
+    /// verification stubs with `UnsupportedAlgorithm`.
+    Es256K,
 }
 
 /// Substrate-internal service principal identity (§4.8).
