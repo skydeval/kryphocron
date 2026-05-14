@@ -294,6 +294,18 @@ impl<'a> PredicateContext<'a> {
 /// pipeline after the block / audience / mute oracle
 /// consultations have already executed and their results are
 /// presented as the typed [`UserCapability::OracleResults`].
+///
+/// `required_jwt_scope` (Phase 4a, §7.2) declares the optional
+/// JWT scope string an operator-issued token must include for
+/// the issuance chokepoint to admit this capability. The default
+/// implementation returns `None` — Phase 1's v1 capabilities
+/// inherit the no-scope-required default. Operators wiring
+/// per-capability scope policies override it; mismatch produces
+/// [`crate::AuthDenial::ScopeMismatch`] which the bind path
+/// surfaces as
+/// [`BindOutcomeRepr::DeniedAtPipeline`]`{ stage:
+/// PipelineStage::JwtScope, reason:
+/// DenialReason::JwtScopeInsufficient }`.
 pub trait IssuancePolicy: UserCapability {
     /// Apply the capability-specific check.
     fn capability_predicate(
@@ -301,6 +313,19 @@ pub trait IssuancePolicy: UserCapability {
         target: &<Self as UserCapability>::Subject,
         oracle_results: &<Self as UserCapability>::OracleResults,
     ) -> Result<(), DenialReason>;
+
+    /// Optional JWT-scope requirement (§7.2). `None` means the
+    /// JWT-scope check is bypassed; `Some(s)` means the
+    /// capability is issued only when the verified JWT's
+    /// `JwtScope::scopes` contains `s`.
+    ///
+    /// The crate ships no scope vocabulary; operators define
+    /// their own scope strings (typically NSID-shaped, e.g.,
+    /// `"com.atproto.repo.createRecord"` or
+    /// `"tools.kryphocron.admin.takedown"`).
+    fn required_jwt_scope() -> Option<&'static str> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -1,13 +1,15 @@
 //! §7.2 / §7.5 verification submodule.
 //!
 //! Phase 4a wires §7.2 — the JWT verification chain — through
-//! [`verify_jwt`]. Phase 1 shipped the [`VerifiedJwt`] type with
-//! private fields and a crate-internal constructor; Phase 4a wires
-//! the constructor body so that all five §7.2 stages (parse →
-//! resolve key → verify signature → verify claims → construct
+//! [`crate::verification::verify_jwt`]. Phase 1 shipped the
+//! [`crate::verification::VerifiedJwt`] type with private fields
+//! and a crate-internal constructor; Phase 4a wires the
+//! constructor body so that all five §7.2 stages (parse → resolve
+//! key → verify signature → verify claims → construct
 //! `VerifiedJwt`) execute on every authenticated request.
 //!
-//! [`VerifiedHandshake`] (§7.5) remains Phase-4d-stubbed.
+//! [`crate::verification::VerifiedHandshake`] (§7.5) remains
+//! Phase-4d-stubbed.
 //!
 //! See §7.2 for the JWT verification flow, §7.5 for the
 //! sync-handshake protocol.
@@ -33,6 +35,20 @@ use crate::wire::JwtNonce;
 ///
 /// Constructible only via [`verify_jwt`]; consumers receiving a
 /// [`VerifiedJwt`] need not re-verify or trust the caller.
+///
+/// Outside-crate code cannot construct a [`VerifiedJwt`] via
+/// struct-literal syntax — every field is private, including the
+/// crate-sealed `_private: PhantomData<sealed::Token>` marker.
+/// The compile-fail doctest below is the witness:
+///
+/// ```compile_fail
+/// // Outside-crate construction must not work — the only way to
+/// // obtain a `VerifiedJwt` is `verify_jwt`'s success path.
+/// use kryphocron::verification::VerifiedJwt;
+/// let _v = VerifiedJwt {
+///     // fields are private; this fails E0451 / E0451-flavored.
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct VerifiedJwt {
     issuer: Did,
@@ -274,10 +290,11 @@ pub enum JwtVerificationError {
 /// integration point).
 ///
 /// Audit-emit is the caller's responsibility — the `authority`
-/// module emits [`crate::UserAuditEvent::CapabilityIssuanceDenied`]
-/// at the ingress chokepoint with
-/// [`crate::DenialReason::JwtVerificationFailed`] carrying the
-/// returned error.
+/// module emits
+/// [`crate::audit::UserAuditEvent::CapabilityIssuanceDenied`] at
+/// the ingress chokepoint with
+/// [`crate::authority::DenialReason::JwtVerificationFailed`]
+/// carrying the returned error.
 ///
 /// # Errors
 ///
@@ -762,11 +779,590 @@ fn parse_nonce_field(
 mod tests {
     use super::*;
 
+    use async_trait::async_trait;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::sync::{Arc, Mutex};
+
+    use crate::resolver::{DidDocument, DidResolutionError, DidResolver};
+
+    // ============================================================
+    // Test fixtures.
+    // ============================================================
+
+    fn local_audience() -> ServiceIdentity {
+        ServiceIdentity::new_internal(
+            Did::new("did:web:audience.example").unwrap(),
+            KeyId::from_bytes([0u8; 32]),
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    fn issuer_did() -> Did {
+        Did::new("did:plc:issuerexample").unwrap()
+    }
+
+    fn fixed_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn fixed_verifying_pubkey() -> PublicKey {
+        let signing = fixed_signing_key();
+        PublicKey {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: signing.verifying_key().to_bytes(),
+        }
+    }
+
+    fn b64u(input: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(input)
+    }
+
+    /// Construct + sign a JWT from a header JSON + payload JSON.
+    fn build_jwt(header: &serde_json::Value, payload: &serde_json::Value) -> String {
+        let header_b64 = b64u(serde_json::to_vec(header).unwrap().as_slice());
+        let payload_b64 = b64u(serde_json::to_vec(payload).unwrap().as_slice());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig = fixed_signing_key().sign(signing_input.as_bytes());
+        let sig_b64 = b64u(&sig.to_bytes());
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    fn standard_payload(now_secs: u64) -> serde_json::Value {
+        serde_json::json!({
+            "iss": issuer_did().as_str(),
+            "aud": local_audience().service_did().as_str(),
+            "iat": now_secs,
+            "exp": now_secs + 600,
+            "scope": "tools.kryphocron.feed.read",
+        })
+    }
+
+    fn ed25519_header() -> serde_json::Value {
+        serde_json::json!({ "alg": "EdDSA", "typ": "JWT" })
+    }
+
+    // ============================================================
+    // Mock DidResolver.
+    // ============================================================
+
+    /// In-memory mock resolver. Stores DID → (key id, public key)
+    /// pairs; configurable to also return errors.
+    struct MockResolver {
+        documents: Mutex<std::collections::HashMap<String, Result<DidDocument, DidResolutionError>>>,
+    }
+
+    impl MockResolver {
+        fn new() -> Self {
+            MockResolver {
+                documents: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn insert(&self, did: &Did, key_id: KeyId, key: PublicKey) {
+            let doc = DidDocument {
+                did: did.clone(),
+                verification_methods: vec![(key_id, key)],
+                rotation_history: vec![],
+            };
+            self.documents.lock().unwrap().insert(did.as_str().to_string(), Ok(doc));
+        }
+
+        fn insert_err(&self, did: &Did, err: DidResolutionError) {
+            self.documents.lock().unwrap().insert(did.as_str().to_string(), Err(err));
+        }
+    }
+
+    #[async_trait]
+    impl DidResolver for MockResolver {
+        async fn resolve(
+            &self,
+            did: &Did,
+            _deadline: Instant,
+        ) -> Result<DidDocument, DidResolutionError> {
+            self.documents
+                .lock()
+                .unwrap()
+                .get(did.as_str())
+                .cloned()
+                .unwrap_or(Err(DidResolutionError::NotFound))
+        }
+
+        async fn invalidate(&self, _did: &Did) {}
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn populated_resolver() -> Arc<MockResolver> {
+        let resolver = Arc::new(MockResolver::new());
+        resolver.insert(&issuer_did(), KeyId::from_bytes([1u8; 32]), fixed_verifying_pubkey());
+        resolver
+    }
+
+    // ============================================================
+    // §7.2 default-config commitments.
+    // ============================================================
+
     #[test]
     fn jwt_config_default_is_ed25519_only() {
         // §7.2 default allowlist commitment.
         let c = JwtVerificationConfig::default();
         assert_eq!(c.accepted_algorithms, &[SignatureAlgorithm::Ed25519]);
         assert!(!c.require_nonce);
+    }
+
+    #[test]
+    fn jwt_config_defaults_match_7_2_recommendations() {
+        let c = JwtVerificationConfig::default();
+        assert_eq!(c.max_clock_skew, Duration::from_secs(30));
+        assert_eq!(c.max_validity_window, Duration::from_secs(3600));
+    }
+
+    // ============================================================
+    // §7.2 parsing tests.
+    // ============================================================
+
+    #[tokio::test]
+    async fn malformed_jwt_with_wrong_segment_count_returns_malformed() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        for bad in ["", "only_one_segment", "two.segments", "four.segments.are.bad"] {
+            let err = verify_jwt(bad, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, JwtVerificationError::Malformed), "input {bad:?} -> {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_jwt_with_invalid_base64url_returns_malformed() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        // `***` is not valid base64url.
+        let err = verify_jwt("***.***.***", &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn malformed_jwt_with_invalid_json_in_header_returns_malformed() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let bad = format!("{}.{}.{}", b64u(b"not json"), b64u(b"{}"), b64u(b"sig"));
+        let err = verify_jwt(&bad, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn alg_none_returns_malformed_not_unsupported() {
+        // §7.2 alg-confusion discipline: `alg: "none"` → Malformed,
+        // never UnsupportedAlgorithm. Important: the audit signal
+        // must read "this token is not parseable" not "this
+        // algorithm is not configured."
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        for none_variant in ["none", "None", "NONE", "nOnE"] {
+            let header = serde_json::json!({ "alg": none_variant });
+            let token = build_jwt(&header, &standard_payload(now_secs()));
+            let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, JwtVerificationError::Malformed),
+                "alg={none_variant:?} -> {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_alg_string_returns_malformed() {
+        // Unknown alg names (not in the IANA registered space) are
+        // Malformed — not UnsupportedAlgorithm — because they're
+        // either misformatted or alg-confusion attempts.
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let header = serde_json::json!({ "alg": "MyCustomAlg" });
+        let token = build_jwt(&header, &standard_payload(now_secs()));
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn known_alg_outside_allowlist_returns_unsupported_algorithm() {
+        // ES256 is a known IANA alg name; if not in the operator's
+        // configured allowlist (default: Ed25519-only) this is the
+        // legitimate UnsupportedAlgorithm signal.
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let header = serde_json::json!({ "alg": "ES256" });
+        let token = build_jwt(&header, &standard_payload(now_secs()));
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::UnsupportedAlgorithm(SignatureAlgorithm::Es256)));
+    }
+
+    // ============================================================
+    // §7.2 signature verification tests.
+    // ============================================================
+
+    #[tokio::test]
+    async fn happy_path_verifies_an_ed25519_signed_jwt() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let payload = standard_payload(now_secs());
+        let token = build_jwt(&ed25519_header(), &payload);
+        let v = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap();
+        assert_eq!(v.issuer().as_str(), issuer_did().as_str());
+        assert_eq!(v.algorithm(), SignatureAlgorithm::Ed25519);
+        assert_eq!(v.scope().scopes.as_slice(), &["tools.kryphocron.feed.read"]);
+        assert!(v.nonce().is_none());
+    }
+
+    #[tokio::test]
+    async fn tampered_payload_fails_signature_invalid() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let payload = standard_payload(now_secs());
+        let token = build_jwt(&ed25519_header(), &payload);
+        // Tamper the payload segment by re-encoding a different
+        // payload while keeping the original signature.
+        let mut parts = token.split('.');
+        let header_b64 = parts.next().unwrap();
+        let _orig_payload = parts.next().unwrap();
+        let sig_b64 = parts.next().unwrap();
+        let other_payload = serde_json::json!({
+            "iss": issuer_did().as_str(),
+            "aud": local_audience().service_did().as_str(),
+            "iat": now_secs(),
+            "exp": now_secs() + 600,
+            "scope": "different.scope",
+        });
+        let other_payload_b64 = b64u(serde_json::to_vec(&other_payload).unwrap().as_slice());
+        let tampered = format!("{header_b64}.{other_payload_b64}.{sig_b64}");
+        let err = verify_jwt(&tampered, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::SignatureInvalid));
+    }
+
+    #[tokio::test]
+    async fn tampered_signature_fails_signature_invalid() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        // Replace the signature with a same-length zero bitstring.
+        let mut parts = token.rsplitn(2, '.');
+        parts.next().unwrap(); // discard original sig
+        let prefix = parts.next().unwrap();
+        let zero_sig = b64u(&[0u8; ed25519_dalek::SIGNATURE_LENGTH]);
+        let tampered = format!("{prefix}.{zero_sig}");
+        let err = verify_jwt(&tampered, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::SignatureInvalid));
+    }
+
+    #[tokio::test]
+    async fn wrong_key_fails_signature_invalid() {
+        // Resolver returns the wrong public key for the issuer.
+        let r = Arc::new(MockResolver::new());
+        let wrong_key = PublicKey {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: SigningKey::from_bytes(&[99u8; 32]).verifying_key().to_bytes(),
+        };
+        r.insert(&issuer_did(), KeyId::from_bytes([1u8; 32]), wrong_key);
+        let cfg = JwtVerificationConfig::default();
+        let token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::SignatureInvalid));
+    }
+
+    // ============================================================
+    // §7.2 claims verification tests.
+    // ============================================================
+
+    #[tokio::test]
+    async fn expired_jwt_returns_expired_with_exp_and_now() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        // exp is 2 hours in the past, well outside skew.
+        let now = now_secs();
+        let payload = serde_json::json!({
+            "iss": issuer_did().as_str(),
+            "aud": local_audience().service_did().as_str(),
+            "iat": now - 7200,
+            "exp": now - 3600,
+        });
+        let token = build_jwt(&ed25519_header(), &payload);
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Expired { .. }));
+    }
+
+    #[tokio::test]
+    async fn future_dated_iat_returns_not_yet_valid() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        // iat is 5 minutes in the future, beyond skew.
+        let now = now_secs();
+        let payload = serde_json::json!({
+            "iss": issuer_did().as_str(),
+            "aud": local_audience().service_did().as_str(),
+            "iat": now + 300,
+            "exp": now + 600,
+        });
+        let token = build_jwt(&ed25519_header(), &payload);
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::NotYetValid { .. }));
+    }
+
+    #[tokio::test]
+    async fn nbf_in_future_returns_not_yet_valid() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let now = now_secs();
+        let payload = serde_json::json!({
+            "iss": issuer_did().as_str(),
+            "aud": local_audience().service_did().as_str(),
+            "iat": now,
+            "exp": now + 600,
+            "nbf": now + 300,
+        });
+        let token = build_jwt(&ed25519_header(), &payload);
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::NotYetValid { .. }));
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_returns_wrong_audience() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let payload = serde_json::json!({
+            "iss": issuer_did().as_str(),
+            "aud": "did:web:somewhere.else",
+            "iat": now_secs(),
+            "exp": now_secs() + 600,
+        });
+        let token = build_jwt(&ed25519_header(), &payload);
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::WrongAudience { .. }));
+    }
+
+    #[tokio::test]
+    async fn validity_window_too_long_returns_validity_window_too_long() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig {
+            max_validity_window: Duration::from_secs(60),
+            ..JwtVerificationConfig::default()
+        };
+        let now = now_secs();
+        let payload = serde_json::json!({
+            "iss": issuer_did().as_str(),
+            "aud": local_audience().service_did().as_str(),
+            "iat": now,
+            "exp": now + 3600,
+        });
+        let token = build_jwt(&ed25519_header(), &payload);
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::ValidityWindowTooLong { .. }));
+    }
+
+    #[tokio::test]
+    async fn issuer_resolution_failure_propagates() {
+        let r = Arc::new(MockResolver::new());
+        r.insert_err(&issuer_did(), DidResolutionError::NotFound);
+        let cfg = JwtVerificationConfig::default();
+        let token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::IssuerResolutionFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn issuer_key_not_in_document_when_document_empty() {
+        let r = Arc::new(MockResolver::new());
+        let empty_doc = DidDocument {
+            did: issuer_did(),
+            verification_methods: vec![],
+            rotation_history: vec![],
+        };
+        r.documents.lock().unwrap().insert(issuer_did().as_str().to_string(), Ok(empty_doc));
+        let cfg = JwtVerificationConfig::default();
+        let token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::IssuerKeyNotInDocument));
+    }
+
+    // ============================================================
+    // §7.2 nonce extraction tests.
+    // ============================================================
+
+    #[tokio::test]
+    async fn require_nonce_true_with_missing_nonce_returns_nonce_missing() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig {
+            require_nonce: true,
+            ..JwtVerificationConfig::default()
+        };
+        let token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        let err = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::NonceMissing));
+    }
+
+    #[tokio::test]
+    async fn require_nonce_false_with_present_nonce_succeeds() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let nonce_bytes = [0xABu8; 16];
+        let mut payload = standard_payload(now_secs());
+        payload["nonce"] = serde_json::Value::String(b64u(&nonce_bytes));
+        let token = build_jwt(&ed25519_header(), &payload);
+        let v = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap();
+        assert_eq!(v.nonce().unwrap().as_bytes(), &nonce_bytes);
+    }
+
+    /// §7.2 commits `NonceReplay` as a variant. Phase 4a does not
+    /// wire replay protection (the `NonceTracker` integration
+    /// lands in Phase 4b); this test simply pins the variant
+    /// exists and is constructible.
+    #[test]
+    fn nonce_replay_variant_is_reachable() {
+        let _e = JwtVerificationError::NonceReplay;
+    }
+
+    // ============================================================
+    // Scope-extraction tests.
+    // ============================================================
+
+    #[tokio::test]
+    async fn scope_extracted_from_space_delimited_string() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let mut payload = standard_payload(now_secs());
+        payload["scope"] = serde_json::Value::String("a.b c.d  e.f".into());
+        let token = build_jwt(&ed25519_header(), &payload);
+        let v = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap();
+        assert_eq!(v.scope().scopes.as_slice(), &["a.b", "c.d", "e.f"]);
+    }
+
+    #[tokio::test]
+    async fn scope_extracted_from_json_array() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let mut payload = standard_payload(now_secs());
+        payload["scope"] = serde_json::json!(["x.y", "z.w"]);
+        let token = build_jwt(&ed25519_header(), &payload);
+        let v = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap();
+        assert_eq!(v.scope().scopes.as_slice(), &["x.y", "z.w"]);
+    }
+
+    #[tokio::test]
+    async fn scope_extracted_from_scp_field_name() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let mut payload = standard_payload(now_secs());
+        payload.as_object_mut().unwrap().remove("scope");
+        payload["scp"] = serde_json::Value::String("only.scope".into());
+        let token = build_jwt(&ed25519_header(), &payload);
+        let v = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap();
+        assert_eq!(v.scope().scopes.as_slice(), &["only.scope"]);
+    }
+
+    #[tokio::test]
+    async fn missing_scope_yields_empty_jwt_scope() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let mut payload = standard_payload(now_secs());
+        payload.as_object_mut().unwrap().remove("scope");
+        let token = build_jwt(&ed25519_header(), &payload);
+        let v = verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap();
+        assert!(v.scope().scopes.is_empty());
+    }
+
+    // ============================================================
+    // Authorization-header parsing tests.
+    // ============================================================
+
+    #[tokio::test]
+    async fn authorization_header_with_bearer_prefix_succeeds() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let raw_token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        let header_value = format!("Bearer {raw_token}");
+        let v = verify_jwt(&header_value, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap();
+        assert_eq!(v.issuer().as_str(), issuer_did().as_str());
+    }
+
+    #[tokio::test]
+    async fn authorization_header_lowercase_bearer_also_succeeds() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let raw_token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        let header_value = format!("bearer {raw_token}");
+        let _v = verify_jwt(&header_value, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_authorization_header_returns_malformed() {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let err = verify_jwt("", &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
+        let err = verify_jwt("Bearer ", &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
     }
 }

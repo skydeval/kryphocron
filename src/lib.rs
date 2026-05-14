@@ -139,14 +139,14 @@ pub use audit::{
     SinkPanicGuard, SubstrateAuditSink, TerminatedSinkGuard, UserAuditSink,
 };
 pub use authority::{
-    AuthDenial, AuthorityId, BindError, BindFailureReason, BindOutcomeRepr,
-    BoundChannelProof, BoundModerationProof, BoundSubstrateProof, BoundUserProof,
-    CapabilityClass, CapabilityKind, CapabilitySemantics, CapabilitySet, ChannelProof,
-    ChannelProofRef, DenialReason, Endpoint, InspectionKind, InspectionNotification,
-    InspectionNotificationQueueReader, IssuancePolicy, ModerationCapability,
-    ModerationProof, ModerationProofRef, NotificationId, PipelineStage, PredicateContext,
-    ResourceId, SubstrateProof, SubstrateProofRef, SubstrateScope, UserCapability,
-    UserProof, UserProofRef,
+    check_jwt_scope_for, AuthDenial, AuthorityId, BindError, BindFailureReason,
+    BindOutcomeRepr, BoundChannelProof, BoundModerationProof, BoundSubstrateProof,
+    BoundUserProof, CapabilityClass, CapabilityKind, CapabilitySemantics, CapabilitySet,
+    ChannelProof, ChannelProofRef, DenialReason, Endpoint, InspectionKind,
+    InspectionNotification, InspectionNotificationQueueReader, IssuancePolicy,
+    ModerationCapability, ModerationProof, ModerationProofRef, NotificationId,
+    PipelineStage, PredicateContext, ResourceId, SubstrateProof, SubstrateProofRef,
+    SubstrateScope, UserCapability, UserProof, UserProofRef,
 };
 pub use encryption::{
     AuditEncryptionAlgorithm, AuditEncryptionKeyId, EncryptionError,

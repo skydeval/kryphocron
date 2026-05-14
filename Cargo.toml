@@ -72,6 +72,11 @@ kryphocron-lexicons = { path = "../kryphocron-lexicons" }
 [dev-dependencies]
 # `trybuild` for Phase B's "this should not compile" assertions.
 trybuild = "1"
+# Phase 4a (§7.2 JWT verification) tests are async because
+# `verify_jwt` is async (DID resolution may need network I/O).
+# Use the `tokio::test` macro with a single-thread runtime —
+# tests don't need the multi-thread scheduler.
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [features]
 default = []
