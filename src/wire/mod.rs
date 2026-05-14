@@ -22,6 +22,15 @@ pub use self::claim::{
     CapabilityClaim, ClaimConstructionError, ClaimOrigin, ResourceScope, ScopeVariantName,
     MAX_CAPABILITY_CLAIM_SIZE, MAX_CLAIM_VALIDITY,
 };
+
+// Crate-internal re-exports for the `verification` submodule —
+// the §7.6 receive-side path needs the wire-envelope decoder,
+// the round-trip canonicality check, and the domain tag for
+// signature verification. None of these surface publicly.
+pub(crate) use self::claim::{
+    decode_wire as decode_wire_envelope,
+    wire_bytes_are_canonical as wire_envelope_is_canonical, CLAIM_DOMAIN_TAG,
+};
 pub use self::nonce::{
     ClaimNonce, JwtNonce, NonceFreshness, NonceIssuerKey, NonceKind, NoncePrincipal,
     NonceTracker, NonceTrackerError,

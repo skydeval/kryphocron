@@ -1,15 +1,16 @@
 //! §7.2 / §7.5 verification submodule.
 //!
 //! Phase 4a wires §7.2 — the JWT verification chain — through
-//! [`crate::verification::verify_jwt`]. Phase 1 shipped the
-//! [`crate::verification::VerifiedJwt`] type with private fields
-//! and a crate-internal constructor; Phase 4a wires the
-//! constructor body so that all five §7.2 stages (parse → resolve
-//! key → verify signature → verify claims → construct
-//! `VerifiedJwt`) execute on every authenticated request.
+//! [`crate::verification::verify_jwt`]. Phase 4b wires §7.6 —
+//! the capability-claim verification chain — through
+//! [`crate::verification::verify_capability_claim`]. Phase 1
+//! shipped the [`crate::verification::VerifiedJwt`] type with
+//! private fields and a crate-internal constructor; Phase 4a
+//! wired the constructor body. Phase 4b ships the parallel
+//! [`VerifiedCapabilityClaim`] type and constructor.
 //!
-//! [`crate::verification::VerifiedHandshake`] (§7.5) remains
-//! Phase-4d-stubbed.
+//! [`crate::verification::VerifiedHandshake`] /
+//! [`VerifiedSyncMessage`] (§7.5) remain Phase-4d-stubbed.
 //!
 //! See §7.2 for the JWT verification flow, §7.5 for the
 //! sync-handshake protocol.
@@ -23,13 +24,18 @@ use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use smallvec::SmallVec;
 use thiserror::Error;
 
+use crate::authority::capability::CapabilityKind;
 use crate::identity::{
-    KeyId, PublicKey, ServiceIdentity, SignatureAlgorithm, TraceId,
+    KeyId, PublicKey, ServiceIdentity, SessionId, SignatureAlgorithm, TraceId,
 };
 use crate::proto::Did;
 use crate::resolver::{DidResolutionError, DidResolver};
 use crate::sealed;
-use crate::wire::JwtNonce;
+use crate::wire::{
+    decode_wire_envelope, wire_envelope_is_canonical, CapabilityClaim, JwtNonce,
+    NonceFreshness, NonceIssuerKey, NoncePrincipal, NonceTracker, NonceTrackerError,
+    ResourceScope, CLAIM_DOMAIN_TAG, MAX_CAPABILITY_CLAIM_SIZE,
+};
 
 /// JWT that passed signature **and** claim verification (§7.2).
 ///
@@ -775,6 +781,564 @@ fn parse_nonce_field(
     }
 }
 
+// ============================================================
+// §7.6 capability-claim verification.
+// ============================================================
+
+/// Capability claim that has passed wire-canonicality, signature,
+/// and claim verification (§7.6).
+///
+/// Constructible only via [`verify_capability_claim`]; consumers
+/// receiving a [`VerifiedCapabilityClaim`] need not re-verify or
+/// trust the caller.
+///
+/// Outside-crate code cannot construct via struct-literal syntax
+/// — every field is private, including the crate-sealed
+/// `_private: PhantomData<sealed::Token>` marker.
+///
+/// ```compile_fail
+/// // Outside-crate construction must not work.
+/// use kryphocron::verification::VerifiedCapabilityClaim;
+/// let _v = VerifiedCapabilityClaim {
+///     // fields private; this fails to compile.
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct VerifiedCapabilityClaim {
+    issuer: ServiceIdentity,
+    subject: Did,
+    capabilities: Vec<CapabilityKind>,
+    resource_scope: ResourceScope,
+    trace_id: TraceId,
+    issued_at: SystemTime,
+    expires_at: SystemTime,
+    _private: PhantomData<sealed::Token>,
+}
+
+impl VerifiedCapabilityClaim {
+    /// Crate-internal constructor. Reserved for
+    /// [`verify_capability_claim`] after every §7.6 verification
+    /// stage has succeeded; not reachable from outside
+    /// `crate::verification`.
+    #[must_use]
+    pub(crate) fn new_internal(
+        issuer: ServiceIdentity,
+        subject: Did,
+        capabilities: Vec<CapabilityKind>,
+        resource_scope: ResourceScope,
+        trace_id: TraceId,
+        issued_at: SystemTime,
+        expires_at: SystemTime,
+    ) -> Self {
+        VerifiedCapabilityClaim {
+            issuer,
+            subject,
+            capabilities,
+            resource_scope,
+            trace_id,
+            issued_at,
+            expires_at,
+            _private: PhantomData,
+        }
+    }
+
+    /// Borrow the issuer service identity.
+    #[must_use]
+    pub fn issuer(&self) -> &ServiceIdentity {
+        &self.issuer
+    }
+    /// Borrow the subject DID.
+    #[must_use]
+    pub fn subject(&self) -> &Did {
+        &self.subject
+    }
+    /// Borrow the requested capabilities.
+    #[must_use]
+    pub fn capabilities(&self) -> &[CapabilityKind] {
+        &self.capabilities
+    }
+    /// Borrow the resource scope.
+    #[must_use]
+    pub fn resource_scope(&self) -> &ResourceScope {
+        &self.resource_scope
+    }
+    /// Forensic trace id.
+    #[must_use]
+    pub fn trace_id(&self) -> TraceId {
+        self.trace_id
+    }
+    /// Issued-at instant.
+    #[must_use]
+    pub fn issued_at(&self) -> SystemTime {
+        self.issued_at
+    }
+    /// Expires-at instant.
+    #[must_use]
+    pub fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
+}
+
+/// Sync-channel message that has passed handshake-aware
+/// verification (§7.5 + §7.6).
+///
+/// Phase 4b ships the type *shape*; the actual verification path
+/// requires the sync handshake which lands in Phase 4d. The
+/// crate-internal constructor remains unreachable until 4d
+/// connects the handshake-evidence wiring.
+#[derive(Debug, Clone)]
+pub struct VerifiedSyncMessage {
+    session_identity: ServiceIdentity,
+    session_id: SessionId,
+    payload: VerifiedCapabilityClaim,
+    _private: PhantomData<sealed::Token>,
+}
+
+impl VerifiedSyncMessage {
+    /// Borrow the session-bound peer identity.
+    #[must_use]
+    pub fn session_identity(&self) -> &ServiceIdentity {
+        &self.session_identity
+    }
+    /// Return the session id from the originating handshake.
+    #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+    /// Borrow the inner verified capability claim.
+    #[must_use]
+    pub fn payload(&self) -> &VerifiedCapabilityClaim {
+        &self.payload
+    }
+}
+
+/// Capability-claim verification configuration (§7.6).
+///
+/// Parallel to [`JwtVerificationConfig`]; sets the same defaults
+/// where the two contexts share semantics
+/// (`max_clock_skew = 30s`, `accepted_algorithms = [Ed25519]`)
+/// plus a 600s `max_validity_window` matching
+/// [`crate::MAX_CLAIM_VALIDITY`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ClaimVerificationConfig {
+    /// Maximum clock skew tolerated between issuer and verifier.
+    pub max_clock_skew: Duration,
+    /// Maximum permitted validity window (≤ 600s per §4.8).
+    pub max_validity_window: Duration,
+    /// Algorithm allowlist; default `[Ed25519]` per §7.2.
+    pub accepted_algorithms: &'static [SignatureAlgorithm],
+}
+
+impl Default for ClaimVerificationConfig {
+    fn default() -> Self {
+        ClaimVerificationConfig {
+            max_clock_skew: Duration::from_secs(30),
+            max_validity_window: Duration::from_secs(600),
+            accepted_algorithms: &[SignatureAlgorithm::Ed25519],
+        }
+    }
+}
+
+/// Capability-claim verification failure (§7.6).
+///
+/// Parallel structure to [`JwtVerificationError`]; the two enums
+/// are intentionally separate because the failure modes differ
+/// (CBOR canonicality, capability-class wire-eligibility,
+/// nonce-tracker backend errors).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ClaimVerificationError {
+    /// Wire envelope is structurally malformed: bad scheme prefix,
+    /// base64url decode failure, CBOR decode failure, non-canonical
+    /// CBOR encoding (the §7 round-4 hazard), missing field, type
+    /// mismatch, or unrecognized capability/algorithm name.
+    #[error("claim malformed")]
+    Malformed,
+    /// Algorithm not in the allowlist.
+    #[error("claim algorithm not supported: {0:?}")]
+    UnsupportedAlgorithm(SignatureAlgorithm),
+    /// Signature did not verify against the issuer's signing key.
+    #[error("claim signature invalid")]
+    SignatureInvalid,
+    /// Claim has expired.
+    #[error("claim expired (exp={exp:?}, now={now:?})")]
+    Expired {
+        /// `expires_at` from the claim.
+        exp: SystemTime,
+        /// Current time at verification.
+        now: SystemTime,
+    },
+    /// Claim is not yet valid (`issued_at` in the future beyond
+    /// skew tolerance).
+    #[error("claim not yet valid")]
+    NotYetValid {
+        /// `issued_at` from the claim.
+        iat: SystemTime,
+        /// Current time at verification.
+        now: SystemTime,
+        /// Clock skew tolerated.
+        skew: Duration,
+    },
+    /// Audience mismatch. Per Phase 4a chainlink #27, the `got`
+    /// field carries the claimed-audience DID directly (no
+    /// synthetic `ServiceIdentity` placeholder).
+    #[error("claim wrong audience")]
+    WrongAudience {
+        /// Expected (local) audience.
+        expected: ServiceIdentity,
+        /// Audience claimed by the wire envelope.
+        got: Did,
+    },
+    /// Issuer DID failed to resolve.
+    #[error("claim issuer resolution failed: {0}")]
+    IssuerResolutionFailed(DidResolutionError),
+    /// Issuer's signing key not in DID document or rotation
+    /// history.
+    #[error("issuer key not in DID document")]
+    IssuerKeyNotInDocument,
+    /// `expires_at - issued_at` exceeds the configured maximum.
+    #[error("validity window too long")]
+    ValidityWindowTooLong {
+        /// Requested validity window.
+        window: Duration,
+        /// Maximum permitted.
+        max: Duration,
+    },
+    /// Wire envelope exceeds [`MAX_CAPABILITY_CLAIM_SIZE`].
+    #[error("claim size {size} exceeds max {max}")]
+    ClaimTooLarge {
+        /// Wire envelope size.
+        size: usize,
+        /// Maximum permitted.
+        max: usize,
+    },
+    /// Nonce previously observed under the same issuer partition
+    /// within the tracker's retention window.
+    #[error("claim nonce replay")]
+    NonceReplay,
+    /// Nonce tracker backend failure.
+    #[error("nonce tracker failure: {0}")]
+    NonceTrackerFailed(NonceTrackerError),
+    /// §4.8 W6 violation observed at receive time: claim
+    /// references a substrate-class or moderation-class
+    /// capability that should never appear on the wire. The
+    /// substrate's own claims fail at construction, but external
+    /// claims must be re-checked because they may have been
+    /// minted by a non-substrate or malicious party.
+    #[error("non-wire-eligible capability {0:?} on the wire")]
+    NonWireEligibleCapability(CapabilityKind),
+    /// §4.8 W9 / W10 violation observed at receive time: claim's
+    /// scope is not permitted for one of its declared
+    /// capabilities. Belt-and-suspenders to construction-time
+    /// checks.
+    #[error("scope variant not permitted for class")]
+    NonexhaustiveScopeForClass,
+}
+
+/// Verify a capability-claim wire envelope against the configured
+/// DID resolver and nonce tracker (§7.6).
+///
+/// `raw_header` may be either the bare base64url-encoded wire
+/// envelope or a full HTTP `Authorization` header value
+/// (`KryphocronClaim <base64url>`); the function strips the scheme
+/// prefix when present.
+///
+/// The verification chain runs all §7.6 receive-time enforcement
+/// stages in order:
+///
+/// 1. Authorization-header scheme + base64url decode.
+/// 2. Wire-bytes size ceiling ([`MAX_CAPABILITY_CLAIM_SIZE`]).
+/// 3. Round-trip canonicality (re-encoded bytes byte-equal input;
+///    closes the §7 round-4 hazard).
+/// 4. CBOR structural decode into payload + signature.
+/// 5. Algorithm allowlist check.
+/// 6. Audience equality against `local_audience.service_did()`.
+/// 7. W6 / W9 / W10 belt-and-suspenders against externally-minted
+///    claims (substrate's own claims fail at construction).
+/// 8. Validity window ≤ `config.max_validity_window`.
+/// 9. `expires_at` future (within skew); `issued_at` past (within
+///    skew).
+/// 10. Issuer DID resolution + signing-key selection.
+/// 11. Domain-separated Ed25519 signature verification over the
+///     re-encoded canonical payload.
+/// 12. Nonce-tracker check-and-record under the
+///     `(NonceKind::CapabilityClaim, NonceIssuerKey)` partition.
+/// 13. Construct [`VerifiedCapabilityClaim`] via the
+///     crate-internal constructor.
+///
+/// On success returns [`VerifiedCapabilityClaim`] — an unforgeable
+/// token that ingress paths accept as evidence that §7.6
+/// verification ran without trusting the caller.
+///
+/// `ClaimOrigin::DelegatedFromUpstream` payloads are rejected as
+/// `Malformed` in Phase 4b: receipt-chain verification (W11/W12/W13)
+/// lands in Phase 4e. SelfOriginated claims succeed.
+///
+/// # Errors
+///
+/// Returns [`ClaimVerificationError`] on any failure.
+pub async fn verify_capability_claim(
+    raw_header: &str,
+    local_audience: &ServiceIdentity,
+    resolver: &dyn DidResolver,
+    nonce_tracker: &dyn NonceTracker,
+    config: &ClaimVerificationConfig,
+    deadline: Instant,
+    _trace_id: TraceId,
+) -> Result<VerifiedCapabilityClaim, ClaimVerificationError> {
+    // 1. Strip `KryphocronClaim ` prefix (case-insensitive scheme)
+    //    and base64url-decode.
+    let token = parse_claim_header(raw_header)?;
+    let wire_bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| ClaimVerificationError::Malformed)?;
+
+    // 2. Wire-bytes size ceiling.
+    if wire_bytes.len() > MAX_CAPABILITY_CLAIM_SIZE {
+        return Err(ClaimVerificationError::ClaimTooLarge {
+            size: wire_bytes.len(),
+            max: MAX_CAPABILITY_CLAIM_SIZE,
+        });
+    }
+
+    // 3. Round-trip canonicality. Reject non-canonical encodings
+    //    as Malformed — closes the §7 round-4 hazard at the
+    //    boundary.
+    if !wire_envelope_is_canonical(&wire_bytes) {
+        return Err(ClaimVerificationError::Malformed);
+    }
+
+    // 4. Decode the wire envelope.
+    let (
+        issuer,
+        audience,
+        subject,
+        origin,
+        capabilities,
+        resource_scope,
+        nonce,
+        trace_id_field,
+        issued_at,
+        expires_at,
+        signature,
+    ) = decode_wire_envelope(&wire_bytes).map_err(|()| ClaimVerificationError::Malformed)?;
+
+    // 5. Algorithm allowlist.
+    if !config.accepted_algorithms.contains(&signature.algorithm) {
+        return Err(ClaimVerificationError::UnsupportedAlgorithm(signature.algorithm));
+    }
+
+    // 6. Audience equality. Per Phase 4a chainlink #27, the `got`
+    //    field carries the claimed DID directly (not a synthetic
+    //    placeholder ServiceIdentity).
+    if audience.service_did() != local_audience.service_did() {
+        return Err(ClaimVerificationError::WrongAudience {
+            expected: local_audience.clone(),
+            got: audience.service_did().clone(),
+        });
+    }
+
+    // 7. W6 / W9 / W10 belt-and-suspenders. The substrate's own
+    //    claims pass these checks at construction; external claims
+    //    must be re-checked.
+    for cap in &capabilities {
+        if !cap.is_wire_eligible() {
+            return Err(ClaimVerificationError::NonWireEligibleCapability(*cap));
+        }
+        if !class_permits_scope(cap.class(), &resource_scope) {
+            return Err(ClaimVerificationError::NonexhaustiveScopeForClass);
+        }
+    }
+
+    // 8. Validity window.
+    let window = expires_at
+        .duration_since(issued_at)
+        .unwrap_or(Duration::ZERO);
+    if window > config.max_validity_window {
+        return Err(ClaimVerificationError::ValidityWindowTooLong {
+            window,
+            max: config.max_validity_window,
+        });
+    }
+
+    // 9. Expiry / not-yet-valid (clock-skew tolerant).
+    let now = SystemTime::now();
+    if now > expires_at + config.max_clock_skew {
+        return Err(ClaimVerificationError::Expired {
+            exp: expires_at,
+            now,
+        });
+    }
+    if now + config.max_clock_skew < issued_at {
+        return Err(ClaimVerificationError::NotYetValid {
+            iat: issued_at,
+            now,
+            skew: config.max_clock_skew,
+        });
+    }
+
+    // 10. Issuer DID resolution + signing-key selection.
+    let document = resolver
+        .resolve(issuer.service_did(), deadline)
+        .await
+        .map_err(ClaimVerificationError::IssuerResolutionFailed)?;
+    let public_key = select_signing_key_for_claim(
+        &document,
+        issuer.key_id(),
+        signature.algorithm,
+    )?;
+
+    // 11. Re-encode the canonical payload (no signature field) and
+    //     verify the signature with domain separation.
+    //     Note: `decode_claim_origin` rejects DelegatedFromUpstream
+    //     in Phase 4b. SelfOriginated payloads round-trip here.
+    let received_claim = CapabilityClaim::new_internal_received(
+        issuer.clone(),
+        audience,
+        subject.clone(),
+        origin,
+        capabilities.clone(),
+        resource_scope.clone(),
+        nonce,
+        trace_id_field,
+        issued_at,
+        expires_at,
+        signature,
+    );
+    let canonical_payload = received_claim.canonical_payload_bytes();
+    let mut signing_input =
+        Vec::with_capacity(CLAIM_DOMAIN_TAG.len() + canonical_payload.len());
+    signing_input.extend_from_slice(CLAIM_DOMAIN_TAG);
+    signing_input.extend_from_slice(&canonical_payload);
+    verify_claim_signature(
+        &signing_input,
+        &received_claim.signature().bytes,
+        signature.algorithm,
+        &public_key,
+    )?;
+
+    // 12. Nonce-tracker check-and-record.
+    let issuer_partition = NonceIssuerKey {
+        principal: NoncePrincipal::Service(issuer.service_did().clone()),
+        key_id: issuer.key_id(),
+    };
+    let nonce_bytes = *received_claim.nonce().as_bytes();
+    match nonce_tracker
+        .record(
+            crate::wire::NonceKind::CapabilityClaim,
+            &issuer_partition,
+            &nonce_bytes,
+            now,
+        )
+        .map_err(ClaimVerificationError::NonceTrackerFailed)?
+    {
+        NonceFreshness::Fresh => {}
+        NonceFreshness::Replay { .. } => return Err(ClaimVerificationError::NonceReplay),
+    }
+
+    // 13. Construct VerifiedCapabilityClaim.
+    Ok(VerifiedCapabilityClaim::new_internal(
+        issuer,
+        subject,
+        capabilities,
+        resource_scope,
+        trace_id_field,
+        issued_at,
+        expires_at,
+    ))
+}
+
+/// Strip the `KryphocronClaim ` (case-insensitive) scheme prefix
+/// per §7.6.
+fn parse_claim_header(raw: &str) -> Result<&str, ClaimVerificationError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ClaimVerificationError::Malformed);
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("KryphocronClaim ")
+        .or_else(|| trimmed.strip_prefix("kryphocronclaim "))
+        .or_else(|| trimmed.strip_prefix("KRYPHOCRONCLAIM "))
+    {
+        let token = rest.trim_start();
+        if token.is_empty() {
+            return Err(ClaimVerificationError::Malformed);
+        }
+        return Ok(token);
+    }
+    // Bare token — operators that already stripped the scheme
+    // upstream remain usable.
+    Ok(trimmed)
+}
+
+/// Belt-and-suspenders class-vs-scope check at receive time
+/// (§4.8 W9 / W10 enforcement). Mirror of `claim::check_scope_for_class`
+/// expressed against [`crate::authority::CapabilityClass`].
+fn class_permits_scope(
+    class: crate::authority::CapabilityClass,
+    scope: &ResourceScope,
+) -> bool {
+    use crate::authority::CapabilityClass;
+    match class {
+        CapabilityClass::User => matches!(scope, ResourceScope::Resource(_)),
+        CapabilityClass::Channel => true,
+        CapabilityClass::Substrate | CapabilityClass::Moderation => false,
+    }
+}
+
+/// Pick a [`PublicKey`] from a resolved DID document for
+/// capability-claim signature verification.
+///
+/// §7.6 dispatch: the issuer carries an explicit `KeyId`, so
+/// resolution looks for an exact `KeyId` match in the DID
+/// document's verification methods (or, in Phase 4c, the
+/// rotation history). Algorithm must also match. No match →
+/// `IssuerKeyNotInDocument`.
+fn select_signing_key_for_claim(
+    document: &crate::resolver::DidDocument,
+    expected_key_id: KeyId,
+    algorithm: SignatureAlgorithm,
+) -> Result<PublicKey, ClaimVerificationError> {
+    for (kid, key) in &document.verification_methods {
+        if *kid == expected_key_id && key.algorithm == algorithm {
+            return Ok(*key);
+        }
+    }
+    // Phase 4c lands rotation-history walking via RotationChain;
+    // for 4b, exact-match-in-current-methods only.
+    Err(ClaimVerificationError::IssuerKeyNotInDocument)
+}
+
+/// Verify a capability-claim signature for the given algorithm.
+fn verify_claim_signature(
+    signing_input: &[u8],
+    signature: &[u8],
+    algorithm: SignatureAlgorithm,
+    public_key: &PublicKey,
+) -> Result<(), ClaimVerificationError> {
+    match algorithm {
+        SignatureAlgorithm::Ed25519 => {
+            if signature.len() != ed25519_dalek::SIGNATURE_LENGTH {
+                return Err(ClaimVerificationError::SignatureInvalid);
+            }
+            let mut sig_bytes = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
+            sig_bytes.copy_from_slice(signature);
+            let sig = Ed25519Signature::from_bytes(&sig_bytes);
+            let key = VerifyingKey::from_bytes(&public_key.bytes)
+                .map_err(|_| ClaimVerificationError::SignatureInvalid)?;
+            key.verify(signing_input, &sig)
+                .map_err(|_| ClaimVerificationError::SignatureInvalid)
+        }
+        SignatureAlgorithm::Es256 | SignatureAlgorithm::Es256K => {
+            // Phase 4a chainlink #26: ES256/ES256K primitives
+            // ship in a later sub-phase. Phase 4b keeps the same
+            // stub posture for capability-claim verification.
+            Err(ClaimVerificationError::UnsupportedAlgorithm(algorithm))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1364,5 +1928,322 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, JwtVerificationError::Malformed));
+    }
+
+    // ============================================================
+    // §7.6 capability-claim verification tests.
+    // ============================================================
+
+    use crate::wire::{CapabilityClaim, ClaimNonce, DefaultNonceTracker, ResourceScope};
+    use crate::authority::CapabilityKind;
+    use crate::authority::subjects::ResourceId;
+
+    fn issuer_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn issuer_service_identity() -> ServiceIdentity {
+        let signing = issuer_signing_key();
+        ServiceIdentity::new_internal(
+            Did::new("did:plc:claimissuer").unwrap(),
+            KeyId::from_bytes([0xAA; 32]),
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: signing.verifying_key().to_bytes(),
+            },
+            None,
+        )
+    }
+
+    fn audience_service_identity() -> ServiceIdentity {
+        ServiceIdentity::new_internal(
+            Did::new("did:web:audience.example").unwrap(),
+            KeyId::from_bytes([0xBB; 32]),
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    fn sample_resource_id() -> ResourceId {
+        ResourceId::new(
+            Did::new("did:plc:owner").unwrap(),
+            crate::Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+            crate::Rkey::new("samplerkey").unwrap(),
+        )
+    }
+
+    fn build_claim() -> CapabilityClaim {
+        CapabilityClaim::new(
+            issuer_service_identity(),
+            audience_service_identity(),
+            Did::new("did:plc:subject").unwrap(),
+            vec![CapabilityKind::ViewPrivate],
+            ResourceScope::Resource(sample_resource_id()),
+            ClaimNonce::from_bytes([0xCC; 16]),
+            TraceId::from_bytes([0xDD; 16]),
+            Duration::from_secs(60),
+            &issuer_signing_key(),
+        )
+        .unwrap()
+    }
+
+    fn populated_claim_resolver() -> Arc<MockResolver> {
+        let resolver = Arc::new(MockResolver::new());
+        let issuer = issuer_service_identity();
+        resolver.insert(
+            issuer.service_did(),
+            issuer.key_id(),
+            *issuer.key_material(),
+        );
+        resolver
+    }
+
+    fn b64u_wire(claim: &CapabilityClaim) -> String {
+        URL_SAFE_NO_PAD.encode(claim.to_wire_bytes())
+    }
+
+    /// §7.6 default-config commitments.
+    #[test]
+    fn claim_config_default_is_ed25519_only() {
+        let c = ClaimVerificationConfig::default();
+        assert_eq!(c.accepted_algorithms, &[SignatureAlgorithm::Ed25519]);
+        assert_eq!(c.max_clock_skew, Duration::from_secs(30));
+        assert_eq!(c.max_validity_window, Duration::from_secs(600));
+    }
+
+    #[tokio::test]
+    async fn claim_happy_path_verifies_an_ed25519_signed_claim() {
+        let claim = build_claim();
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let header = format!("KryphocronClaim {}", b64u_wire(&claim));
+        let v = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v.issuer().service_did().as_str(), "did:plc:claimissuer");
+        assert_eq!(v.subject().as_str(), "did:plc:subject");
+        assert_eq!(v.capabilities(), &[CapabilityKind::ViewPrivate]);
+    }
+
+    #[tokio::test]
+    async fn claim_replay_against_same_nonce_returns_nonce_replay() {
+        let claim = build_claim();
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let header = format!("KryphocronClaim {}", b64u_wire(&claim));
+        // First verification succeeds.
+        let _v = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap();
+        // Second verification of the same wire bytes (same nonce
+        // under the same issuer partition) is rejected.
+        let err = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ClaimVerificationError::NonceReplay));
+    }
+
+    #[tokio::test]
+    async fn claim_wrong_audience_returns_wrong_audience_with_did() {
+        let claim = build_claim();
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let header = format!("KryphocronClaim {}", b64u_wire(&claim));
+        // Verify against a different audience identity.
+        let other_audience = ServiceIdentity::new_internal(
+            Did::new("did:web:somewhere.else").unwrap(),
+            KeyId::from_bytes([0; 32]),
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: [0; 32],
+            },
+            None,
+        );
+        let err = verify_capability_claim(
+            &header,
+            &other_audience,
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ClaimVerificationError::WrongAudience { got, .. } => {
+                // Phase 4a chainlink #27: `got` is a Did, not a
+                // synthetic ServiceIdentity placeholder.
+                assert_eq!(got.as_str(), "did:web:audience.example");
+            }
+            other => panic!("expected WrongAudience, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_with_invalid_base64url_returns_malformed() {
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let err = verify_capability_claim(
+            "KryphocronClaim ***not-base64url***",
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ClaimVerificationError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn claim_with_non_canonical_cbor_returns_malformed() {
+        // Hand-built CBOR map with non-canonical key ordering
+        // (`zebra` before `apple`). Decodes successfully via
+        // ciborium but fails the round-trip canonicality check.
+        let non_canonical: Vec<u8> = vec![
+            0xA2, 0x65, 0x7A, 0x65, 0x62, 0x72, 0x61, 0x01, 0x65, 0x61, 0x70, 0x70,
+            0x6C, 0x65, 0x02,
+        ];
+        let header = format!("KryphocronClaim {}", URL_SAFE_NO_PAD.encode(&non_canonical));
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let err = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ClaimVerificationError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn claim_too_large_returns_claim_too_large() {
+        // A wire-bytes payload larger than MAX_CAPABILITY_CLAIM_SIZE.
+        // Construct via raw bytes (not via CapabilityClaim::new
+        // which would itself reject at construction).
+        let oversized = vec![0u8; MAX_CAPABILITY_CLAIM_SIZE + 1];
+        let header = format!("KryphocronClaim {}", URL_SAFE_NO_PAD.encode(&oversized));
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let err = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ClaimVerificationError::ClaimTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn claim_tampered_signature_fails_signature_invalid() {
+        // Tamper the signature bytes specifically. Decoding the
+        // wire envelope still succeeds (signature shape is the
+        // same 64 bytes); the signature verification step fails
+        // unambiguously with SignatureInvalid.
+        let claim = build_claim();
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let wire = claim.to_wire_bytes();
+        // The 64 signature bytes are the last 64 bytes of the
+        // payload byte string in the canonical-CBOR encoding —
+        // ciborium's `bytes(64)` head is `0x58 0x40` followed by
+        // 64 raw bytes. Find the byte-string head and zero its
+        // payload.
+        let mut tampered = wire.clone();
+        let head_pos = tampered
+            .windows(2)
+            .position(|w| w == [0x58, 0x40])
+            .expect("wire envelope must contain a bytes(64) for the signature");
+        let sig_start = head_pos + 2;
+        for b in &mut tampered[sig_start..sig_start + 64] {
+            *b = 0;
+        }
+        let header = format!("KryphocronClaim {}", URL_SAFE_NO_PAD.encode(&tampered));
+        let err = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ClaimVerificationError::SignatureInvalid));
+    }
+
+    #[tokio::test]
+    async fn claim_with_known_alg_outside_allowlist_returns_unsupported_algorithm() {
+        let claim = build_claim();
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig {
+            accepted_algorithms: &[],
+            ..ClaimVerificationConfig::default()
+        };
+        let header = format!("KryphocronClaim {}", b64u_wire(&claim));
+        let err = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimVerificationError::UnsupportedAlgorithm(SignatureAlgorithm::Ed25519)
+        ));
     }
 }

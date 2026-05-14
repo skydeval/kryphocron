@@ -592,6 +592,133 @@ pub(crate) fn decode_payload(
     ))
 }
 
+// ============================================================
+// Wire envelope (signing payload + signature) encoder/decoder.
+// ============================================================
+
+/// Encode a constructed [`CapabilityClaim`] as wire-format
+/// bytes: the canonical CBOR of all fields including the
+/// `signature` field.
+///
+/// The wire envelope is what the [`KryphocronClaim`] HTTP
+/// authorization scheme carries (after base64url encoding) and
+/// what the sync-channel framed-binary path carries (post-
+/// handshake). Receivers verify the signature against the
+/// canonical encoding of the same map *minus* the `signature`
+/// key — see [`Self::canonical_payload_bytes`].
+impl CapabilityClaim {
+    /// Encode this claim for wire transmission.
+    #[must_use]
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let map = Value::Map(vec![
+            (Value::Text("issuer".into()), service_identity_value(&self.issuer)),
+            (Value::Text("audience".into()), service_identity_value(&self.audience)),
+            (
+                Value::Text("subject".into()),
+                Value::Text(self.subject.as_str().to_string()),
+            ),
+            (Value::Text("origin".into()), claim_origin_value(&self.origin)),
+            (
+                Value::Text("capabilities".into()),
+                capabilities_value(&self.capabilities),
+            ),
+            (
+                Value::Text("resource_scope".into()),
+                resource_scope_value(&self.resource_scope),
+            ),
+            (
+                Value::Text("nonce".into()),
+                Value::Bytes(self.nonce.as_bytes().to_vec()),
+            ),
+            (
+                Value::Text("trace_id".into()),
+                Value::Bytes(self.trace_id.as_bytes().to_vec()),
+            ),
+            (Value::Text("issued_at".into()), system_time_value(self.issued_at)),
+            (Value::Text("expires_at".into()), system_time_value(self.expires_at)),
+            (Value::Text("signature".into()), claim_signature_value(&self.signature)),
+        ]);
+        canonical_cbor::to_canonical_bytes(map)
+    }
+}
+
+fn claim_signature_value(s: &ClaimSignature) -> Value {
+    Value::Map(vec![
+        (Value::Text("alg".into()), Value::Text(signature_alg_name(s.algorithm).into())),
+        (Value::Text("bytes".into()), Value::Bytes(s.bytes.to_vec())),
+    ])
+}
+
+/// Decode a wire envelope into its constituent fields.
+///
+/// Returns `Err(())` for any structural problem; callers
+/// translate to the appropriate
+/// [`crate::ClaimVerificationError`] variant.
+#[allow(clippy::type_complexity)]
+pub(crate) fn decode_wire(
+    bytes: &[u8],
+) -> Result<
+    (
+        ServiceIdentity,
+        ServiceIdentity,
+        Did,
+        ClaimOrigin,
+        Vec<CapabilityKind>,
+        ResourceScope,
+        ClaimNonce,
+        TraceId,
+        SystemTime,
+        SystemTime,
+        ClaimSignature,
+    ),
+    (),
+> {
+    let value = canonical_cbor::from_bytes(bytes)?;
+    let map = into_map(&value)?;
+    let signature = decode_claim_signature(map_get(&map, "signature")?)?;
+    Ok((
+        decode_service_identity(map_get(&map, "issuer")?)?,
+        decode_service_identity(map_get(&map, "audience")?)?,
+        decode_did(map_get(&map, "subject")?)?,
+        decode_claim_origin(map_get(&map, "origin")?)?,
+        decode_capabilities(map_get(&map, "capabilities")?)?,
+        decode_resource_scope(map_get(&map, "resource_scope")?)?,
+        decode_nonce(map_get(&map, "nonce")?)?,
+        decode_trace_id(map_get(&map, "trace_id")?)?,
+        decode_system_time(map_get(&map, "issued_at")?)?,
+        decode_system_time(map_get(&map, "expires_at")?)?,
+        signature,
+    ))
+}
+
+fn decode_claim_signature(v: &Value) -> Result<ClaimSignature, ()> {
+    let map = into_map(v)?;
+    let alg_str = match map_get(&map, "alg")? {
+        Value::Text(s) => s.as_str(),
+        _ => return Err(()),
+    };
+    let algorithm = decode_signature_alg(alg_str).ok_or(())?;
+    let bytes = decode_bytes(map_get(&map, "bytes")?)?;
+    let bytes_arr: [u8; 64] = bytes.try_into().map_err(|_| ())?;
+    Ok(ClaimSignature {
+        algorithm,
+        bytes: bytes_arr,
+    })
+}
+
+/// Round-trip-canonicality check: re-encode a decoded value and
+/// compare to the input bytes. Used at receive-time to reject
+/// non-canonical wire payloads as `Malformed` per the §7
+/// round-4 hazard.
+#[must_use]
+pub(crate) fn wire_bytes_are_canonical(bytes: &[u8]) -> bool {
+    let Ok(value) = canonical_cbor::from_bytes(bytes) else {
+        return false;
+    };
+    let re_encoded = canonical_cbor::to_canonical_bytes(value);
+    re_encoded == bytes
+}
+
 fn into_map(v: &Value) -> Result<Vec<(Value, Value)>, ()> {
     match v {
         Value::Map(entries) => Ok(entries.clone()),
