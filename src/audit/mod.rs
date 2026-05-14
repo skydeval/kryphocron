@@ -18,8 +18,10 @@ pub use self::composite::{
     TRACKER_SHARDS,
 };
 pub use self::events::{
-    BatchRejectionReason, ChannelAuditEvent, ChannelCloseCause, DerivationOutcome,
-    FallbackAuditEvent, ModerationAuditEvent, NarrowingKind, SubstrateAuditEvent,
+    BatchRejectionReason, ChannelAuditEvent, ChannelCloseCause, DeprecationEventDetail,
+    DerivationOutcome, FallbackAuditEvent, FallbackTrustPolicy, InvalidationSource,
+    ModerationAuditEvent, NarrowingKind, OracleFreshnessState, PeerOperation,
+    PeerTrustConstraints, PeerTrustDecision, RateLimitBucket, SubstrateAuditEvent,
     SyncPerspective, UserAuditEvent,
 };
 pub use self::rate_limit::{IssuanceRateLimiter, TokenBucket};
