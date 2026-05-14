@@ -7,6 +7,7 @@
 //! (§4.9 A2): cross-class misrouting is a compile error because
 //! each channel's sink takes a class-specific event enum.
 
+mod bounded_string;
 mod composite;
 mod events;
 mod rate_limit;
@@ -17,12 +18,13 @@ pub use self::composite::{
     CompositeRollbackMarker, TRACKER_GRACE_WINDOW_DEFAULT, TRACKER_GRACE_WINDOW_MAX,
     TRACKER_SHARDS,
 };
+pub use self::bounded_string::{BoundedString, BoundedStringTooLong};
 pub use self::events::{
     BatchRejectionReason, ChannelAuditEvent, ChannelCloseCause, DeprecationEventDetail,
     DerivationOutcome, FallbackAuditEvent, FallbackTrustPolicy, InvalidationSource,
-    ModerationAuditEvent, NarrowingKind, OracleFreshnessState, PeerOperation,
-    PeerTrustConstraints, PeerTrustDecision, RateLimitBucket, SubstrateAuditEvent,
-    SyncPerspective, UserAuditEvent,
+    ModerationAuditEvent, ModeratorRationale, NarrowingKind, OracleFreshnessState,
+    PeerOperation, PeerTrustConstraints, PeerTrustDecision, RateLimitBucket,
+    SubstrateAuditEvent, SyncPerspective, UserAuditEvent, MAX_RATIONALE_LEN,
 };
 pub use self::rate_limit::{IssuanceRateLimiter, TokenBucket};
 pub use self::sinks::{

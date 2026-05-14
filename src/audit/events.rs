@@ -82,6 +82,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::authority::capability::CapabilityKind;
 use crate::authority::predicate::{BindFailureReason, BindOutcomeRepr, DenialReason, SemVer};
+use crate::authority::ModerationCaseId;
 use crate::identity::{KeyId, ServiceIdentity, SessionDigest, SessionId, TraceId};
 use crate::ingress::{AttributionChain, Requester};
 use crate::oracle::OracleKind;
@@ -89,6 +90,7 @@ use crate::proto::{Did, Nsid};
 use crate::resolver::PeerKind;
 use crate::target::TargetRepresentation;
 
+use super::bounded_string::BoundedString;
 use super::composite::CompositeOpId;
 use super::sinks::SinkKind;
 
@@ -771,22 +773,126 @@ pub enum PeerTrustDecision {
     Deferred,
 }
 
-/// Moderation-class audit events.
+/// Moderation-class audit events (§6.5).
+///
+/// Emitted to the [`crate::audit::ModerationAuditSink`]. Records
+/// moderator capability use; pair with
+/// [`crate::authority::InspectionNotification`] events (§6.7) for
+/// forward-attributed notifications to affected resource owners
+/// via shared `trace_id`.
+///
+/// All variants follow §6.1's cross-cutting rules. Variants
+/// recording moderator decisions carry a
+/// [`ModeratorRationale`]; round-1 patch F2 introduced the
+/// [`MAX_RATIONALE_LEN`] = 4096 byte bound, validated at
+/// `CapabilityClaim` construction (§4.8 pattern) rather than at
+/// audit-emit time.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ModerationAuditEvent {
-    /// Moderation capability bound.
-    CapabilityBound {
-        /// Trace id.
+    /// `ModeratorRead` bind. The substrate emits ONE event here
+    /// AND ONE inspection notification (§6.7) per bind. Both
+    /// share `trace_id`. §6.5.
+    ModeratorInspected {
+        /// Forensic trace id (§6.1).
         trace_id: TraceId,
-        /// Capability.
-        capability: CapabilityKind,
-        /// Outcome.
+        /// Moderator DID.
+        moderator: Did,
+        /// Moderation case identifier.
+        case: ModerationCaseId,
+        /// Subject representation (§4.4).
+        target_repr: TargetRepresentation,
+        /// Moderator-declared rationale (length-bounded per
+        /// round-1 patch F2).
+        rationale: ModeratorRationale,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// `ModeratorTakedown` bind ran to terminal outcome. §6.5.
+    ModeratorTookDown {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Moderator DID.
+        moderator: Did,
+        /// Moderation case identifier.
+        case: ModerationCaseId,
+        /// Subject representation (§4.4).
+        target_repr: TargetRepresentation,
+        /// Outcome of the bind (§4.3 [`BindOutcomeRepr`]).
         outcome: BindOutcomeRepr,
-        /// When.
+        /// Moderator-declared rationale.
+        rationale: ModeratorRationale,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// `ModeratorRestore` bind ran to terminal outcome. The
+    /// inverse of takedown; restores `RecordState::TakenDown`
+    /// records to `Live`. §6.5.
+    ModeratorRestored {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Moderator DID.
+        moderator: Did,
+        /// Moderation case identifier.
+        case: ModerationCaseId,
+        /// Subject representation (§4.4).
+        target_repr: TargetRepresentation,
+        /// Outcome of the bind (§4.3 [`BindOutcomeRepr`]).
+        outcome: BindOutcomeRepr,
+        /// Moderator-declared rationale.
+        rationale: ModeratorRationale,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// Moderation-class issuance was rejected at the chokepoint.
+    /// §6.5.
+    ModerationIssuanceDenied {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Moderator DID.
+        moderator: Did,
+        /// Moderation-class capability that was denied.
+        capability: CapabilityKind,
+        /// Reason the issuance chokepoint denied.
+        reason: DenialReason,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// Composite-audit rollback marker for moderation-class
+    /// operations. §6.5.
+    CompositeRollbackMarker {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Identifies the composite scope this marker rolls back.
+        composite_op_id: CompositeOpId,
+        /// Which sibling sink's failure triggered the rollback.
+        failing_sink: SinkKind,
+        /// Emission wallclock (§6.1).
         at: SystemTime,
     },
 }
+
+/// Moderator-declared rationale for a moderation action (§6.5).
+///
+/// Required for all moderation-class capabilities. The substrate
+/// does not enforce content of the string but does enforce length
+/// and presence per round-1 patch F2 — see [`MAX_RATIONALE_LEN`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeratorRationale {
+    /// Free-text rationale field on the capability claim, declared
+    /// by the moderator at issuance time.
+    Declared(BoundedString<MAX_RATIONALE_LEN>),
+}
+
+/// Maximum byte length of a [`ModeratorRationale::Declared`]
+/// payload (§6.5 round-1 patch F2).
+///
+/// 4 KB is the v1 cap; matches "generous free-text prose,
+/// structured rationale references go out-of-band." Raising the
+/// bound in a future version is additive within the
+/// `#[non_exhaustive]` discipline.
+pub const MAX_RATIONALE_LEN: usize = 4096;
 
 /// Fallback event vocabulary — what
 /// [`crate::audit::FallbackAuditSink`] receives (§4.9).
@@ -1373,6 +1479,125 @@ mod tests {
                 | PeerTrustDecision::Reject
                 | PeerTrustDecision::Deferred => {}
             }
+        }
+    }
+
+    // ============================================================
+    // §6.5 moderation-class
+    // ============================================================
+
+    fn sample_rationale() -> ModeratorRationale {
+        ModeratorRationale::Declared(
+            BoundedString::<MAX_RATIONALE_LEN>::new("test rationale").unwrap(),
+        )
+    }
+
+    fn sample_case() -> ModerationCaseId {
+        ModerationCaseId::from_bytes([0u8; 16])
+    }
+
+    /// §6.5 commits exactly five `ModerationAuditEvent` variants
+    /// in this order: `ModeratorInspected`, `ModeratorTookDown`,
+    /// `ModeratorRestored`, `ModerationIssuanceDenied`,
+    /// `CompositeRollbackMarker`.
+    ///
+    /// Note: kickoff prose names them `ModeratorRead`,
+    /// `ModeratorTakedown`, `ModeratorRestored`; spec §6.5
+    /// commits `ModeratorInspected`, `ModeratorTookDown`,
+    /// `ModeratorRestored`. Spec wording is authoritative.
+    #[test]
+    fn moderation_audit_event_v1_variant_set_pinned() {
+        let trace_id = sample_trace_id();
+        let at = SystemTime::UNIX_EPOCH;
+        let moderator = sample_did();
+        let case = sample_case();
+        let target = sample_target_repr();
+        let rationale = sample_rationale();
+
+        let inspected = ModerationAuditEvent::ModeratorInspected {
+            trace_id,
+            moderator: moderator.clone(),
+            case,
+            target_repr: target.clone(),
+            rationale: rationale.clone(),
+            at,
+        };
+        let took_down = ModerationAuditEvent::ModeratorTookDown {
+            trace_id,
+            moderator: moderator.clone(),
+            case,
+            target_repr: target.clone(),
+            outcome: BindOutcomeRepr::Success,
+            rationale: rationale.clone(),
+            at,
+        };
+        let restored = ModerationAuditEvent::ModeratorRestored {
+            trace_id,
+            moderator: moderator.clone(),
+            case,
+            target_repr: target,
+            outcome: BindOutcomeRepr::Success,
+            rationale,
+            at,
+        };
+        let denied = ModerationAuditEvent::ModerationIssuanceDenied {
+            trace_id,
+            moderator,
+            capability: CapabilityKind::ViewPrivate,
+            reason: DenialReason::OwnershipCheckFailed,
+            at,
+        };
+        let rollback = ModerationAuditEvent::CompositeRollbackMarker {
+            trace_id,
+            composite_op_id: CompositeOpId::from_bytes([0u8; 16]),
+            failing_sink: SinkKind::Substrate,
+            at,
+        };
+
+        for ev in [inspected, took_down, restored, denied, rollback] {
+            match ev {
+                ModerationAuditEvent::ModeratorInspected { .. }
+                | ModerationAuditEvent::ModeratorTookDown { .. }
+                | ModerationAuditEvent::ModeratorRestored { .. }
+                | ModerationAuditEvent::ModerationIssuanceDenied { .. }
+                | ModerationAuditEvent::CompositeRollbackMarker { .. } => {}
+            }
+        }
+    }
+
+    /// §6.5 round-1 patch F2: `MAX_RATIONALE_LEN = 4096`.
+    #[test]
+    fn max_rationale_len_pinned_at_4096() {
+        assert_eq!(MAX_RATIONALE_LEN, 4096);
+    }
+
+    /// §6.5 round-1 patch F2 boundary: rationales of length
+    /// `MAX_RATIONALE_LEN` accepted; longer rejected at
+    /// construction. Validation happens at `BoundedString::new`,
+    /// not at audit-emit time, keeping the audit-emit path
+    /// infallible-on-length.
+    #[test]
+    fn moderator_rationale_boundary_at_max_rationale_len() {
+        let exact = "a".repeat(MAX_RATIONALE_LEN);
+        let over = "a".repeat(MAX_RATIONALE_LEN + 1);
+
+        let ok = BoundedString::<MAX_RATIONALE_LEN>::new(exact).unwrap();
+        let _r = ModeratorRationale::Declared(ok);
+
+        let err = BoundedString::<MAX_RATIONALE_LEN>::new(over).unwrap_err();
+        assert_eq!(err.bound, MAX_RATIONALE_LEN);
+        assert_eq!(err.len, MAX_RATIONALE_LEN + 1);
+    }
+
+    /// §6.5 commits `ModeratorRationale` as a `#[non_exhaustive]`
+    /// enum with `Declared(BoundedString<MAX_RATIONALE_LEN>)` as
+    /// the v1 variant. Future versions may add structured
+    /// rationale-reference variants additively.
+    #[test]
+    fn moderator_rationale_v1_variant_set_pinned() {
+        let r = sample_rationale();
+        match r {
+            ModeratorRationale::Declared(_) => {}
         }
     }
 }
