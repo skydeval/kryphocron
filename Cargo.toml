@@ -55,9 +55,19 @@ trybuild = "1"
 [features]
 default = []
 
-# §9.4 ships `audit-serde-json` for operators consuming JSON
-# audit streams. Phase 1 declares the feature with no impls;
-# Phase 3 (§6 audit-event vocabulary) wires the derives.
+# §9.4 / §6.10 ships `audit-serde-json` for operators consuming
+# JSON audit streams. Phase 1 declares the feature with no impls;
+# Phase 3 (§6 audit-event vocabulary) ships the variant set but
+# defers the transitive `Serialize` / `Deserialize` derive
+# wiring to Phase 6: §6.10's "every reachable type gains the
+# derives" goal requires changes across `crate::identity`
+# (ServiceIdentity's sealed-token PhantomData; Instant fields in
+# `BindOutcomeRepr::Expired`), `kryphocron-lexicons` (SemVer,
+# Nsid, Did currently lack derives), and the `proto-blue` family.
+# Both `cargo build --features audit-serde-json` and `cargo build`
+# succeed in Phase 3 — the feature flag remains structurally
+# wired and the `serde` / `serde_json` dependencies are correctly
+# optional. See chainlink for full-coverage rollout plan.
 audit-serde-json = ["dep:serde", "dep:serde_json"]
 
 [dependencies.serde]
