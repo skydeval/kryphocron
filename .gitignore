@@ -1,1 +1,6 @@
 /target
+# Internal working-process artifacts; not for public consumption
+docs/design/
+
+# Local Claude Code state
+.claude/

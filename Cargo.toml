@@ -1,6 +1,94 @@
 [package]
 name = "kryphocron"
-version = "0.0.1"
+version = "0.1.0-phase1"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Reserved."
+description = "Primitives crate for the kryphocron substrate: capability proofs, tier-aware envelopes, authorization context, audit pipeline, and inter-service auth vocabulary."
+keywords = ["atproto", "authorization", "capability", "audit"]
+categories = ["authentication", "cryptography", "data-structures"]
+publish = false
+
+# Phase 1 manifest. Phase 6 (§9 polish) will swap `license` to
+# AGPL-3.0-or-later (§9.8) once the on-disk LICENSE files are
+# replaced in lockstep. The current MIT/Apache LICENSE files are
+# pre-existing crates.io-reservation artifacts. See CHAINLINKS #1.
+
+[lib]
+name = "kryphocron"
+path = "src/lib.rs"
+
+[dependencies]
+# §9.5 trait-async dependency. Used by the §7 resolver and §8
+# encryption-hook trait surfaces. Phase 1 ships only the trait
+# shapes; concrete impls fire in Phase 4/5.
+async-trait = "0.1"
+
+# §9.5 small-vector optimization. Used in capability sets,
+# attribution chains, scope vectors, JWT scope vectors. Phase 1
+# uses it for §4.2 AttributionChain entries (replacing the spec's
+# ArrayVec reference; bounded depth is runtime-enforced by the
+# crate's constructors). See CHAINLINKS #2.
+smallvec = "1.13"
+
+# §9.5 structured error derivation. Used across §4 error enums.
+thiserror = "2"
+
+# Phase 1 does NOT yet pull in proto-blue-lexicon, blake3,
+# ed25519-dalek, or ciborium. proto-blue types ship as local
+# placeholders (CHAINLINKS #3); the cryptographic and wire-format
+# implementations are Phase 4/5 territory. The trait surfaces and
+# type vocabulary compile without those deps.
+
+[dev-dependencies]
+# `trybuild` for Phase B's "this should not compile" assertions.
+trybuild = "1"
+
+[features]
+default = []
+
+# §9.4 ships `audit-serde-json` for operators consuming JSON
+# audit streams. Phase 1 declares the feature with no impls;
+# Phase 3 (§6 audit-event vocabulary) wires the derives.
+audit-serde-json = ["dep:serde", "dep:serde_json"]
+
+[dependencies.serde]
+version = "1"
+optional = true
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1"
+optional = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2024_compatibility = { level = "warn", priority = -1 }
+
+[lints.clippy]
+# Project-standard lint level: warn `all` (correctness + suspicious
+# + style + complexity + perf), allow pedantic.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+
+# Allow phase-stub patterns explicitly.
+todo = "allow"
+unimplemented = "allow"
+
+# §4-committed shapes carry large fields (ServiceIdentity holds key
+# material + rotation evidence; DenialReason and AuthDenial carry
+# the full diagnostic payload per round-5). Boxing them would be a
+# wire-format-touching change deferred to Phase 4's perf review;
+# Phase 1 keeps the spec-committed shapes verbatim.
+large_enum_variant = "allow"
+result_large_err = "allow"
+
+# §4.8 CapabilityClaim::new constructor takes 8 args by spec; the
+# alternative (a builder) is a Phase 4 ergonomics decision.
+too_many_arguments = "allow"
+
+# The crate's #[must_use] discipline mostly lives on types
+# (Proof families, Outcome, etc.). Function-level #[must_use] on
+# helpers returning already-must_use types is doubled; clippy
+# flags it correctly — fixes are inline.
