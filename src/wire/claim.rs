@@ -96,8 +96,10 @@ impl CapabilityClaim {
     ///    except `signature`).
     /// 6. §7.6 size ceiling: encoded payload ≤
     ///    [`MAX_CAPABILITY_CLAIM_SIZE`].
-    /// 7. §4.8 W8: domain-separated Ed25519 signature with
-    ///    [`CLAIM_DOMAIN_TAG`] over the canonical encoding.
+    /// 7. §4.8 W8: domain-separated Ed25519 signature with the
+    ///    crate-internal `CLAIM_DOMAIN_TAG` constant
+    ///    (`b"kryphocron/v1/capability-claim/"`) over the
+    ///    canonical encoding.
     ///
     /// The constructed claim's `origin` is
     /// [`ClaimOrigin::SelfOriginated`]. Delegated-from-upstream
@@ -600,12 +602,12 @@ pub(crate) fn decode_payload(
 /// bytes: the canonical CBOR of all fields including the
 /// `signature` field.
 ///
-/// The wire envelope is what the [`KryphocronClaim`] HTTP
+/// The wire envelope is what the `KryphocronClaim` HTTP
 /// authorization scheme carries (after base64url encoding) and
 /// what the sync-channel framed-binary path carries (post-
 /// handshake). Receivers verify the signature against the
 /// canonical encoding of the same map *minus* the `signature`
-/// key — see [`Self::canonical_payload_bytes`].
+/// key (the `canonical_payload_bytes` crate-internal helper).
 impl CapabilityClaim {
     /// Encode this claim for wire transmission.
     #[must_use]

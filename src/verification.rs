@@ -7,10 +7,12 @@
 //! shipped the [`crate::verification::VerifiedJwt`] type with
 //! private fields and a crate-internal constructor; Phase 4a
 //! wired the constructor body. Phase 4b ships the parallel
-//! [`VerifiedCapabilityClaim`] type and constructor.
+//! [`crate::verification::VerifiedCapabilityClaim`] type and
+//! constructor.
 //!
 //! [`crate::verification::VerifiedHandshake`] /
-//! [`VerifiedSyncMessage`] (§7.5) remain Phase-4d-stubbed.
+//! [`crate::verification::VerifiedSyncMessage`] (§7.5) remain
+//! Phase-4d-stubbed.
 //!
 //! See §7.2 for the JWT verification flow, §7.5 for the
 //! sync-handshake protocol.
