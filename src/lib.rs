@@ -192,9 +192,10 @@ pub use timing::{
 pub use wire::{
     AttributionChainWire, AttributionEntryWire, AttributionPrincipal,
     CapabilityClaim, ClaimConstructionError, ClaimNonce, ClaimOrigin,
-    ClaimSignature, DelegationReceipt, DelegationReceiptPayload,
-    JwtNonce, NonceFreshness, NonceIssuerKey, NonceKind,
-    NoncePrincipal, NonceTracker, NonceTrackerError,
+    ClaimSignature, DefaultNonceTracker, DelegationReceipt,
+    DelegationReceiptPayload, JwtNonce, NonceFreshness, NonceIssuerKey,
+    NonceKind, NoncePrincipal, NonceTracker, NonceTrackerError,
     ReceiptVerificationFailure, ResourceScope, ScopeVariantName,
+    DEFAULT_NONCE_RETENTION, DEFAULT_PER_PARTITION_CAP,
     MAX_CAPABILITY_CLAIM_SIZE, MAX_CLAIM_VALIDITY, MAX_ROTATION_DEPTH,
 };

@@ -16,6 +16,7 @@ mod claim;
 mod nonce;
 mod receipt;
 mod signature;
+mod tracker;
 
 pub use self::claim::{
     CapabilityClaim, ClaimConstructionError, ClaimOrigin, ResourceScope, ScopeVariantName,
@@ -24,6 +25,9 @@ pub use self::claim::{
 pub use self::nonce::{
     ClaimNonce, JwtNonce, NonceFreshness, NonceIssuerKey, NonceKind, NoncePrincipal,
     NonceTracker, NonceTrackerError,
+};
+pub use self::tracker::{
+    DefaultNonceTracker, DEFAULT_NONCE_RETENTION, DEFAULT_PER_PARTITION_CAP,
 };
 pub use self::receipt::{
     AttributionChainWire, AttributionEntryWire, AttributionPrincipal, DelegationReceipt,
