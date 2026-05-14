@@ -638,6 +638,7 @@ version = "0.1.0-phase1"
 dependencies = [
  "async-trait",
  "base64",
+ "ciborium",
  "ed25519-dalek",
  "kryphocron-lexicons",
  "serde",

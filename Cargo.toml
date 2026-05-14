@@ -55,6 +55,14 @@ base64 = "0.22"
 # rollout for Phase 6).
 serde_json = "1"
 
+# §4.8 / §7.6 / §9.5 deterministic CBOR encoding for the
+# capability-claim wire format. Phase 4b uses ciborium's `Value`
+# tree as the building block and a project-internal canonicalizer
+# (RFC 8949 §4.2.1 length-then-bytewise map-key sort) to produce
+# round-trip-stable signatures. Pinned to 0.2 to align with the
+# version proto-blue's lexicon parsing transitively pulls in.
+ciborium = "0.2"
+
 # Phase 2 (§5 lexicon strategy) deliverable: the companion crate
 # ships the v1 lexicons, the codegen-produced Rust types, and the
 # build-time three-way-consistency-checked registry. The

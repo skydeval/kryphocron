@@ -11,6 +11,7 @@
 //! `wire` as a separate module, but the types it ships are part
 //! of the public API surface.
 
+mod canonical_cbor;
 mod claim;
 mod nonce;
 mod receipt;
