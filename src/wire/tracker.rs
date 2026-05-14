@@ -53,6 +53,12 @@ pub const DEFAULT_NONCE_RETENTION: Duration = Duration::from_secs(3700);
 /// this should ship a custom tracker.
 pub const DEFAULT_PER_PARTITION_CAP: usize = 16_384;
 
+/// One per-issuer-per-key partition: a map from observed nonce
+/// bytes to first-seen instant.
+type Partition = HashMap<[u8; 16], SystemTime>;
+/// All partitions, keyed by `(kind, NonceIssuerKey)`.
+type PartitionMap = HashMap<(NonceKind, NonceIssuerKey), Partition>;
+
 /// In-memory [`NonceTracker`] implementation.
 ///
 /// One [`Mutex`] covers the partition map; partition contents are
@@ -61,7 +67,7 @@ pub const DEFAULT_PER_PARTITION_CAP: usize = 16_384;
 /// `DashMap`, persistent backend) implement [`NonceTracker`]
 /// themselves.
 pub struct DefaultNonceTracker {
-    inner: Mutex<HashMap<(NonceKind, NonceIssuerKey), HashMap<[u8; 16], SystemTime>>>,
+    inner: Mutex<PartitionMap>,
     retention: Duration,
     per_partition_cap: usize,
 }
