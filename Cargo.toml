@@ -34,6 +34,27 @@ smallvec = "1.13"
 # §9.5 structured error derivation. Used across §4 error enums.
 thiserror = "2"
 
+# §9.5 / §7.2 Ed25519 signature verification. Phase 4a wires this
+# for the JWT verification chain; the v1 algorithm allowlist
+# defaults to Ed25519-only per §7.2's conservative-default
+# discipline. ECDSA variants (ES256/ES256K) are operator opt-in
+# and currently stub with `UnsupportedAlgorithm` — see chainlinks.
+ed25519-dalek = "2"
+
+# §7.2 / §9.5 base64url decoding for JWT segment parsing. Pinned
+# to 0.22 to align with the version proto-blue's lexicon parsing
+# transitively pulls in (one major version across the dep tree).
+base64 = "0.22"
+
+# §7.2 / §9.5 JSON parsing for JWT headers and payloads. Phase 4a
+# moves this from `optional` to unconditional because the
+# verification path needs JSON parsing on every authenticated
+# request. The `audit-serde-json` feature retains its `dep:serde`
+# activation for the optional `Serialize`/`Deserialize` derives on
+# audit events (chainlink #22 tracks the full transitive coverage
+# rollout for Phase 6).
+serde_json = "1"
+
 # Phase 2 (§5 lexicon strategy) deliverable: the companion crate
 # ships the v1 lexicons, the codegen-produced Rust types, and the
 # build-time three-way-consistency-checked registry. The
@@ -68,16 +89,19 @@ default = []
 # succeed in Phase 3 — the feature flag remains structurally
 # wired and the `serde` / `serde_json` dependencies are correctly
 # optional. See chainlink for full-coverage rollout plan.
-audit-serde-json = ["dep:serde", "dep:serde_json"]
+audit-serde-json = ["dep:serde"]
 
 [dependencies.serde]
 version = "1"
 optional = true
 features = ["derive"]
 
-[dependencies.serde_json]
-version = "1"
-optional = true
+# `serde_json` was [dependencies.serde_json] optional in Phase 1.
+# Phase 4a (§7.2 JWT verification) needs JSON parsing
+# unconditionally; moved to the unconditional `[dependencies]`
+# block above. The `audit-serde-json` feature still activates
+# `serde` for the optional Serialize/Deserialize derives on
+# audit-event types.
 
 [lints.rust]
 unsafe_code = "forbid"
