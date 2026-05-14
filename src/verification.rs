@@ -2220,6 +2220,145 @@ mod tests {
         assert!(matches!(err, ClaimVerificationError::SignatureInvalid));
     }
 
+    /// §4.8 W8 domain-separation: a signature computed WITHOUT
+    /// the `CLAIM_DOMAIN_TAG` prefix (e.g., the same canonical
+    /// payload signed JWT-style with a bare-bytes signing input)
+    /// must NOT verify. Otherwise an attacker who captures a
+    /// signature in one domain (delegation receipt, JWT, etc.)
+    /// could replay it in the capability-claim domain — exactly
+    /// the cross-domain confusion W8 forecloses.
+    #[tokio::test]
+    async fn claim_signature_without_domain_tag_fails_verification() {
+        use ed25519_dalek::Signer;
+
+        let claim = build_claim();
+        let canonical_payload = claim.canonical_payload_bytes();
+        // Sign the bare canonical payload — *without* prepending
+        // CLAIM_DOMAIN_TAG. This is the cross-domain forgery
+        // attempt.
+        let bare_sig = issuer_signing_key().sign(&canonical_payload);
+        let forged_signature = crate::wire::ClaimSignature {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: bare_sig.to_bytes(),
+        };
+        let forged_claim = crate::wire::CapabilityClaim::new_internal_received(
+            issuer_service_identity(),
+            audience_service_identity(),
+            Did::new("did:plc:subject").unwrap(),
+            crate::wire::ClaimOrigin::SelfOriginated,
+            vec![CapabilityKind::ViewPrivate],
+            crate::wire::ResourceScope::Resource(sample_resource_id()),
+            ClaimNonce::from_bytes([0xCC; 16]),
+            TraceId::from_bytes([0xDD; 16]),
+            claim.issued_at(),
+            claim.expires_at(),
+            forged_signature,
+        );
+        let header = format!("KryphocronClaim {}", URL_SAFE_NO_PAD.encode(forged_claim.to_wire_bytes()));
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let err = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ClaimVerificationError::SignatureInvalid),
+            "domain-separation bypass must fail; got {err:?}"
+        );
+    }
+
+    /// §4.8 W6 belt-and-suspenders at receive: an externally-
+    /// minted claim carrying a substrate-class capability must
+    /// be rejected at receive even though `CapabilityClaim::new`
+    /// would have caught it at construction. The substrate's own
+    /// claims pass W6 at issuance; external claims may not.
+    #[tokio::test]
+    async fn claim_with_substrate_capability_returns_non_wire_eligible_at_receive() {
+        use ed25519_dalek::Signer;
+
+        // Build a wire envelope by hand: bypass the
+        // construction-time W6 check via the crate-internal
+        // received-shape constructor, then properly sign with
+        // domain separation.
+        let issuer = issuer_service_identity();
+        let bad_caps = vec![CapabilityKind::ScanShard]; // substrate-class
+        let issued_at = SystemTime::now();
+        let expires_at = issued_at + Duration::from_secs(60);
+        let nonce = ClaimNonce::from_bytes([0xEE; 16]);
+        let trace = TraceId::from_bytes([0xFF; 16]);
+        // Provisional claim with a placeholder signature so we
+        // can call canonical_payload_bytes(); the signature isn't
+        // included in the canonical payload anyway.
+        let placeholder_sig = crate::wire::ClaimSignature {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: [0; 64],
+        };
+        let provisional = crate::wire::CapabilityClaim::new_internal_received(
+            issuer.clone(),
+            audience_service_identity(),
+            Did::new("did:plc:subject").unwrap(),
+            crate::wire::ClaimOrigin::SelfOriginated,
+            bad_caps.clone(),
+            crate::wire::ResourceScope::ClassWideAdministrative,
+            nonce,
+            trace,
+            issued_at,
+            expires_at,
+            placeholder_sig,
+        );
+        let canonical_payload = provisional.canonical_payload_bytes();
+        let mut signing_input = Vec::new();
+        signing_input.extend_from_slice(crate::wire::CLAIM_DOMAIN_TAG);
+        signing_input.extend_from_slice(&canonical_payload);
+        let real_sig = issuer_signing_key().sign(&signing_input);
+        let signed = crate::wire::CapabilityClaim::new_internal_received(
+            issuer,
+            audience_service_identity(),
+            Did::new("did:plc:subject").unwrap(),
+            crate::wire::ClaimOrigin::SelfOriginated,
+            bad_caps,
+            crate::wire::ResourceScope::ClassWideAdministrative,
+            nonce,
+            trace,
+            issued_at,
+            expires_at,
+            crate::wire::ClaimSignature {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: real_sig.to_bytes(),
+            },
+        );
+        let header = format!(
+            "KryphocronClaim {}",
+            URL_SAFE_NO_PAD.encode(signed.to_wire_bytes())
+        );
+        let resolver = populated_claim_resolver();
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let err = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*resolver,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimVerificationError::NonWireEligibleCapability(CapabilityKind::ScanShard)
+        ));
+    }
+
     #[tokio::test]
     async fn claim_with_known_alg_outside_allowlist_returns_unsupported_algorithm() {
         let claim = build_claim();

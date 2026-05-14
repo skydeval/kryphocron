@@ -355,6 +355,32 @@ pub fn from_xrpc_request<'a>(
     );
 }
 
+/// Construct [`AuthContext`] from a verified service-issued
+/// capability claim (§7.6).
+///
+/// Parallel to [`from_xrpc_request`] but for the
+/// substrate-internal trust context: the resulting context's
+/// [`Requester`] variant is [`Requester::Service`] carrying the
+/// claim's issuer identity.
+///
+/// **Phase 4b stub.** The constructor signature ships with the
+/// `VerifiedCapabilityClaim` type from §7.6 wired, but
+/// `AuthContext` construction still requires the same
+/// chain-rehydration / sink-plumbing wiring [`from_xrpc_request`]
+/// is awaiting (Phase 4d / 4e). Both stubs land together when
+/// the broader `AuthContext` construction path crystalizes.
+#[must_use]
+pub fn from_service_request<'a>(
+    _evidence: crate::verification::VerifiedCapabilityClaim,
+    _trace_id: TraceId,
+    _sinks: AuditSinks<'a>,
+    _oracles: OracleSet<'a>,
+) -> AuthContext<'a> {
+    unimplemented!(
+        "§7.6 ingress::from_service_request: Phase 4d/4e wires AuthContext rehydration"
+    );
+}
+
 /// Construct [`AuthContext`] from a verified sync-channel
 /// handshake (§4.2).
 ///
@@ -367,6 +393,25 @@ pub fn from_sync_channel_handshake<'a>(
     _oracles: OracleSet<'a>,
 ) -> AuthContext<'a> {
     unimplemented!("§4.2 ingress::from_sync_channel_handshake: Phase 4 wires");
+}
+
+/// Construct [`AuthContext`] from a verified post-handshake
+/// sync-channel message (§7.5 / §7.6).
+///
+/// **Phase 4b stub.** The signature ships with the
+/// [`crate::verification::VerifiedSyncMessage`] type from §7.6
+/// wired; construction requires the sync handshake
+/// implementation that lands in Phase 4d.
+#[must_use]
+pub fn from_sync_channel_message<'a>(
+    _evidence: crate::verification::VerifiedSyncMessage,
+    _trace_id: TraceId,
+    _sinks: AuditSinks<'a>,
+    _oracles: OracleSet<'a>,
+) -> AuthContext<'a> {
+    unimplemented!(
+        "§7.5 ingress::from_sync_channel_message: Phase 4d wires the handshake-evidence path"
+    );
 }
 
 /// Construct an anonymous [`AuthContext`] for public-read paths
