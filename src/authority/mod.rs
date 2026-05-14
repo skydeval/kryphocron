@@ -26,7 +26,8 @@ pub use self::capability::{
     UserCapability,
 };
 pub use self::moderation::{
-    InspectionNotification, InspectionNotificationQueueReader, NotificationId,
+    InspectionKind, InspectionNotification, InspectionNotificationQueueReader,
+    NotificationId,
 };
 pub use self::predicate::{
     AuthDenial, BindError, BindFailureReason, BindOutcomeRepr, DenialReason, IssuancePolicy,

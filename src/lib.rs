@@ -142,10 +142,11 @@ pub use authority::{
     AuthDenial, AuthorityId, BindError, BindFailureReason, BindOutcomeRepr,
     BoundChannelProof, BoundModerationProof, BoundSubstrateProof, BoundUserProof,
     CapabilityClass, CapabilityKind, CapabilitySemantics, CapabilitySet, ChannelProof,
-    ChannelProofRef, DenialReason, Endpoint, IssuancePolicy, ModerationCapability,
-    ModerationProof, ModerationProofRef, PipelineStage, PredicateContext, ResourceId,
-    SubstrateProof, SubstrateProofRef, SubstrateScope, UserCapability, UserProof,
-    UserProofRef,
+    ChannelProofRef, DenialReason, Endpoint, InspectionKind, InspectionNotification,
+    InspectionNotificationQueueReader, IssuancePolicy, ModerationCapability,
+    ModerationProof, ModerationProofRef, NotificationId, PipelineStage, PredicateContext,
+    ResourceId, SubstrateProof, SubstrateProofRef, SubstrateScope, UserCapability,
+    UserProof, UserProofRef,
 };
 pub use encryption::{
     AuditEncryptionAlgorithm, AuditEncryptionKeyId, EncryptionError,

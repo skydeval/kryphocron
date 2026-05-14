@@ -894,30 +894,64 @@ pub enum ModeratorRationale {
 /// `#[non_exhaustive]` discipline.
 pub const MAX_RATIONALE_LEN: usize = 4096;
 
-/// Fallback event vocabulary — what
-/// [`crate::audit::FallbackAuditSink`] receives (§4.9).
+/// Fallback channel events (§6.6).
+///
+/// Emitted to the [`crate::audit::FallbackAuditSink`]. Reserved for
+/// emission failures in the four primary channels; operators route
+/// fallback events to out-of-band channels (stderr, syslog) so they
+/// survive primary pipeline failure.
+///
+/// Fallback events have a deliberately minimal field set; the
+/// channel exists for the case where the primary channel can't be
+/// trusted. Forensic detail comes from correlating `trace_id` with
+/// events on the primary channel (when those channels recover)
+/// rather than from rich detail in the fallback events themselves.
+///
+/// The fallback sink **must not panic**; if it does, the substrate
+/// logs to stderr and aborts the process (§4.3).
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum FallbackAuditEvent {
-    /// Sink panicked.
-    SinkPanic {
-        /// Which sink.
+    /// A primary sink panicked during emission. Recorded by the
+    /// [`crate::audit::SinkPanicGuard`] machinery (§4.3). §6.6.
+    ///
+    /// (Renamed from Phase 1's `SinkPanic` to match §6.6's
+    /// committed identifier.)
+    SinkPanicked {
+        /// Which sink panicked.
         sink: SinkKind,
-        /// Trace id.
+        /// Forensic trace id (§6.1).
         trace_id: TraceId,
-        /// Capability that was being recorded.
+        /// Capability whose recording triggered the panic.
         capability: CapabilityKind,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
     },
-    /// Composite-audit failure.
+    /// A `composite_audit` scope encountered unrecoverable
+    /// inconsistency — rollback markers couldn't be emitted to
+    /// every committed sink. Operators reading this must treat the
+    /// affected `composite_op_id` as having partial coverage. §6.6.
+    ///
+    /// Correlation of [`Self::CompositeFailure`] events to primary-
+    /// channel `CompositeRollbackMarker` events by
+    /// `composite_op_id` is best-effort within the
+    /// [`crate::audit::TRACKER_GRACE_WINDOW_DEFAULT`] /
+    /// [`crate::audit::TRACKER_GRACE_WINDOW_MAX`] window (§4.9).
+    /// Markers attempted after grace expiry are rejected by the
+    /// tracker and do not appear on the primary channels; the
+    /// fallback event records the composite failure unconditionally
+    /// regardless.
     CompositeFailure {
-        /// Trace id.
+        /// Forensic trace id (§6.1).
         trace_id: TraceId,
-        /// Composite op id.
+        /// Identifies the composite scope this failure ends.
         composite_op_id: CompositeOpId,
         /// Sinks that committed before the failure.
-        sinks_committed: Vec<SinkKind>,
-        /// Sinks that failed.
-        sinks_failed: Vec<SinkKind>,
+        sinks_committed: smallvec::SmallVec<[SinkKind; 4]>,
+        /// Sinks that failed mid-flight.
+        sinks_failed: smallvec::SmallVec<[SinkKind; 4]>,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
     },
 }
 
@@ -1599,5 +1633,56 @@ mod tests {
         match r {
             ModeratorRationale::Declared(_) => {}
         }
+    }
+
+    // ============================================================
+    // §6.6 fallback channel
+    // ============================================================
+
+    /// §6.6 commits exactly two `FallbackAuditEvent` variants:
+    /// `SinkPanicked` (renamed from Phase 1's `SinkPanic`) and
+    /// `CompositeFailure`. Both gained an explicit `at:
+    /// SystemTime` field per §6.1.
+    #[test]
+    fn fallback_audit_event_v1_variant_set_pinned() {
+        let trace_id = sample_trace_id();
+        let at = SystemTime::UNIX_EPOCH;
+
+        let panicked = FallbackAuditEvent::SinkPanicked {
+            sink: SinkKind::User,
+            trace_id,
+            capability: CapabilityKind::ViewPrivate,
+            at,
+        };
+        let composite = FallbackAuditEvent::CompositeFailure {
+            trace_id,
+            composite_op_id: CompositeOpId::from_bytes([0u8; 16]),
+            sinks_committed: smallvec::smallvec![SinkKind::User, SinkKind::Substrate],
+            sinks_failed: smallvec::smallvec![SinkKind::Channel],
+            at,
+        };
+
+        for ev in [panicked, composite] {
+            match ev {
+                FallbackAuditEvent::SinkPanicked { .. }
+                | FallbackAuditEvent::CompositeFailure { .. } => {}
+            }
+        }
+    }
+
+    /// §6.6 migrated `sinks_committed` and `sinks_failed` from
+    /// `Vec<SinkKind>` to `SmallVec<[SinkKind; 4]>` to avoid heap
+    /// allocations in the common ≤4-sinks-per-composite case.
+    #[test]
+    fn fallback_composite_failure_uses_smallvec_inline_for_le_4_sinks() {
+        let four: smallvec::SmallVec<[SinkKind; 4]> = smallvec::smallvec![
+            SinkKind::User,
+            SinkKind::Channel,
+            SinkKind::Substrate,
+            SinkKind::Moderation,
+        ];
+        // Inline-cap = 4: a four-element SmallVec lives on the
+        // stack rather than the heap.
+        assert!(!four.spilled());
     }
 }

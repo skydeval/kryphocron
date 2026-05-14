@@ -74,10 +74,17 @@ pub trait ModerationAuditSink: Send + Sync {
 }
 
 /// Fallback sink for sink-panic / composite-failure events
-/// (§4.9).
+/// (§4.9 / §6.6).
 ///
 /// **Must not panic.** If it does, the substrate logs to stderr
 /// and aborts the process.
+///
+/// The two argument-shape methods ([`Self::record_panic`] and
+/// [`Self::record_composite_failure`]) take an explicit `at:
+/// SystemTime` so the substrate's emission timestamp matches what
+/// the variants record per §6.1's universal `at` rule. Sink
+/// implementers preferring to receive the constructed event
+/// directly use [`Self::record_event`].
 pub trait FallbackAuditSink: Send + Sync {
     /// Record a sink panic.
     fn record_panic(
@@ -85,6 +92,7 @@ pub trait FallbackAuditSink: Send + Sync {
         sink: SinkKind,
         trace_id: crate::identity::TraceId,
         capability: crate::authority::capability::CapabilityKind,
+        at: std::time::SystemTime,
     );
 
     /// Record a composite-audit failure.
@@ -94,6 +102,7 @@ pub trait FallbackAuditSink: Send + Sync {
         composite_op_id: super::composite::CompositeOpId,
         sinks_committed: &[SinkKind],
         sinks_failed: &[SinkKind],
+        at: std::time::SystemTime,
     );
 
     /// Generic record entry: helpful for tests and
