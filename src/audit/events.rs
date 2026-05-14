@@ -81,8 +81,8 @@
 use std::time::SystemTime;
 
 use crate::authority::capability::CapabilityKind;
-use crate::authority::predicate::{BindFailureReason, BindOutcomeRepr, DenialReason};
-use crate::identity::TraceId;
+use crate::authority::predicate::{BindFailureReason, BindOutcomeRepr, DenialReason, SemVer};
+use crate::identity::{ServiceIdentity, SessionDigest, SessionId, TraceId};
 use crate::ingress::{AttributionChain, Requester};
 use crate::proto::Did;
 use crate::target::TargetRepresentation;
@@ -192,22 +192,205 @@ pub enum UserAuditEvent {
     },
 }
 
-/// Channel-class audit events (Phase 3 fills in the variant set
-/// per §6). Phase 1 carries a single placeholder event so the
-/// type is constructible from tests.
+/// Channel-class audit events (§6.3).
+///
+/// Emitted to the [`crate::audit::ChannelAuditSink`]. Channels are
+/// sync-channel sessions between substrate peers (§4.3
+/// [`crate::Endpoint`]); these variants record session lifecycle
+/// and per-session activity. `session_digest` is the keyed-Blake3
+/// hash of the session id (§4.4), correlating multiple events from
+/// the same session within the deployment without leaking session
+/// identity across deployments.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ChannelAuditEvent {
-    /// Capability proof bound on a channel-class operation.
-    CapabilityBound {
-        /// Trace id.
+    /// `ChannelProof::bind` ran to terminal outcome. Establishes a
+    /// session-bound proof for the sync channel. §6.3.
+    ChannelBound {
+        /// Forensic trace id (§6.1).
         trace_id: TraceId,
-        /// Capability.
-        capability: CapabilityKind,
-        /// Outcome.
+        /// Peer service identity.
+        peer: ServiceIdentity,
+        /// Keyed-Blake3 session digest (§4.4).
+        session_digest: SessionDigest,
+        /// Channel-class endpoint capability.
+        endpoint: CapabilityKind,
+        /// Outcome of the bind (§4.3 [`BindOutcomeRepr`]).
         outcome: BindOutcomeRepr,
-        /// When.
+        /// Emission wallclock (§6.1).
         at: SystemTime,
+    },
+    /// Channel issuance was rejected at the authority chokepoint.
+    /// §6.3.
+    ChannelIssuanceDenied {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Peer service identity.
+        peer: ServiceIdentity,
+        /// Channel-class endpoint capability.
+        endpoint: CapabilityKind,
+        /// Reason the issuance chokepoint denied.
+        reason: DenialReason,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// A reborrow of a bound channel proof failed mid-session.
+    /// Successful reborrows are silent (the original bind covered
+    /// the terminal event). §6.3.
+    ChannelReborrowFailed {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Peer service identity.
+        peer: ServiceIdentity,
+        /// Keyed-Blake3 session digest.
+        session_digest: SessionDigest,
+        /// Channel-class endpoint capability.
+        endpoint: CapabilityKind,
+        /// Reborrow-specific failure reason.
+        reason: BindFailureReason,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// A sync batch was rejected wholesale (e.g., lexicon-set
+    /// version skew detected at handshake per §5.5). Per-record
+    /// rejections during a successful sync emit individual user-
+    /// or substrate-class events; this variant is for whole-batch
+    /// rejections. §6.3.
+    ///
+    /// Emitted symmetrically: the substrate that observes the
+    /// rejection emits one event from its perspective. The
+    /// rejecting side and the rejected side both emit (when their
+    /// observation paths allow it; §7's sync-handshake spec
+    /// commits to the receiver sending a rejection signal before
+    /// closing so the sender observes the rejection rather than
+    /// just timing out). Round-1 patch F4 introduced
+    /// [`SyncPerspective`] to disambiguate.
+    SyncBatchRejected {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Peer service identity.
+        peer: ServiceIdentity,
+        /// Keyed-Blake3 session digest.
+        session_digest: SessionDigest,
+        /// Whether this substrate was the local sender or
+        /// receiver in the rejected sync.
+        perspective: SyncPerspective,
+        /// Reason for the batch rejection.
+        reason: BatchRejectionReason,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// Channel session ended. The substrate emits one per session
+    /// regardless of cause (clean close, peer disconnect, timeout,
+    /// substrate shutdown). §6.3.
+    ChannelClosed {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Peer service identity.
+        peer: ServiceIdentity,
+        /// Keyed-Blake3 session digest.
+        session_digest: SessionDigest,
+        /// What ended the session.
+        cause: ChannelCloseCause,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// A sync-channel message arrived with a `session_id` not in
+    /// the receiving substrate instance's local session tracker.
+    /// Typically indicates load-balancer routing misconfiguration
+    /// in multi-instance deployments (sessions are process-local
+    /// per §7.5; sticky load-balancing is required for handshake-
+    /// established sessions). The substrate closes the connection
+    /// after emitting this event; operators monitoring for this
+    /// event detect routing anomalies. §6.3.
+    UnknownSessionMessage {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// The session id observed on the wire.
+        session_id_received: SessionId,
+        /// Peer identity, if any portion of the handshake
+        /// completed before the unknown-session-id failure.
+        peer_identity: Option<ServiceIdentity>,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// Composite-audit rollback marker for channel-class
+    /// operations. §6.3.
+    CompositeRollbackMarker {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Identifies the composite scope this marker rolls back.
+        composite_op_id: CompositeOpId,
+        /// Which sibling sink's failure triggered the rollback.
+        failing_sink: SinkKind,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+}
+
+/// Discriminator for [`ChannelAuditEvent::SyncBatchRejected`]'s
+/// `perspective` field (§6.3, round-1 patch F4).
+///
+/// The two-perspective variant set distinguishes whether *this*
+/// substrate was the sender or receiver in the rejected sync, so
+/// operators correlating sender-side and receiver-side records of
+/// the same rejection can recover causality.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyncPerspective {
+    /// This substrate initiated the sync; the rejection was
+    /// observed from the peer or via timeout.
+    LocalAsSender,
+    /// The peer initiated the sync; this substrate rejected it.
+    LocalAsReceiver,
+}
+
+/// Reason a sync batch was rejected wholesale (§6.3).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchRejectionReason {
+    /// Lexicon-set major versions did not match across peers.
+    /// Round-1 patch on §5.5 made the major version a hard
+    /// rejection criterion at the handshake stage.
+    LexiconSetMajorVersionMismatch {
+        /// This substrate's local lexicon-set version.
+        local: SemVer,
+        /// Peer's lexicon-set version as observed at handshake.
+        peer: SemVer,
+    },
+    /// Peer not present in the local trust set.
+    UnauthorizedPeer,
+    /// Handshake signature did not verify under the peer's
+    /// declared key material.
+    HandshakeSignatureInvalid,
+    /// Handshake did not complete within its timeout.
+    HandshakeTimeout,
+    /// Handshake nonce was previously seen; replay rejected.
+    HandshakeNonceReplay {
+        /// `at` of the first observation of this nonce.
+        first_seen_at: SystemTime,
+    },
+}
+
+/// What ended a channel session (§6.3).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelCloseCause {
+    /// Both peers concluded the session via the protocol's clean-
+    /// close handshake.
+    CleanClose,
+    /// Peer disconnected without a clean-close handshake.
+    PeerDisconnected,
+    /// Session exceeded its activity timeout.
+    Timeout,
+    /// Substrate process is shutting down; sessions closed as
+    /// part of orderly drain.
+    SubstrateShutdown,
+    /// A protocol-level error closed the session. Free-text
+    /// `detail` is operator-visible.
+    ProtocolError {
+        /// Operator-visible static rationale string.
+        detail: &'static str,
     },
 }
 
@@ -301,14 +484,16 @@ pub enum DerivationOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
     use crate::authority::capability::CapabilityKind;
-    use crate::authority::predicate::{BindFailureReason, BindOutcomeRepr, DenialReason};
-    use crate::identity::TraceId;
+    use crate::authority::predicate::{BindFailureReason, BindOutcomeRepr, DenialReason, SemVer};
+    use crate::identity::{
+        KeyId, PublicKey, ServiceIdentity, SessionDigest, SessionId, SignatureAlgorithm, TraceId,
+    };
     use crate::ingress::{AttributionChain, Requester};
-    use crate::oracle::{OracleKind, OracleQueryKind, BlockOracleQuery};
+    use crate::oracle::{BlockOracleQuery, OracleKind, OracleQueryKind};
     use crate::proto::Did;
     use crate::target::{StructuralRepresentation, TargetRepresentation};
 
@@ -325,6 +510,22 @@ mod tests {
 
     fn sample_trace_id() -> TraceId {
         TraceId::from_bytes([0u8; 16])
+    }
+
+    fn sample_service_identity() -> ServiceIdentity {
+        ServiceIdentity::new_internal(
+            sample_did(),
+            KeyId::from_bytes([0u8; 32]),
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    fn sample_session_digest() -> SessionDigest {
+        SessionDigest::from_bytes([0u8; 32])
     }
 
     /// §6.2 commits exactly five variants in this order:
@@ -403,7 +604,7 @@ mod tests {
     #[test]
     fn user_audit_event_carries_trace_id_and_at_per_6_1() {
         let trace_id = sample_trace_id();
-        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
         let bound = UserAuditEvent::CapabilityBound {
             trace_id,
             requester: sample_did(),
@@ -443,5 +644,144 @@ mod tests {
             attribution: chain,
             at: SystemTime::UNIX_EPOCH,
         };
+    }
+
+    // ============================================================
+    // §6.3 channel-class
+    // ============================================================
+
+    /// §6.3 commits exactly seven variants in this order:
+    /// `ChannelBound`, `ChannelIssuanceDenied`,
+    /// `ChannelReborrowFailed`, `SyncBatchRejected`,
+    /// `ChannelClosed`, `UnknownSessionMessage`,
+    /// `CompositeRollbackMarker`.
+    #[test]
+    fn channel_audit_event_v1_variant_set_pinned() {
+        let trace_id = sample_trace_id();
+        let at = SystemTime::UNIX_EPOCH;
+        let peer = sample_service_identity();
+        let digest = sample_session_digest();
+        let endpoint = CapabilityKind::ViewPrivate;
+
+        let bound = ChannelAuditEvent::ChannelBound {
+            trace_id,
+            peer: peer.clone(),
+            session_digest: digest,
+            endpoint,
+            outcome: BindOutcomeRepr::Success,
+            at,
+        };
+        let denied = ChannelAuditEvent::ChannelIssuanceDenied {
+            trace_id,
+            peer: peer.clone(),
+            endpoint,
+            reason: DenialReason::OwnershipCheckFailed,
+            at,
+        };
+        let reborrow = ChannelAuditEvent::ChannelReborrowFailed {
+            trace_id,
+            peer: peer.clone(),
+            session_digest: digest,
+            endpoint,
+            reason: BindFailureReason::AuditUnavailable,
+            at,
+        };
+        let batch = ChannelAuditEvent::SyncBatchRejected {
+            trace_id,
+            peer: peer.clone(),
+            session_digest: digest,
+            perspective: SyncPerspective::LocalAsReceiver,
+            reason: BatchRejectionReason::UnauthorizedPeer,
+            at,
+        };
+        let closed = ChannelAuditEvent::ChannelClosed {
+            trace_id,
+            peer,
+            session_digest: digest,
+            cause: ChannelCloseCause::CleanClose,
+            at,
+        };
+        let unknown = ChannelAuditEvent::UnknownSessionMessage {
+            trace_id,
+            session_id_received: SessionId::from_bytes([0u8; 32]),
+            peer_identity: None,
+            at,
+        };
+        let rollback = ChannelAuditEvent::CompositeRollbackMarker {
+            trace_id,
+            composite_op_id: CompositeOpId::from_bytes([0u8; 16]),
+            failing_sink: SinkKind::User,
+            at,
+        };
+
+        for ev in [bound, denied, reborrow, batch, closed, unknown, rollback] {
+            match ev {
+                ChannelAuditEvent::ChannelBound { .. }
+                | ChannelAuditEvent::ChannelIssuanceDenied { .. }
+                | ChannelAuditEvent::ChannelReborrowFailed { .. }
+                | ChannelAuditEvent::SyncBatchRejected { .. }
+                | ChannelAuditEvent::ChannelClosed { .. }
+                | ChannelAuditEvent::UnknownSessionMessage { .. }
+                | ChannelAuditEvent::CompositeRollbackMarker { .. } => {}
+            }
+        }
+    }
+
+    /// §6.3 round-1 patch F4 introduces [`SyncPerspective`] with
+    /// exactly two variants. The kickoff names them
+    /// `Sender`/`Receiver` but §6.3 commits
+    /// `LocalAsSender`/`LocalAsReceiver`; the spec wording is
+    /// authoritative.
+    #[test]
+    fn sync_perspective_v1_variant_set_pinned() {
+        for p in [SyncPerspective::LocalAsSender, SyncPerspective::LocalAsReceiver] {
+            match p {
+                SyncPerspective::LocalAsSender | SyncPerspective::LocalAsReceiver => {}
+            }
+        }
+    }
+
+    /// §6.3 commits exactly five `BatchRejectionReason` variants.
+    #[test]
+    fn batch_rejection_reason_v1_variant_set_pinned() {
+        let v1 = BatchRejectionReason::LexiconSetMajorVersionMismatch {
+            local: SemVer::new(1, 0, 0),
+            peer: SemVer::new(2, 0, 0),
+        };
+        let v2 = BatchRejectionReason::UnauthorizedPeer;
+        let v3 = BatchRejectionReason::HandshakeSignatureInvalid;
+        let v4 = BatchRejectionReason::HandshakeTimeout;
+        let v5 = BatchRejectionReason::HandshakeNonceReplay {
+            first_seen_at: SystemTime::UNIX_EPOCH,
+        };
+        for r in [v1, v2, v3, v4, v5] {
+            match r {
+                BatchRejectionReason::LexiconSetMajorVersionMismatch { .. }
+                | BatchRejectionReason::UnauthorizedPeer
+                | BatchRejectionReason::HandshakeSignatureInvalid
+                | BatchRejectionReason::HandshakeTimeout
+                | BatchRejectionReason::HandshakeNonceReplay { .. } => {}
+            }
+        }
+    }
+
+    /// §6.3 commits exactly five `ChannelCloseCause` variants.
+    #[test]
+    fn channel_close_cause_v1_variant_set_pinned() {
+        for c in [
+            ChannelCloseCause::CleanClose,
+            ChannelCloseCause::PeerDisconnected,
+            ChannelCloseCause::Timeout,
+            ChannelCloseCause::SubstrateShutdown,
+            ChannelCloseCause::ProtocolError { detail: "test" },
+        ] {
+            match c {
+                ChannelCloseCause::CleanClose
+                | ChannelCloseCause::PeerDisconnected
+                | ChannelCloseCause::Timeout
+                | ChannelCloseCause::SubstrateShutdown
+                | ChannelCloseCause::ProtocolError { .. } => {}
+            }
+        }
     }
 }

@@ -18,8 +18,9 @@ pub use self::composite::{
     TRACKER_SHARDS,
 };
 pub use self::events::{
-    ChannelAuditEvent, DerivationOutcome, FallbackAuditEvent, ModerationAuditEvent,
-    NarrowingKind, SubstrateAuditEvent, UserAuditEvent,
+    BatchRejectionReason, ChannelAuditEvent, ChannelCloseCause, DerivationOutcome,
+    FallbackAuditEvent, ModerationAuditEvent, NarrowingKind, SubstrateAuditEvent,
+    SyncPerspective, UserAuditEvent,
 };
 pub use self::rate_limit::{IssuanceRateLimiter, TokenBucket};
 pub use self::sinks::{
