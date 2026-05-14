@@ -196,5 +196,5 @@ pub use wire::{
     JwtNonce, NonceFreshness, NonceIssuerKey, NonceKind,
     NoncePrincipal, NonceTracker, NonceTrackerError,
     ReceiptVerificationFailure, ResourceScope, ScopeVariantName,
-    MAX_CLAIM_VALIDITY, MAX_ROTATION_DEPTH,
+    MAX_CAPABILITY_CLAIM_SIZE, MAX_CLAIM_VALIDITY, MAX_ROTATION_DEPTH,
 };

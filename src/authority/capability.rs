@@ -125,6 +125,58 @@ impl CapabilityKind {
             CapabilityClass::User | CapabilityClass::Channel
         )
     }
+
+    /// Stable wire-encoding name for this capability kind (§4.8).
+    ///
+    /// Used as the canonical-CBOR text representation in
+    /// [`crate::CapabilityClaim`] payloads. Distinct from
+    /// `Debug`'s output, which is not a stable contract. Each
+    /// returned `&'static str` is the variant's ASCII identifier
+    /// in `lowerCamelCase`; the inverse is
+    /// [`Self::from_wire_name`].
+    #[must_use]
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            CapabilityKind::ViewPrivate => "viewPrivate",
+            CapabilityKind::ParticipatePrivate => "participatePrivate",
+            CapabilityKind::EditPrivatePost => "editPrivatePost",
+            CapabilityKind::DeletePrivatePost => "deletePrivatePost",
+            CapabilityKind::ManageAudience => "manageAudience",
+            CapabilityKind::EmitToSyncChannel => "emitToSyncChannel",
+            CapabilityKind::AppViewSync => "appViewSync",
+            CapabilityKind::GraphSync => "graphSync",
+            CapabilityKind::ScanShard => "scanShard",
+            CapabilityKind::ReplicatePrivate => "replicatePrivate",
+            CapabilityKind::GarbageCollect => "garbageCollect",
+            CapabilityKind::ModeratorRead => "moderatorRead",
+            CapabilityKind::ModeratorTakedown => "moderatorTakedown",
+            CapabilityKind::ModeratorRestore => "moderatorRestore",
+        }
+    }
+
+    /// Inverse of [`Self::wire_name`]. Returns `None` for unknown
+    /// names — the receive-side parser surfaces this as a
+    /// `Malformed` claim.
+    #[must_use]
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "viewPrivate" => CapabilityKind::ViewPrivate,
+            "participatePrivate" => CapabilityKind::ParticipatePrivate,
+            "editPrivatePost" => CapabilityKind::EditPrivatePost,
+            "deletePrivatePost" => CapabilityKind::DeletePrivatePost,
+            "manageAudience" => CapabilityKind::ManageAudience,
+            "emitToSyncChannel" => CapabilityKind::EmitToSyncChannel,
+            "appViewSync" => CapabilityKind::AppViewSync,
+            "graphSync" => CapabilityKind::GraphSync,
+            "scanShard" => CapabilityKind::ScanShard,
+            "replicatePrivate" => CapabilityKind::ReplicatePrivate,
+            "garbageCollect" => CapabilityKind::GarbageCollect,
+            "moderatorRead" => CapabilityKind::ModeratorRead,
+            "moderatorTakedown" => CapabilityKind::ModeratorTakedown,
+            "moderatorRestore" => CapabilityKind::ModeratorRestore,
+            _ => return None,
+        })
+    }
 }
 
 /// Capability semantics: read vs. write (§4.3 stage-0

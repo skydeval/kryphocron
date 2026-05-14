@@ -3,20 +3,47 @@
 use core::marker::PhantomData;
 use std::time::{Duration, SystemTime};
 
+use ciborium::Value;
+use ed25519_dalek::Signer;
 use thiserror::Error;
 
 use crate::authority::capability::CapabilityKind;
 use crate::authority::subjects::ResourceId;
-use crate::identity::{ServiceIdentity, TraceId};
+use crate::identity::{KeyId, PublicKey, ServiceIdentity, SignatureAlgorithm, TraceId};
 use crate::proto::Did;
 use crate::sealed;
 
+use super::canonical_cbor;
 use super::nonce::ClaimNonce;
-use super::receipt::AttributionChainWire;
+use super::receipt::{
+    AttributionChainWire, AttributionEntryWire, AttributionPrincipal, DelegationReceipt,
+};
 use super::signature::ClaimSignature;
 
 /// Maximum validity window for a [`CapabilityClaim`] (§4.8).
 pub const MAX_CLAIM_VALIDITY: Duration = Duration::from_secs(600);
+
+/// Maximum byte size of a deterministic-CBOR-encoded
+/// [`CapabilityClaim`] (§7.6).
+///
+/// 4 KB before base64url encoding; after the ~33% expansion the
+/// HTTP `Authorization` header value lands at ~5462 bytes plus
+/// the `KryphocronClaim` scheme prefix. The substrate refuses to
+/// mint claims it cannot transmit — failure is fail-fast at
+/// issuance via [`ClaimConstructionError::ClaimTooLarge`] rather
+/// than discover-at-transit.
+pub const MAX_CAPABILITY_CLAIM_SIZE: usize = 4096;
+
+/// Domain-separation tag for [`CapabilityClaim`] signatures
+/// (§4.8 W8).
+///
+/// Signing input is `DOMAIN_TAG || canonical_cbor(payload)`.
+/// Other §7 contexts use distinct tags
+/// (`b"kryphocron/v1/attribution-receipt/"` for delegation
+/// receipts in Phase 4e; service trust declarations in Phase 4c
+/// and the sync handshake in Phase 4d will land their own).
+/// Cross-domain signature reuse is foreclosed by tag distinctness.
+pub(crate) const CLAIM_DOMAIN_TAG: &[u8] = b"kryphocron/v1/capability-claim/";
 
 /// Cross-service wire vocabulary for capability delegation (§4.8).
 ///
@@ -46,35 +73,53 @@ pub struct CapabilityClaim {
 }
 
 impl CapabilityClaim {
-    /// Construct a [`CapabilityClaim`] (§4.8 constructor).
+    /// Construct a self-originated [`CapabilityClaim`] (§4.8
+    /// constructor).
     ///
-    /// Validation per-class:
+    /// `signing_key` is the Ed25519 private key whose public half
+    /// matches `issuer.key_material()`. Phase 4b enforces a
+    /// defensive equality check between the derived public bytes
+    /// and the issuer's declared key material; mismatch returns
+    /// [`ClaimConstructionError::SigningFailed`]. Operators
+    /// holding their service signing keys via KMS-equivalent
+    /// machinery are responsible for keeping the key pair coherent.
     ///
-    /// - Substrate-class and moderation-class capabilities are
-    ///   never wire-eligible (§4.8 W6); attempting either rejects
-    ///   with [`ClaimConstructionError::NonWireEligibleCapability`].
-    /// - User-class restricts `resource_scope` to
-    ///   [`ResourceScope::Resource`] (§4.8 W9).
-    /// - Mixed-class claims must satisfy **all** classes' scope
-    ///   restrictions (§4.8 W10).
-    /// - `validity` must be ≤ [`MAX_CLAIM_VALIDITY`].
-    /// - Phase 4 wires the signing path; Phase 1 returns
-    ///   [`ClaimConstructionError::SigningFailed`].
+    /// Validation order per §4.8:
+    ///
+    /// 1. `validity` ≤ [`MAX_CLAIM_VALIDITY`].
+    /// 2. §4.8 W6: substrate-class and moderation-class
+    ///    capabilities are never wire-eligible.
+    /// 3. §4.8 W9 / W10: per-class scope restrictions; mixed-
+    ///    class claims must satisfy *all* classes' restrictions.
+    /// 4. Issuer / signing-key coherence.
+    /// 5. Canonical CBOR encoding of the payload (every field
+    ///    except `signature`).
+    /// 6. §7.6 size ceiling: encoded payload ≤
+    ///    [`MAX_CAPABILITY_CLAIM_SIZE`].
+    /// 7. §4.8 W8: domain-separated Ed25519 signature with
+    ///    [`CLAIM_DOMAIN_TAG`] over the canonical encoding.
+    ///
+    /// The constructed claim's `origin` is
+    /// [`ClaimOrigin::SelfOriginated`]. Delegated-from-upstream
+    /// construction (`ClaimOrigin::DelegatedFromUpstream`) lands
+    /// in Phase 4e alongside the receipt-signing path; see
+    /// chainlinks.
     ///
     /// # Errors
     ///
     /// See [`ClaimConstructionError`].
     pub fn new(
-        _issuer: ServiceIdentity,
-        _audience: ServiceIdentity,
-        _subject: Did,
+        issuer: ServiceIdentity,
+        audience: ServiceIdentity,
+        subject: Did,
         capabilities: Vec<CapabilityKind>,
         resource_scope: ResourceScope,
-        _nonce: ClaimNonce,
-        _trace_id: TraceId,
+        nonce: ClaimNonce,
+        trace_id: TraceId,
         validity: Duration,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<Self, ClaimConstructionError> {
-        // §4.8 validity ceiling.
+        // 1. Validity ceiling.
         if validity > MAX_CLAIM_VALIDITY {
             return Err(ClaimConstructionError::ValidityTooLong {
                 requested: validity,
@@ -82,24 +127,143 @@ impl CapabilityClaim {
             });
         }
 
-        // §4.8 W6: substrate / moderation capabilities never on
-        // the wire.
+        // 2. W6: substrate / moderation capabilities never on
+        //    the wire.
         for cap in &capabilities {
             if !cap.is_wire_eligible() {
                 return Err(ClaimConstructionError::NonWireEligibleCapability(*cap));
             }
         }
 
-        // §4.8 W9 / W10: per-class scope restrictions. The
-        // validate-per-class logic is straightforward but the
-        // crate-level enforcement matters; Phase 4 expands this
-        // with the Channel-class permitted broader scopes.
+        // 3. W9 / W10: per-class scope restrictions.
         for cap in &capabilities {
             check_scope_for_class(*cap, &resource_scope)?;
         }
 
-        // Phase 4 wires the signing path.
-        Err(ClaimConstructionError::SigningFailed)
+        // 4. Issuer / signing-key coherence. A mismatch produces
+        //    a claim that fails verification at every receiver;
+        //    surface it at construction so operators don't ship
+        //    broken claims into the wild. The check is constant-
+        //    time on 32 bytes — no information leak.
+        let derived_public = signing_key.verifying_key().to_bytes();
+        if derived_public != issuer.key_material().bytes {
+            return Err(ClaimConstructionError::SigningFailed);
+        }
+
+        // Build the unsigned payload value.
+        let now = SystemTime::now();
+        let issued_at = now;
+        let expires_at = now + validity;
+        let origin = ClaimOrigin::SelfOriginated;
+
+        // 5. Canonical-CBOR encode the payload (every field
+        //    except `signature`).
+        let canonical_bytes = encode_payload(
+            &issuer,
+            &audience,
+            &subject,
+            &origin,
+            &capabilities,
+            &resource_scope,
+            &nonce,
+            &trace_id,
+            issued_at,
+            expires_at,
+        );
+
+        // 6. §7.6 size ceiling.
+        if canonical_bytes.len() > MAX_CAPABILITY_CLAIM_SIZE {
+            return Err(ClaimConstructionError::ClaimTooLarge {
+                size: canonical_bytes.len(),
+                max: MAX_CAPABILITY_CLAIM_SIZE,
+            });
+        }
+
+        // 7. W8 domain-separated Ed25519 signature.
+        let mut signing_input =
+            Vec::with_capacity(CLAIM_DOMAIN_TAG.len() + canonical_bytes.len());
+        signing_input.extend_from_slice(CLAIM_DOMAIN_TAG);
+        signing_input.extend_from_slice(&canonical_bytes);
+        let sig = signing_key.sign(&signing_input);
+        let signature = ClaimSignature {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: sig.to_bytes(),
+        };
+
+        Ok(CapabilityClaim {
+            issuer,
+            audience,
+            subject,
+            origin,
+            capabilities,
+            resource_scope,
+            nonce,
+            trace_id,
+            issued_at,
+            expires_at,
+            signature,
+            _private: PhantomData,
+        })
+    }
+
+    /// Crate-internal constructor for received claims. Reserved
+    /// for [`crate::verification::verify_capability_claim`] after
+    /// every §7.6 verification stage has succeeded; not reachable
+    /// from outside `crate::wire` / `crate::verification`.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_internal_received(
+        issuer: ServiceIdentity,
+        audience: ServiceIdentity,
+        subject: Did,
+        origin: ClaimOrigin,
+        capabilities: Vec<CapabilityKind>,
+        resource_scope: ResourceScope,
+        nonce: ClaimNonce,
+        trace_id: TraceId,
+        issued_at: SystemTime,
+        expires_at: SystemTime,
+        signature: ClaimSignature,
+    ) -> Self {
+        CapabilityClaim {
+            issuer,
+            audience,
+            subject,
+            origin,
+            capabilities,
+            resource_scope,
+            nonce,
+            trace_id,
+            issued_at,
+            expires_at,
+            signature,
+            _private: PhantomData,
+        }
+    }
+
+    /// Re-emit the canonical CBOR encoding of this claim's
+    /// signed payload (all fields except `signature`).
+    ///
+    /// Receivers re-encode the deserialized payload with this
+    /// helper and verify the result byte-equals the on-wire
+    /// payload — the round-trip check that closes the §7
+    /// round-4 non-canonicality hazard. Senders use the same
+    /// helper inside [`Self::new`] to produce signature input
+    /// bytes.
+    #[must_use]
+    pub(crate) fn canonical_payload_bytes(&self) -> Vec<u8> {
+        encode_payload(
+            &self.issuer,
+            &self.audience,
+            &self.subject,
+            &self.origin,
+            &self.capabilities,
+            &self.resource_scope,
+            &self.nonce,
+            &self.trace_id,
+            self.issued_at,
+            self.expires_at,
+        )
     }
 
     /// Borrow the issuer.
@@ -166,6 +330,419 @@ impl CapabilityClaim {
     #[must_use]
     pub fn signature(&self) -> &ClaimSignature {
         &self.signature
+    }
+}
+
+// ============================================================
+// §4.8 deterministic CBOR encoding for the wire payload.
+// ============================================================
+
+/// Encode the unsigned payload (every field except `signature`)
+/// as canonical RFC 8949 §4.2 CBOR.
+///
+/// The shape is a top-level map with ten keys; nested values use
+/// the encoders below. All map orderings are imposed by
+/// [`canonical_cbor::canonicalize`] downstream of this builder,
+/// so the per-builder `Value::Map(vec![...])` insertion order is
+/// not load-bearing.
+#[allow(clippy::too_many_arguments)]
+fn encode_payload(
+    issuer: &ServiceIdentity,
+    audience: &ServiceIdentity,
+    subject: &Did,
+    origin: &ClaimOrigin,
+    capabilities: &[CapabilityKind],
+    resource_scope: &ResourceScope,
+    nonce: &ClaimNonce,
+    trace_id: &TraceId,
+    issued_at: SystemTime,
+    expires_at: SystemTime,
+) -> Vec<u8> {
+    let map = Value::Map(vec![
+        (Value::Text("issuer".into()), service_identity_value(issuer)),
+        (Value::Text("audience".into()), service_identity_value(audience)),
+        (Value::Text("subject".into()), Value::Text(subject.as_str().to_string())),
+        (Value::Text("origin".into()), claim_origin_value(origin)),
+        (Value::Text("capabilities".into()), capabilities_value(capabilities)),
+        (Value::Text("resource_scope".into()), resource_scope_value(resource_scope)),
+        (Value::Text("nonce".into()), Value::Bytes(nonce.as_bytes().to_vec())),
+        (Value::Text("trace_id".into()), Value::Bytes(trace_id.as_bytes().to_vec())),
+        (Value::Text("issued_at".into()), system_time_value(issued_at)),
+        (Value::Text("expires_at".into()), system_time_value(expires_at)),
+    ]);
+    canonical_cbor::to_canonical_bytes(map)
+}
+
+/// Encode a [`ServiceIdentity`] as a four-field map. The
+/// optional `rotation_evidence` field is intentionally **not**
+/// included: §4.8 commits that non-signing-key parts of
+/// `ServiceIdentity` may change without affecting the identity's
+/// signing semantics, so binding signatures to the rotation
+/// chain would invalidate claims after legitimate, non-signing
+/// rotation events.
+fn service_identity_value(s: &ServiceIdentity) -> Value {
+    Value::Map(vec![
+        (Value::Text("did".into()), Value::Text(s.service_did().as_str().to_string())),
+        (Value::Text("key_id".into()), Value::Bytes(s.key_id().as_bytes().to_vec())),
+        (Value::Text("key_alg".into()), Value::Text(signature_alg_name(s.key_material().algorithm).into())),
+        (Value::Text("key_material".into()), Value::Bytes(s.key_material().bytes.to_vec())),
+    ])
+}
+
+/// Stable wire name for the [`SignatureAlgorithm`] enum.
+fn signature_alg_name(a: SignatureAlgorithm) -> &'static str {
+    match a {
+        SignatureAlgorithm::Ed25519 => "Ed25519",
+        SignatureAlgorithm::Es256 => "Es256",
+        SignatureAlgorithm::Es256K => "Es256K",
+    }
+}
+
+fn capabilities_value(caps: &[CapabilityKind]) -> Value {
+    Value::Array(
+        caps.iter()
+            .map(|c| Value::Text(c.wire_name().to_string()))
+            .collect(),
+    )
+}
+
+fn resource_scope_value(s: &ResourceScope) -> Value {
+    match s {
+        ResourceScope::Resource(rid) => Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text("resource".into())),
+            (
+                Value::Text("value".into()),
+                Value::Map(vec![
+                    (Value::Text("did".into()), Value::Text(rid.did().as_str().to_string())),
+                    (Value::Text("nsid".into()), Value::Text(rid.nsid().as_str().to_string())),
+                    (Value::Text("rkey".into()), Value::Text(rid.rkey().as_str().to_string())),
+                ]),
+            ),
+        ]),
+        ResourceScope::AllResourcesOwnedBy(did) => Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text("all_resources_owned_by".into())),
+            (Value::Text("value".into()), Value::Text(did.as_str().to_string())),
+        ]),
+        ResourceScope::ClassWideAdministrative => Value::Map(vec![(
+            Value::Text("kind".into()),
+            Value::Text("class_wide_administrative".into()),
+        )]),
+    }
+}
+
+fn claim_origin_value(o: &ClaimOrigin) -> Value {
+    match o {
+        ClaimOrigin::SelfOriginated => Value::Map(vec![(
+            Value::Text("kind".into()),
+            Value::Text("self_originated".into()),
+        )]),
+        ClaimOrigin::DelegatedFromUpstream { chain } => Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text("delegated_from_upstream".into())),
+            (Value::Text("chain".into()), attribution_chain_value(chain)),
+        ]),
+    }
+}
+
+fn attribution_chain_value(c: &AttributionChainWire) -> Value {
+    Value::Map(vec![
+        (Value::Text("origin".into()), attribution_principal_value(&c.origin)),
+        (
+            Value::Text("entries".into()),
+            Value::Array(c.entries.iter().map(attribution_entry_value).collect()),
+        ),
+    ])
+}
+
+fn attribution_principal_value(p: &AttributionPrincipal) -> Value {
+    match p {
+        AttributionPrincipal::User(did) => Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text("user".into())),
+            (Value::Text("did".into()), Value::Text(did.as_str().to_string())),
+        ]),
+        AttributionPrincipal::Service(s) => Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text("service".into())),
+            (Value::Text("identity".into()), service_identity_value(s)),
+        ]),
+    }
+}
+
+fn attribution_entry_value(e: &AttributionEntryWire) -> Value {
+    Value::Map(vec![
+        (Value::Text("principal".into()), attribution_principal_value(&e.principal)),
+        (
+            Value::Text("derivation_reason".into()),
+            derivation_reason_value(&e.derivation_reason),
+        ),
+        (Value::Text("derived_at".into()), system_time_value(e.derived_at)),
+        (
+            Value::Text("granted_capabilities".into()),
+            Value::Array(
+                e.granted_capabilities
+                    .kinds()
+                    .iter()
+                    .map(|c| Value::Text(c.wire_name().to_string()))
+                    .collect(),
+            ),
+        ),
+        (Value::Text("receipt".into()), receipt_value(&e.receipt)),
+    ])
+}
+
+fn derivation_reason_value(r: &crate::ingress::DerivationReason) -> Value {
+    use crate::ingress::DerivationReason;
+    match r {
+        DerivationReason::DropPrivilegeToAnonymous => Value::Map(vec![(
+            Value::Text("kind".into()),
+            Value::Text("drop_privilege_to_anonymous".into()),
+        )]),
+        DerivationReason::NarrowCapabilities { dropped } => Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text("narrow_capabilities".into())),
+            (
+                Value::Text("dropped".into()),
+                Value::Array(
+                    dropped
+                        .kinds()
+                        .iter()
+                        .map(|c| Value::Text(c.wire_name().to_string()))
+                        .collect(),
+                ),
+            ),
+        ]),
+        DerivationReason::ServiceToServiceDelegation { trust_declaration_id } => {
+            Value::Map(vec![
+                (
+                    Value::Text("kind".into()),
+                    Value::Text("service_to_service_delegation".into()),
+                ),
+                (
+                    Value::Text("trust_declaration_id".into()),
+                    Value::Text(trust_declaration_id.0.clone()),
+                ),
+            ])
+        }
+    }
+}
+
+fn receipt_value(r: &DelegationReceipt) -> Value {
+    Value::Map(vec![
+        (Value::Text("alg".into()), Value::Text(signature_alg_name(r.algorithm).into())),
+        (Value::Text("bytes".into()), Value::Bytes(r.bytes.to_vec())),
+    ])
+}
+
+/// Encode a [`SystemTime`] as a CBOR unsigned integer (Unix
+/// epoch seconds). Times before the epoch are not part of the
+/// crate's threat model — encoding panics if presented one. The
+/// constructors in this module always pass current `SystemTime`
+/// values from `now()` plus / minus bounded durations, so the
+/// constraint is structural.
+fn system_time_value(t: SystemTime) -> Value {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("SystemTime before UNIX_EPOCH not supported")
+        .as_secs();
+    Value::Integer(secs.into())
+}
+
+// ============================================================
+// Helpers used at receive-time decoding (Phase 4b's
+// `verify_capability_claim` reaches in here through the
+// `verification` submodule).
+// ============================================================
+
+/// Decode a canonical-CBOR byte stream into the constituent
+/// payload fields.
+///
+/// Returns `Err(())` for any structural problem; callers
+/// translate to the appropriate [`crate::ClaimVerificationError`]
+/// variant. The returned tuple matches
+/// [`CapabilityClaim::new_internal_received`]'s parameter order
+/// minus the signature.
+#[allow(clippy::type_complexity, clippy::too_many_lines)]
+pub(crate) fn decode_payload(
+    bytes: &[u8],
+) -> Result<
+    (
+        ServiceIdentity, // issuer
+        ServiceIdentity, // audience
+        Did,             // subject
+        ClaimOrigin,     // origin
+        Vec<CapabilityKind>,
+        ResourceScope,
+        ClaimNonce,
+        TraceId,
+        SystemTime, // issued_at
+        SystemTime, // expires_at
+    ),
+    (),
+> {
+    let value = canonical_cbor::from_bytes(bytes)?;
+    let map = into_map(&value)?;
+    Ok((
+        decode_service_identity(map_get(&map, "issuer")?)?,
+        decode_service_identity(map_get(&map, "audience")?)?,
+        decode_did(map_get(&map, "subject")?)?,
+        decode_claim_origin(map_get(&map, "origin")?)?,
+        decode_capabilities(map_get(&map, "capabilities")?)?,
+        decode_resource_scope(map_get(&map, "resource_scope")?)?,
+        decode_nonce(map_get(&map, "nonce")?)?,
+        decode_trace_id(map_get(&map, "trace_id")?)?,
+        decode_system_time(map_get(&map, "issued_at")?)?,
+        decode_system_time(map_get(&map, "expires_at")?)?,
+    ))
+}
+
+fn into_map(v: &Value) -> Result<Vec<(Value, Value)>, ()> {
+    match v {
+        Value::Map(entries) => Ok(entries.clone()),
+        _ => Err(()),
+    }
+}
+
+fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Result<&'a Value, ()> {
+    map.iter()
+        .find_map(|(k, v)| match k {
+            Value::Text(s) if s == key => Some(v),
+            _ => None,
+        })
+        .ok_or(())
+}
+
+fn decode_did(v: &Value) -> Result<Did, ()> {
+    match v {
+        Value::Text(s) => Did::new(s).map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+fn decode_service_identity(v: &Value) -> Result<ServiceIdentity, ()> {
+    let map = into_map(v)?;
+    let did = decode_did(map_get(&map, "did")?)?;
+    let key_id_bytes = decode_bytes(map_get(&map, "key_id")?)?;
+    let key_id_arr: [u8; 32] = key_id_bytes.try_into().map_err(|_| ())?;
+    let key_alg_str = match map_get(&map, "key_alg")? {
+        Value::Text(s) => s.as_str(),
+        _ => return Err(()),
+    };
+    let algorithm = decode_signature_alg(key_alg_str).ok_or(())?;
+    let key_material_bytes = decode_bytes(map_get(&map, "key_material")?)?;
+    let key_material_arr: [u8; 32] = key_material_bytes.try_into().map_err(|_| ())?;
+    Ok(ServiceIdentity::new_internal(
+        did,
+        KeyId::from_bytes(key_id_arr),
+        PublicKey {
+            algorithm,
+            bytes: key_material_arr,
+        },
+        None,
+    ))
+}
+
+fn decode_signature_alg(s: &str) -> Option<SignatureAlgorithm> {
+    Some(match s {
+        "Ed25519" => SignatureAlgorithm::Ed25519,
+        "Es256" => SignatureAlgorithm::Es256,
+        "Es256K" => SignatureAlgorithm::Es256K,
+        _ => return None,
+    })
+}
+
+fn decode_bytes(v: &Value) -> Result<Vec<u8>, ()> {
+    match v {
+        Value::Bytes(b) => Ok(b.clone()),
+        _ => Err(()),
+    }
+}
+
+fn decode_capabilities(v: &Value) -> Result<Vec<CapabilityKind>, ()> {
+    match v {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Text(s) => CapabilityKind::from_wire_name(s).ok_or(()),
+                _ => Err(()),
+            })
+            .collect(),
+        _ => Err(()),
+    }
+}
+
+fn decode_resource_scope(v: &Value) -> Result<ResourceScope, ()> {
+    let map = into_map(v)?;
+    let kind = match map_get(&map, "kind")? {
+        Value::Text(s) => s.as_str(),
+        _ => return Err(()),
+    };
+    match kind {
+        "resource" => {
+            let value_map = into_map(map_get(&map, "value")?)?;
+            let did = decode_did(map_get(&value_map, "did")?)?;
+            let nsid_str = match map_get(&value_map, "nsid")? {
+                Value::Text(s) => s.as_str(),
+                _ => return Err(()),
+            };
+            let nsid = crate::Nsid::new(nsid_str).map_err(|_| ())?;
+            let rkey_str = match map_get(&value_map, "rkey")? {
+                Value::Text(s) => s.as_str(),
+                _ => return Err(()),
+            };
+            let rkey = crate::Rkey::new(rkey_str).map_err(|_| ())?;
+            Ok(ResourceScope::Resource(ResourceId::new(did, nsid, rkey)))
+        }
+        "all_resources_owned_by" => {
+            let did = decode_did(map_get(&map, "value")?)?;
+            Ok(ResourceScope::AllResourcesOwnedBy(did))
+        }
+        "class_wide_administrative" => Ok(ResourceScope::ClassWideAdministrative),
+        _ => Err(()),
+    }
+}
+
+fn decode_claim_origin(v: &Value) -> Result<ClaimOrigin, ()> {
+    let map = into_map(v)?;
+    let kind = match map_get(&map, "kind")? {
+        Value::Text(s) => s.as_str(),
+        _ => return Err(()),
+    };
+    match kind {
+        "self_originated" => Ok(ClaimOrigin::SelfOriginated),
+        "delegated_from_upstream" => {
+            // Phase 4b decodes the chain bytes structurally so
+            // round-trip canonicality holds; receipt verification
+            // (W11/W12/W13) lands in Phase 4e. For 4b, the chain
+            // surface is parsed but receipt signatures are not
+            // walked. See chainlink for the 4e wire-up.
+            let _chain_value = map_get(&map, "chain")?;
+            // Phase 4b minimum: reject delegated claims at the
+            // boundary because verification is incomplete; 4e
+            // closes this gap. Receivers wanting to admit
+            // self-originated claims succeed; delegated claims
+            // are deferred.
+            Err(())
+        }
+        _ => Err(()),
+    }
+}
+
+fn decode_nonce(v: &Value) -> Result<ClaimNonce, ()> {
+    let bytes = decode_bytes(v)?;
+    let arr: [u8; 16] = bytes.try_into().map_err(|_| ())?;
+    Ok(ClaimNonce::from_bytes(arr))
+}
+
+fn decode_trace_id(v: &Value) -> Result<TraceId, ()> {
+    let bytes = decode_bytes(v)?;
+    let arr: [u8; 16] = bytes.try_into().map_err(|_| ())?;
+    Ok(TraceId::from_bytes(arr))
+}
+
+fn decode_system_time(v: &Value) -> Result<SystemTime, ()> {
+    match v {
+        Value::Integer(i) => {
+            let secs: u64 = (*i).try_into().map_err(|_| ())?;
+            Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+        }
+        _ => Err(()),
     }
 }
 
@@ -310,11 +887,71 @@ pub enum ClaimConstructionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::capability::CapabilityKind;
+    use crate::authority::subjects::ResourceId;
+    use crate::identity::{KeyId, PublicKey, ServiceIdentity, SignatureAlgorithm};
+    use crate::proto::{Did, Nsid, Rkey};
+    use ed25519_dalek::SigningKey;
+
+    fn fixed_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn fixed_service_identity(did: &str) -> ServiceIdentity {
+        let signing = fixed_signing_key();
+        ServiceIdentity::new_internal(
+            Did::new(did).unwrap(),
+            KeyId::from_bytes([1u8; 32]),
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: signing.verifying_key().to_bytes(),
+            },
+            None,
+        )
+    }
+
+    fn unmatched_service_identity(did: &str) -> ServiceIdentity {
+        // Different `key_material` from `fixed_signing_key()`'s
+        // public — exercises the issuer/signing-key coherence
+        // check.
+        let other = SigningKey::from_bytes(&[42u8; 32]);
+        ServiceIdentity::new_internal(
+            Did::new(did).unwrap(),
+            KeyId::from_bytes([2u8; 32]),
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: other.verifying_key().to_bytes(),
+            },
+            None,
+        )
+    }
+
+    fn sample_resource() -> ResourceId {
+        ResourceId::new(
+            Did::new("did:plc:owner").unwrap(),
+            Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+            Rkey::new("samplerkey").unwrap(),
+        )
+    }
 
     #[test]
     fn validity_ceiling_pinned_at_600s() {
         // §4.8 commits MAX_CLAIM_VALIDITY = 600 seconds.
         assert_eq!(MAX_CLAIM_VALIDITY, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn max_capability_claim_size_pinned_at_4096() {
+        // §7.6 commits MAX_CAPABILITY_CLAIM_SIZE = 4096 bytes.
+        assert_eq!(MAX_CAPABILITY_CLAIM_SIZE, 4096);
+    }
+
+    #[test]
+    fn claim_domain_tag_pinned_per_4_8_w8() {
+        // §4.8 W8 commits this exact tag string. Crate-internal
+        // visibility so other §7 contexts (receipts, handshakes,
+        // trust declarations) cannot accidentally reuse it.
+        assert_eq!(CLAIM_DOMAIN_TAG, b"kryphocron/v1/capability-claim/");
     }
 
     #[test]
@@ -324,5 +961,218 @@ mod tests {
             ScopeVariantName::from(&r),
             ScopeVariantName::ClassWideAdministrative
         );
+    }
+
+    #[test]
+    fn happy_path_constructs_self_originated_claim() {
+        let signing = fixed_signing_key();
+        let issuer = fixed_service_identity("did:web:issuer.example");
+        let audience = fixed_service_identity("did:web:audience.example");
+        let claim = CapabilityClaim::new(
+            issuer,
+            audience,
+            Did::new("did:plc:subject").unwrap(),
+            vec![CapabilityKind::ViewPrivate],
+            ResourceScope::Resource(sample_resource()),
+            ClaimNonce::from_bytes([0xAB; 16]),
+            TraceId::from_bytes([0xCD; 16]),
+            Duration::from_secs(60),
+            &signing,
+        )
+        .unwrap();
+
+        assert!(matches!(claim.origin(), ClaimOrigin::SelfOriginated));
+        assert_eq!(claim.signature().algorithm, SignatureAlgorithm::Ed25519);
+        // Sanity: the canonical payload is non-empty and within
+        // the 4 KB ceiling.
+        let bytes = claim.canonical_payload_bytes();
+        assert!(!bytes.is_empty());
+        assert!(bytes.len() <= MAX_CAPABILITY_CLAIM_SIZE);
+    }
+
+    #[test]
+    fn validity_too_long_returns_validity_too_long() {
+        let signing = fixed_signing_key();
+        let err = CapabilityClaim::new(
+            fixed_service_identity("did:web:i"),
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ViewPrivate],
+            ResourceScope::Resource(sample_resource()),
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            MAX_CLAIM_VALIDITY + Duration::from_secs(1),
+            &signing,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClaimConstructionError::ValidityTooLong { .. }));
+    }
+
+    #[test]
+    fn substrate_capability_returns_non_wire_eligible() {
+        // §4.8 W6: substrate-class never wire-shippable.
+        let signing = fixed_signing_key();
+        let err = CapabilityClaim::new(
+            fixed_service_identity("did:web:i"),
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ScanShard],
+            ResourceScope::ClassWideAdministrative,
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            Duration::from_secs(60),
+            &signing,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimConstructionError::NonWireEligibleCapability(CapabilityKind::ScanShard)
+        ));
+    }
+
+    #[test]
+    fn moderation_capability_returns_non_wire_eligible() {
+        let signing = fixed_signing_key();
+        let err = CapabilityClaim::new(
+            fixed_service_identity("did:web:i"),
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ModeratorRead],
+            ResourceScope::ClassWideAdministrative,
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            Duration::from_secs(60),
+            &signing,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimConstructionError::NonWireEligibleCapability(CapabilityKind::ModeratorRead)
+        ));
+    }
+
+    #[test]
+    fn user_capability_with_non_resource_scope_returns_scope_not_permitted() {
+        // §4.8 W9: user-class restricted to Resource scope.
+        let signing = fixed_signing_key();
+        let err = CapabilityClaim::new(
+            fixed_service_identity("did:web:i"),
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ViewPrivate],
+            ResourceScope::ClassWideAdministrative,
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            Duration::from_secs(60),
+            &signing,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimConstructionError::ScopeNotPermittedForClass {
+                capability: CapabilityKind::ViewPrivate,
+                scope_variant: ScopeVariantName::ClassWideAdministrative,
+            }
+        ));
+    }
+
+    #[test]
+    fn mixed_class_with_user_and_channel_uses_most_restrictive() {
+        // §4.8 W10: mixed-class claims must satisfy ALL classes'
+        // restrictions. User-class requires Resource scope; if a
+        // channel-class capability is included with a non-Resource
+        // scope, the user-class check fails.
+        let signing = fixed_signing_key();
+        let err = CapabilityClaim::new(
+            fixed_service_identity("did:web:i"),
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ViewPrivate, CapabilityKind::EmitToSyncChannel],
+            ResourceScope::AllResourcesOwnedBy(Did::new("did:plc:owner").unwrap()),
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            Duration::from_secs(60),
+            &signing,
+        )
+        .unwrap_err();
+        // The user-class check fires first; channel-class would
+        // accept AllResourcesOwnedBy but the most-restrictive
+        // class wins.
+        assert!(matches!(
+            err,
+            ClaimConstructionError::ScopeNotPermittedForClass { .. }
+        ));
+    }
+
+    #[test]
+    fn issuer_signing_key_mismatch_returns_signing_failed() {
+        // Defensive check: issuer's declared key_material doesn't
+        // match the public derived from signing_key.
+        let signing = fixed_signing_key();
+        let issuer_with_other_key = unmatched_service_identity("did:web:i");
+        let err = CapabilityClaim::new(
+            issuer_with_other_key,
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ViewPrivate],
+            ResourceScope::Resource(sample_resource()),
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            Duration::from_secs(60),
+            &signing,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClaimConstructionError::SigningFailed));
+    }
+
+    #[test]
+    fn canonical_payload_round_trips_through_decode() {
+        // Encode → decode → re-encode → byte-equals. The receive-
+        // side defensive check Phase 4b's verify_capability_claim
+        // will use lands in C4; this test pins the round-trip
+        // contract at the encoder boundary.
+        let signing = fixed_signing_key();
+        let issuer = fixed_service_identity("did:web:issuer.example");
+        let audience = fixed_service_identity("did:web:audience.example");
+        let claim = CapabilityClaim::new(
+            issuer,
+            audience,
+            Did::new("did:plc:subject").unwrap(),
+            vec![CapabilityKind::ViewPrivate, CapabilityKind::ParticipatePrivate],
+            ResourceScope::Resource(sample_resource()),
+            ClaimNonce::from_bytes([0xAB; 16]),
+            TraceId::from_bytes([0xCD; 16]),
+            Duration::from_secs(60),
+            &signing,
+        )
+        .unwrap();
+
+        let bytes = claim.canonical_payload_bytes();
+        let decoded = decode_payload(&bytes).unwrap();
+        let (
+            d_issuer,
+            d_audience,
+            d_subject,
+            d_origin,
+            d_capabilities,
+            d_resource_scope,
+            d_nonce,
+            d_trace_id,
+            d_issued_at,
+            d_expires_at,
+        ) = decoded;
+        let re_encoded = encode_payload(
+            &d_issuer,
+            &d_audience,
+            &d_subject,
+            &d_origin,
+            &d_capabilities,
+            &d_resource_scope,
+            &d_nonce,
+            &d_trace_id,
+            d_issued_at,
+            d_expires_at,
+        );
+        assert_eq!(bytes, re_encoded);
     }
 }

@@ -19,7 +19,7 @@ mod signature;
 
 pub use self::claim::{
     CapabilityClaim, ClaimConstructionError, ClaimOrigin, ResourceScope, ScopeVariantName,
-    MAX_CLAIM_VALIDITY,
+    MAX_CAPABILITY_CLAIM_SIZE, MAX_CLAIM_VALIDITY,
 };
 pub use self::nonce::{
     ClaimNonce, JwtNonce, NonceFreshness, NonceIssuerKey, NonceKind, NoncePrincipal,
