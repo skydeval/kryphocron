@@ -34,11 +34,19 @@ smallvec = "1.13"
 # §9.5 structured error derivation. Used across §4 error enums.
 thiserror = "2"
 
-# Phase 1 does NOT yet pull in proto-blue-lexicon, blake3,
-# ed25519-dalek, or ciborium. proto-blue types ship as local
-# placeholders (CHAINLINKS #3); the cryptographic and wire-format
-# implementations are Phase 4/5 territory. The trait surfaces and
-# type vocabulary compile without those deps.
+# Phase 2 (§5 lexicon strategy) deliverable: the companion crate
+# ships the v1 lexicons, the codegen-produced Rust types, and the
+# build-time three-way-consistency-checked registry. The
+# kryphocron crate consumes it for `Tier`, `Visibility`,
+# `UnknownNsid`, `SemVer`, `DeprecationState`,
+# `LexiconRegistryEntry`, `KRYPHOCRON_LEXICON_REGISTRY`, and the
+# validated AT-Protocol identifier types (`Did`, `Nsid`,
+# `RecordKey`, `AtUri`, `Cid`, `Datetime`, `Tid`).
+#
+# The path dependency is the development-tree shape. crates.io
+# publication (Phase 6) will replace it with a `version = "~0.1.0"`
+# pin matching the lexicon-set semver (§5.5).
+kryphocron-lexicons = { path = "../kryphocron-lexicons" }
 
 [dev-dependencies]
 # `trybuild` for Phase B's "this should not compile" assertions.

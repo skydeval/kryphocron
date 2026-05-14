@@ -228,18 +228,14 @@ pub enum AuthDenial {
     },
 }
 
-/// Phase 1 placeholder semantic-version triplet. Phase 6
-/// (§9 polish) decides whether to depend on `semver` crate or
-/// keep this internal type. See CHAINLINKS #5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SemVer {
-    /// Major version.
-    pub major: u32,
-    /// Minor version.
-    pub minor: u32,
-    /// Patch version.
-    pub patch: u32,
-}
+/// Semantic-version triplet used in deprecation state (§5.6).
+///
+/// Re-exported from `kryphocron-lexicons` (Phase 2) so the
+/// `KRYPHOCRON_LEXICON_REGISTRY` constant and Phase 1's
+/// `AuthDenial::WriteToDeprecatedLexicon` use the same shape.
+/// Phase 6 decides whether to swap for the `semver` crate. See
+/// CHAINLINKS #5.
+pub use kryphocron_lexicons::SemVer;
 
 /// Predicate-time evaluation context (§4.3 `PredicateContext`).
 ///

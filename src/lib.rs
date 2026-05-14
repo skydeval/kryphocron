@@ -166,14 +166,23 @@ pub use oracle::{
     AudienceOracleQuery, AudienceState, BlockOracleQuery, BlockState,
     MuteOracleQuery, MuteState, OracleKind, OracleQueryKind,
 };
-pub use proto::{AtUri, Cid, Did, Nsid, Rkey, UnknownNsid};
+pub use proto::{AtUri, BlobRef, Cid, CidError, Datetime, Did, Handle, Nsid, RecordKey, Rkey, Tid, UnknownNsid};
+
+// Phase 2 re-exports from the lexicon companion crate (§5.3 /
+// §5.4 / §5.6). The lexicon set's compiled-in registry is the
+// substrate's runtime trust anchor for tier classification and
+// deprecation state.
+pub use kryphocron_lexicons::{
+    DeprecationState, LexiconRegistryEntry, KRYPHOCRON_CODEGEN_HASH,
+    KRYPHOCRON_LEXICON_REGISTRY,
+};
 pub use target::{
     ScopeKind, SensitiveRepresentation, StructuralRepresentation,
     TargetRepresentation,
 };
 pub use tier::{
-    HasNsid, MixedTier, PrivateTier, PublicTier, Tier, TierWitness,
-    Tiered, Visibility,
+    visible_to, HasNsid, MixedTier, PrivateTier, PublicTier, Tier,
+    TierWitness, Tiered, Visibility,
 };
 pub use timing::{
     equalize_timing, equalize_timing_target_for,

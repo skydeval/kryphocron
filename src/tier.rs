@@ -6,6 +6,16 @@
 //! `Tiered<T, PrivateTier>` is a compile error, not a runtime
 //! check.
 //!
+//! Phase 2 split: the runtime [`Tier`] enum, [`Visibility`], and
+//! [`UnknownNsid`] live in `kryphocron-lexicons` because the
+//! build-script-generated `impl Tier { pub fn from_nsid }`
+//! (§5.3) must sit in the same crate as `Tier` (Rust orphan
+//! rules). The type-system witnesses ([`TierWitness`],
+//! [`PublicTier`], [`PrivateTier`], [`HasNsid`], [`Tiered`],
+//! [`MixedTier`]) stay here — they are the substrate's threat-
+//! model vocabulary built on top of `Tier`, not part of the
+//! lexicon set.
+//!
 //! The crate ships two tier witnesses in v1 — [`PublicTier`] and
 //! [`PrivateTier`] — and the runtime [`Tier`] enum is
 //! `#[non_exhaustive]` so future tier additions are additive.
@@ -23,87 +33,32 @@
 //!   [`crate::AuthContext`]s with capabilities. Comparing a
 //!   viewer's "level" against a record's tier is not the abstraction
 //!   the substrate offers — the visibility predicate
-//!   ([`Tier::visible_to`]) is.
+//!   ([`visible_to`]) is.
 
 use core::marker::PhantomData;
 
-use crate::proto::{Nsid, UnknownNsid};
+use crate::proto::Nsid;
 use crate::sealed;
 
-/// Tier classification for substrate-managed records.
+// Re-export the lexicon-companion-crate canonical types (§5.3:
+// `Tier::from_nsid` must live in the same crate as `Tier`).
+pub use kryphocron_lexicons::{Tier, UnknownNsid, Visibility};
+
+/// Visibility predicate against an [`crate::AuthContext`].
 ///
-/// Two tiers in v1: [`Tier::Public`] (default-visible) and
-/// [`Tier::Private`] (audience-gated). `#[non_exhaustive]` from
-/// day one so future tier additions ship as backward-compatible
-/// minor-version changes.
-///
-/// See §4.1.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Tier {
-    /// Public records. Visible to anyone.
-    Public,
-    /// Private records. Visible only to authorized audiences.
-    Private,
-}
-
-impl Tier {
-    /// Map an NSID to its tier classification via the closed-
-    /// namespace registry.
-    ///
-    /// Phase 1 ships the function shape; the registry itself
-    /// lives in the companion `kryphocron-lexicons` crate
-    /// (Phase 2; §5.3 / §5.4). Calling this in Phase 1 always
-    /// returns [`UnknownNsid::NotRegistered`] — there is no
-    /// registry to consult yet.
-    ///
-    /// See §4.1 NSID-to-tier mapping.
-    pub fn from_nsid(nsid: &Nsid) -> Result<Tier, UnknownNsid> {
-        // Phase 1: no registry. Phase 2 wires
-        // `kryphocron_lexicons::registry`.
-        Err(UnknownNsid::NotRegistered(nsid.clone()))
-    }
-
-    /// Visibility predicate against an [`crate::AuthContext`].
-    ///
-    /// `Hidden` and `Forbidden` are distinct **internally** —
-    /// audit pipelines and operators distinguish "exists but
-    /// audience-gated for this viewer" from "policy-forbidden" —
-    /// but they collapse to the same wire response (per §4.1's
-    /// closed-namespace non-enumeration discipline).
-    #[must_use]
-    pub fn visible_to(self, _ctx: &crate::ingress::AuthContext<'_>) -> Visibility {
-        // Phase 1: shape only. The Phase 4 implementation walks
-        // the §4.3 pipeline; the public predicate result is one of
-        // three Visibility variants.
-        unimplemented!("§4.1 Tier::visible_to: Phase 4 wires the pipeline");
-    }
-}
-
-/// Result of [`Tier::visible_to`].
-///
-/// `Hidden` and `Forbidden` are distinct internally; both
-/// collapse to byte-identical wire responses at the HTTP layer
-/// (§4.1 closed-namespace failure modes; §4.6 non-enumeration).
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Visibility {
-    /// Viewer is authorized to see the record.
-    Visible,
-    /// Viewer is not in the record's audience. Indistinguishable
-    /// from `Forbidden` on the public wire.
-    Hidden,
-    /// Viewer is policy-forbidden from the record. Indistinguishable
-    /// from `Hidden` on the public wire.
-    Forbidden,
-}
-
-impl Visibility {
-    /// True iff the viewer may read the record.
-    #[must_use]
-    pub fn allows_read(self) -> bool {
-        matches!(self, Visibility::Visible)
-    }
+/// Free function form — `Tier` lives in `kryphocron-lexicons` so
+/// the orphan rules prevent an inherent `impl Tier { fn visible_to
+/// }` from this crate. Phase 4 may revisit by introducing an
+/// extension trait. `Hidden` and `Forbidden` are distinct
+/// **internally** — audit pipelines and operators distinguish
+/// "exists but audience-gated for this viewer" from
+/// "policy-forbidden" — but they collapse to the same wire response
+/// (per §4.1's closed-namespace non-enumeration discipline).
+#[must_use]
+pub fn visible_to(_tier: Tier, _ctx: &crate::ingress::AuthContext<'_>) -> Visibility {
+    // Phase 1/2: shape only. Phase 4 walks the §4.3 pipeline; the
+    // public predicate result is one of three Visibility variants.
+    unimplemented!("§4.1 visible_to: Phase 4 wires the pipeline");
 }
 
 /// Trait carrying a [`Tier`] as a type-level constant.
@@ -146,10 +101,6 @@ pub trait HasNsid: sealed::Sealed + 'static {
     type Tier: TierWitness;
 
     /// Convenience: produce a typed [`Nsid`] handle.
-    ///
-    /// Default impl wraps [`Self::NSID`]; tests for individual
-    /// record types verify the parse succeeds against
-    /// `proto-blue-lexicon` once Phase 2 wires it.
     fn nsid(&self) -> Nsid {
         Nsid::new(Self::NSID).expect("HasNsid::NSID must be a valid NSID literal")
     }
@@ -229,13 +180,15 @@ mod tests {
 
     #[test]
     fn tier_v1_variant_set_pinned() {
-        // Pin the v1 variant set. From inside the defining crate the
-        // compiler treats #[non_exhaustive] enums as exhaustive, so
-        // adding a new variant breaks this match — the failure is
-        // the intended signal that downstream code needs review.
+        // Pin the v1 variant set. From outside the defining crate
+        // the compiler treats #[non_exhaustive] enums as
+        // non-exhaustive, so this match still has to use a
+        // wildcard; the assertion is that the two known variants
+        // exist with the spec-committed shape.
         let t = Tier::Public;
         match t {
             Tier::Public | Tier::Private => {}
+            _ => panic!("unexpected non-v1 Tier variant"),
         }
     }
 
@@ -253,9 +206,34 @@ mod tests {
     }
 
     #[test]
-    fn from_nsid_phase1_always_unknown() {
-        // Phase 1: registry doesn't exist yet. Phase 2 wires it.
-        let nsid = Nsid::new("tools.kryphocron.feed.postPrivate").unwrap();
-        assert!(matches!(Tier::from_nsid(&nsid), Err(UnknownNsid::NotRegistered(_))));
+    fn from_nsid_resolves_v1_lexicons() {
+        // Phase 2 wires the registry. The eight v1 NSIDs resolve
+        // to the tiers committed by §5.7 / §5.4.
+        let cases: &[(&str, Tier)] = &[
+            ("tools.kryphocron.feed.postPublic", Tier::Public),
+            ("tools.kryphocron.feed.postPrivate", Tier::Private),
+            ("tools.kryphocron.feed.like", Tier::Public),
+            ("tools.kryphocron.feed.repost", Tier::Public),
+            ("tools.kryphocron.feed.threadgate", Tier::Public),
+            ("tools.kryphocron.graph.block", Tier::Private),
+            ("tools.kryphocron.graph.mute", Tier::Private),
+            ("tools.kryphocron.policy.audience", Tier::Private),
+        ];
+        for (nsid_str, expected_tier) in cases {
+            let nsid = Nsid::new(nsid_str).unwrap();
+            let resolved = Tier::from_nsid(&nsid).unwrap_or_else(|_| {
+                panic!("registered NSID `{nsid_str}` did not resolve");
+            });
+            assert_eq!(resolved, *expected_tier, "{nsid_str}");
+        }
+    }
+
+    #[test]
+    fn from_nsid_unknown_returns_not_registered() {
+        let nsid = Nsid::new("com.example.unknown.lexicon").unwrap();
+        assert!(matches!(
+            Tier::from_nsid(&nsid),
+            Err(UnknownNsid::NotRegistered(_))
+        ));
     }
 }
