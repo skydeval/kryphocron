@@ -28,6 +28,9 @@ use thiserror::Error;
 
 use crate::identity::TraceId;
 
+use super::events::{
+    ChannelAuditEvent, ModerationAuditEvent, SubstrateAuditEvent, UserAuditEvent,
+};
 use super::sinks::{AuditError, SinkKind};
 
 /// 16-byte composite-operation identifier (§4.9).
@@ -63,16 +66,68 @@ pub const TRACKER_GRACE_WINDOW_MAX: Duration = Duration::from_secs(1);
 /// Composite-audit scope tracked across a multi-sink operation
 /// (§4.9).
 ///
-/// Internal fields are crate-private — operators cannot construct
-/// or mutate a scope outside [`composite_audit`].
+/// Operators receive a `&CompositeAuditScope` inside the
+/// [`composite_audit`] op closure and call the
+/// [`Self::emit_user`] / [`Self::emit_channel`] /
+/// [`Self::emit_substrate`] / [`Self::emit_moderation`]
+/// methods to **queue** events for commit. Events are NOT
+/// committed to their sinks during the op; they are queued
+/// internally and flushed by [`composite_audit`] after the op
+/// returns successfully. If the op returns `Err(_)`, queued
+/// events are dropped (no commit, no rollback marker).
+///
+/// Internal fields are crate-private — operators cannot
+/// construct or mutate a scope outside [`composite_audit`].
 #[derive(Debug)]
 pub struct CompositeAuditScope {
     trace_id: TraceId,
     composite_op_id: CompositeOpId,
-    // SmallVec to avoid heap allocations for the common case of
-    // ≤4 sinks per composite. Mutated only inside crate.
+    /// Queued events waiting for commit. Mutated by the op via
+    /// `emit_*` methods; drained by [`composite_audit`] after
+    /// the op returns Ok. Order of insertion is preserved so
+    /// commit ordering matches the op's emit order within a
+    /// class; cross-class commit ordering is governed by
+    /// [`COMMIT_PRIORITY_ORDER`].
+    queued_events: std::sync::Mutex<Vec<QueuedEvent>>,
+    /// Sinks that have already received a committed event in
+    /// this composite scope. Populated by [`composite_audit`]
+    /// during the commit phase; consulted by the rollback path
+    /// to identify which sinks need rollback markers.
     sinks_committed: std::sync::Mutex<smallvec::SmallVec<[SinkKind; 4]>>,
 }
+
+/// Queued composite-audit event awaiting commit. One variant
+/// per sink class.
+#[derive(Debug)]
+enum QueuedEvent {
+    User(UserAuditEvent),
+    Channel(ChannelAuditEvent),
+    Substrate(SubstrateAuditEvent),
+    Moderation(ModerationAuditEvent),
+}
+
+impl QueuedEvent {
+    fn class(&self) -> SinkKind {
+        match self {
+            QueuedEvent::User(_) => SinkKind::User,
+            QueuedEvent::Channel(_) => SinkKind::Channel,
+            QueuedEvent::Substrate(_) => SinkKind::Substrate,
+            QueuedEvent::Moderation(_) => SinkKind::Moderation,
+        }
+    }
+}
+
+/// Class-priority commit order (§4.9). Substrate first
+/// (most-privileged → most-diagnostic-on-failure), moderation
+/// second, user third, channel last. The op's emit ordering
+/// within a single class is preserved; cross-class ordering
+/// follows this constant.
+const COMMIT_PRIORITY_ORDER: &[SinkKind] = &[
+    SinkKind::Substrate,
+    SinkKind::Moderation,
+    SinkKind::User,
+    SinkKind::Channel,
+];
 
 impl CompositeAuditScope {
     /// Crate-internal constructor.
@@ -81,6 +136,7 @@ impl CompositeAuditScope {
         CompositeAuditScope {
             trace_id,
             composite_op_id,
+            queued_events: std::sync::Mutex::new(Vec::new()),
             sinks_committed: std::sync::Mutex::new(smallvec::SmallVec::new()),
         }
     }
@@ -95,6 +151,89 @@ impl CompositeAuditScope {
     #[must_use]
     pub fn composite_op_id(&self) -> CompositeOpId {
         self.composite_op_id
+    }
+
+    /// Queue a [`UserAuditEvent`] for commit at the end of the
+    /// composite scope. The event is NOT delivered to the sink
+    /// until [`composite_audit`] commits the scope.
+    pub fn emit_user(&self, event: UserAuditEvent) {
+        // Mutex poisoning here is treated as fatal: if a prior
+        // emit panicked mid-update, the scope's queue is no
+        // longer trustworthy. The expect() surfaces the panic
+        // to the caller (which is op code; the panic propagates
+        // out of composite_audit).
+        self.queued_events
+            .lock()
+            .expect("composite scope queue poisoned")
+            .push(QueuedEvent::User(event));
+    }
+
+    /// Queue a [`ChannelAuditEvent`] for commit.
+    pub fn emit_channel(&self, event: ChannelAuditEvent) {
+        self.queued_events
+            .lock()
+            .expect("composite scope queue poisoned")
+            .push(QueuedEvent::Channel(event));
+    }
+
+    /// Queue a [`SubstrateAuditEvent`] for commit.
+    pub fn emit_substrate(&self, event: SubstrateAuditEvent) {
+        self.queued_events
+            .lock()
+            .expect("composite scope queue poisoned")
+            .push(QueuedEvent::Substrate(event));
+    }
+
+    /// Queue a [`ModerationAuditEvent`] for commit.
+    pub fn emit_moderation(&self, event: ModerationAuditEvent) {
+        self.queued_events
+            .lock()
+            .expect("composite scope queue poisoned")
+            .push(QueuedEvent::Moderation(event));
+    }
+
+    /// Crate-internal: drain the queued events, sorted by
+    /// [`COMMIT_PRIORITY_ORDER`] (stable within each class so
+    /// emit-order is preserved per class). Used by
+    /// [`composite_audit`]'s commit phase.
+    pub(in crate::audit::composite) fn drain_queued_events(&self) -> Vec<QueuedEvent> {
+        let mut events = self
+            .queued_events
+            .lock()
+            .expect("composite scope queue poisoned")
+            .drain(..)
+            .collect::<Vec<_>>();
+        // Stable sort by class priority. `sort_by_key` is stable,
+        // preserving emit-order within a class.
+        events.sort_by_key(|e| {
+            COMMIT_PRIORITY_ORDER
+                .iter()
+                .position(|c| *c == e.class())
+                .unwrap_or(usize::MAX)
+        });
+        events
+    }
+
+    /// Crate-internal: record that a sink has committed an
+    /// event. Used by [`composite_audit`]'s commit phase to
+    /// build the rollback target list.
+    pub(in crate::audit::composite) fn record_committed(&self, class: SinkKind) {
+        let mut g = self
+            .sinks_committed
+            .lock()
+            .expect("composite scope committed-set poisoned");
+        if !g.contains(&class) {
+            g.push(class);
+        }
+    }
+
+    /// Crate-internal: snapshot of sinks that have committed,
+    /// used by the rollback path.
+    pub(in crate::audit::composite) fn committed_snapshot(&self) -> smallvec::SmallVec<[SinkKind; 4]> {
+        self.sinks_committed
+            .lock()
+            .expect("composite scope committed-set poisoned")
+            .clone()
     }
 }
 
