@@ -33,11 +33,19 @@ use crate::identity::{
 use crate::proto::Did;
 use crate::resolver::{DidResolutionError, DidResolver};
 use crate::sealed;
+use crate::audit::BatchRejectionReason;
 use crate::wire::{
-    decode_wire_envelope, wire_envelope_is_canonical, CapabilityClaim, JwtNonce,
-    NonceFreshness, NonceIssuerKey, NoncePrincipal, NonceTracker, NonceTrackerError,
-    ResourceScope, CLAIM_DOMAIN_TAG, MAX_CAPABILITY_CLAIM_SIZE,
+    accept_to_wire_bytes, decode_accept_wire, decode_established_wire,
+    decode_hello_wire, decode_reject_wire, decode_wire_envelope,
+    established_to_wire_bytes, hello_to_wire_bytes, reject_to_wire_bytes,
+    wire_envelope_is_canonical, CapabilityClaim, HandshakeNonceTracker,
+    JwtNonce, NonceFreshness, NonceIssuerKey, NoncePrincipal, NonceTracker,
+    NonceTrackerError, ResourceScope, SessionNonce, SyncChannelAccept,
+    SyncChannelEstablished, SyncChannelHello, SyncChannelReject,
+    SyncRequestedScope, CLAIM_DOMAIN_TAG, MAX_CAPABILITY_CLAIM_SIZE,
+    MAX_HANDSHAKE_MESSAGE_SIZE,
 };
+use kryphocron_lexicons::SemVer;
 
 /// JWT that passed signature **and** claim verification (§7.2).
 ///
@@ -1358,6 +1366,768 @@ fn verify_claim_signature(
     }
 }
 
+// ============================================================
+// §7.5 — sync handshake verification.
+// ============================================================
+
+/// Verification configuration for §7.5 sync-handshake messages.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SyncHandshakeVerificationConfig {
+    /// Maximum tolerated wallclock skew between peer-asserted `at`
+    /// and verifier's `now`. Default 30 seconds, matching §7.2's
+    /// JWT clock-skew default.
+    pub max_clock_skew: Duration,
+    /// Verifier's local lexicon-set version. Used by the
+    /// responder-side Hello verifier for the major-version skew
+    /// check committed in §5.5 / §7.5 line 6650-6660.
+    pub local_lexicon_set_version: SemVer,
+    /// Algorithm allowlist; default `[Ed25519]`. §7.5 does not
+    /// commit additional algorithms for handshake signing.
+    pub accepted_algorithms: &'static [SignatureAlgorithm],
+}
+
+impl Default for SyncHandshakeVerificationConfig {
+    fn default() -> Self {
+        SyncHandshakeVerificationConfig {
+            max_clock_skew: Duration::from_secs(30),
+            local_lexicon_set_version: SemVer::new(1, 0, 0),
+            accepted_algorithms: &[SignatureAlgorithm::Ed25519],
+        }
+    }
+}
+
+/// §7.5 handshake verification failure.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum SyncHandshakeVerificationError {
+    /// Wire envelope structurally malformed (size, CBOR decode,
+    /// non-canonical encoding, missing field, type mismatch).
+    #[error("handshake message malformed")]
+    Malformed,
+    /// Message exceeded [`crate::wire::MAX_HANDSHAKE_MESSAGE_SIZE`].
+    #[error("handshake message too large")]
+    TooLarge,
+    /// Handshake signature did not verify under the resolver-
+    /// returned key material.
+    #[error("handshake signature invalid")]
+    SignatureInvalid,
+    /// Counterparty DID resolution failed.
+    #[error("handshake counterparty DID resolution failed: {0}")]
+    CounterpartyResolutionFailed(DidResolutionError),
+    /// Counterparty's claimed key id is not present in the
+    /// resolved DID document (current methods or rotation history).
+    #[error("counterparty key id not in DID document")]
+    CounterpartyKeyNotInDocument,
+    /// Algorithm not in the allowlist.
+    #[error("handshake algorithm not supported: {0:?}")]
+    UnsupportedAlgorithm(SignatureAlgorithm),
+    /// Initiator's lexicon-set major version exceeds the
+    /// responder's local major version (§5.5 / §7.5 line 6650).
+    /// Responder-side; the responder's correct response is to
+    /// emit a signed `SyncChannelResponse::Reject` with reason
+    /// `LexiconSetMajorVersionMismatch`.
+    #[error("initiator lexicon-set major version mismatch")]
+    LexiconSetMajorVersionMismatch {
+        /// Verifier's local version.
+        local: SemVer,
+        /// Initiator's claimed version.
+        peer: SemVer,
+    },
+    /// Hello nonce was previously seen within the replay window.
+    /// Responder-side; responder emits a signed reject with reason
+    /// `HandshakeNonceReplay { first_seen_at }` and the
+    /// `ChannelAuditEvent::SyncBatchRejected` audit event.
+    #[error("handshake nonce replay")]
+    HandshakeNonceReplay {
+        /// Wallclock at which the responder first observed this
+        /// nonce from this initiator.
+        first_seen_at: SystemTime,
+    },
+    /// Backend failure consulting the [`HandshakeNonceTracker`].
+    #[error("handshake nonce tracker backend unavailable: {0}")]
+    NonceTrackerBackend(NonceTrackerError),
+    /// `at` is more than `max_clock_skew` in the future.
+    #[error("handshake `at` is in the future beyond skew tolerance")]
+    NotYetValid,
+    /// `at` is more than `max_clock_skew` in the past.
+    #[error("handshake `at` is too old (clock skew exceeded)")]
+    TooOld,
+    /// Counterparty's identity does not match the expected
+    /// identity for this side of the handshake. Returned by the
+    /// initiator-side response verifier when the responder's
+    /// `responder_identity` is not the DID the initiator sent
+    /// Hello to (§7.5 "responder_identity unknown" → discard as
+    /// no-message-received).
+    #[error("counterparty identity mismatch")]
+    CounterpartyIdentityMismatch,
+}
+
+/// §7.5 post-handshake message-verification failure.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum SyncMessageVerificationError {
+    /// Inner capability-claim verification failed.
+    #[error("inner claim verification failed: {0}")]
+    Claim(#[from] ClaimVerificationError),
+    /// Verified claim's issuer does not match the session-bound
+    /// peer identity. The substrate dispatcher closes the
+    /// connection on this error; mid-session identity drift is a
+    /// protocol violation.
+    #[error("session-bound peer identity mismatch")]
+    PeerIdentityMismatch,
+}
+
+/// Hello message that has passed responder-side §7.5 verification.
+///
+/// Constructible only via [`verify_sync_hello`].
+#[derive(Debug, Clone)]
+pub struct VerifiedSyncHello {
+    initiator_identity: ServiceIdentity,
+    initiator_lexicon_set_version: SemVer,
+    proposed_session_nonce: SessionNonce,
+    requested_scope: SyncRequestedScope,
+    at: SystemTime,
+    _private: PhantomData<sealed::Token>,
+}
+
+impl VerifiedSyncHello {
+    pub(crate) fn new_internal(
+        initiator_identity: ServiceIdentity,
+        initiator_lexicon_set_version: SemVer,
+        proposed_session_nonce: SessionNonce,
+        requested_scope: SyncRequestedScope,
+        at: SystemTime,
+    ) -> Self {
+        VerifiedSyncHello {
+            initiator_identity,
+            initiator_lexicon_set_version,
+            proposed_session_nonce,
+            requested_scope,
+            at,
+            _private: PhantomData,
+        }
+    }
+    /// Borrow the initiator identity.
+    #[must_use]
+    pub fn initiator_identity(&self) -> &ServiceIdentity {
+        &self.initiator_identity
+    }
+    /// Initiator's lexicon-set version.
+    #[must_use]
+    pub fn initiator_lexicon_set_version(&self) -> SemVer {
+        self.initiator_lexicon_set_version
+    }
+    /// Borrow the proposed session nonce.
+    #[must_use]
+    pub fn proposed_session_nonce(&self) -> &SessionNonce {
+        &self.proposed_session_nonce
+    }
+    /// Borrow the requested scope.
+    #[must_use]
+    pub fn requested_scope(&self) -> &SyncRequestedScope {
+        &self.requested_scope
+    }
+    /// Wallclock the initiator stamped.
+    #[must_use]
+    pub fn at(&self) -> SystemTime {
+        self.at
+    }
+}
+
+/// Accept message that has passed initiator-side §7.5 verification.
+#[derive(Debug, Clone)]
+pub struct VerifiedSyncAccept {
+    responder_identity: ServiceIdentity,
+    responder_lexicon_set_version: SemVer,
+    session_id: SessionId,
+    negotiated_scope: SyncRequestedScope,
+    at: SystemTime,
+    _private: PhantomData<sealed::Token>,
+}
+
+impl VerifiedSyncAccept {
+    pub(crate) fn new_internal(
+        responder_identity: ServiceIdentity,
+        responder_lexicon_set_version: SemVer,
+        session_id: SessionId,
+        negotiated_scope: SyncRequestedScope,
+        at: SystemTime,
+    ) -> Self {
+        VerifiedSyncAccept {
+            responder_identity,
+            responder_lexicon_set_version,
+            session_id,
+            negotiated_scope,
+            at,
+            _private: PhantomData,
+        }
+    }
+    /// Borrow the responder identity.
+    #[must_use]
+    pub fn responder_identity(&self) -> &ServiceIdentity {
+        &self.responder_identity
+    }
+    /// Responder's lexicon-set version.
+    #[must_use]
+    pub fn responder_lexicon_set_version(&self) -> SemVer {
+        self.responder_lexicon_set_version
+    }
+    /// Session id derived by the responder.
+    #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+    /// Borrow the negotiated (responder-narrowed) scope.
+    #[must_use]
+    pub fn negotiated_scope(&self) -> &SyncRequestedScope {
+        &self.negotiated_scope
+    }
+    /// Wallclock the responder stamped.
+    #[must_use]
+    pub fn at(&self) -> SystemTime {
+        self.at
+    }
+}
+
+/// Reject message that has passed initiator-side §7.5 verification.
+#[derive(Debug, Clone)]
+pub struct VerifiedSyncReject {
+    reason: BatchRejectionReason,
+    responder_identity: ServiceIdentity,
+    at: SystemTime,
+    _private: PhantomData<sealed::Token>,
+}
+
+impl VerifiedSyncReject {
+    pub(crate) fn new_internal(
+        reason: BatchRejectionReason,
+        responder_identity: ServiceIdentity,
+        at: SystemTime,
+    ) -> Self {
+        VerifiedSyncReject {
+            reason,
+            responder_identity,
+            at,
+            _private: PhantomData,
+        }
+    }
+    /// Borrow the rejection reason.
+    #[must_use]
+    pub fn reason(&self) -> &BatchRejectionReason {
+        &self.reason
+    }
+    /// Borrow the responder identity.
+    #[must_use]
+    pub fn responder_identity(&self) -> &ServiceIdentity {
+        &self.responder_identity
+    }
+    /// Wallclock the responder stamped.
+    #[must_use]
+    pub fn at(&self) -> SystemTime {
+        self.at
+    }
+}
+
+/// Verified Response: Accept or Reject (§7.5).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum VerifiedSyncResponse {
+    /// The handshake was accepted.
+    Accept(VerifiedSyncAccept),
+    /// The handshake was rejected with a signed reason.
+    Reject(VerifiedSyncReject),
+}
+
+/// Established message that has passed responder-side §7.5
+/// verification.
+#[derive(Debug, Clone)]
+pub struct VerifiedSyncEstablished {
+    session_id: SessionId,
+    at: SystemTime,
+    _private: PhantomData<sealed::Token>,
+}
+
+impl VerifiedSyncEstablished {
+    pub(crate) fn new_internal(session_id: SessionId, at: SystemTime) -> Self {
+        VerifiedSyncEstablished {
+            session_id,
+            at,
+            _private: PhantomData,
+        }
+    }
+    /// Session id from the bound session.
+    #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+    /// Wallclock the initiator stamped.
+    #[must_use]
+    pub fn at(&self) -> SystemTime {
+        self.at
+    }
+}
+
+// Phase 4d wires VerifiedSyncMessage's previously-unreachable
+// constructor path. Kept `pub(crate)` so only the verifier in this
+// module can produce one.
+impl VerifiedSyncMessage {
+    pub(crate) fn new_internal(
+        session_identity: ServiceIdentity,
+        session_id: SessionId,
+        payload: VerifiedCapabilityClaim,
+    ) -> Self {
+        VerifiedSyncMessage {
+            session_identity,
+            session_id,
+            payload,
+            _private: PhantomData,
+        }
+    }
+}
+
+/// Responder-side verifier for `SyncChannelHello` (§7.5).
+///
+/// Walks the §7.5 verification chain in fail-closed order:
+///
+/// 1. Size + canonical-CBOR round-trip canonicality (Phase 4b's
+///    §7 round-4 hazard discipline applied symmetrically).
+/// 2. CBOR decode into structured fields plus the carried
+///    signature.
+/// 3. Algorithm allowlist enforcement (default `[Ed25519]`).
+/// 4. Clock-skew bounds on the initiator's `at`.
+/// 5. Major-version skew check against the verifier's local
+///    lexicon-set version.
+/// 6. Counterparty DID resolution + signing-key selection (walks
+///    `verification_methods` AND `rotation_history` per §4.8 W12).
+/// 7. Signature verification under [`crate::wire::HELLO_DOMAIN_TAG`].
+/// 8. Nonce-tracker check_and_record. The nonce check happens AFTER
+///    signature verification so an attacker cannot induce nonce-
+///    table churn without first producing a valid signature.
+///
+/// On success, returns [`VerifiedSyncHello`] sealed-by-construction.
+/// On any verification failure, returns the appropriate variant of
+/// [`SyncHandshakeVerificationError`].
+///
+/// # Errors
+///
+/// Returns [`SyncHandshakeVerificationError`] for any failure.
+pub async fn verify_sync_hello(
+    wire_bytes: &[u8],
+    nonce_tracker: &dyn HandshakeNonceTracker,
+    resolver: &dyn DidResolver,
+    config: &SyncHandshakeVerificationConfig,
+    deadline: Instant,
+    trace_id: TraceId,
+) -> Result<VerifiedSyncHello, SyncHandshakeVerificationError> {
+    if wire_bytes.len() > MAX_HANDSHAKE_MESSAGE_SIZE {
+        return Err(SyncHandshakeVerificationError::TooLarge);
+    }
+    if !handshake_wire_is_canonical_hello(wire_bytes) {
+        return Err(SyncHandshakeVerificationError::Malformed);
+    }
+    let (initiator_identity, initiator_ver, nonce, scope, at, signature) =
+        decode_hello_wire(wire_bytes)
+            .map_err(|()| SyncHandshakeVerificationError::Malformed)?;
+
+    if !config.accepted_algorithms.contains(&signature.algorithm) {
+        return Err(SyncHandshakeVerificationError::UnsupportedAlgorithm(
+            signature.algorithm,
+        ));
+    }
+
+    let now = SystemTime::now();
+    check_at_window(at, now, config.max_clock_skew)?;
+
+    if initiator_ver.major > config.local_lexicon_set_version.major {
+        return Err(
+            SyncHandshakeVerificationError::LexiconSetMajorVersionMismatch {
+                local: config.local_lexicon_set_version,
+                peer: initiator_ver,
+            },
+        );
+    }
+
+    let document = resolver
+        .resolve(initiator_identity.service_did(), deadline, trace_id)
+        .await
+        .map_err(SyncHandshakeVerificationError::CounterpartyResolutionFailed)?;
+    let public_key = select_handshake_signing_key(
+        &document,
+        initiator_identity.key_id(),
+        signature.algorithm,
+    )?;
+
+    let sign_input = crate::wire::hello_sign_input(
+        &initiator_identity,
+        initiator_ver,
+        &nonce,
+        &scope,
+        at,
+    );
+    if !crate::wire::verify_handshake_signature(&public_key, &sign_input, &signature) {
+        return Err(SyncHandshakeVerificationError::SignatureInvalid);
+    }
+
+    // Nonce tracking AFTER signature verification: an attacker
+    // forging a signature can no longer induce nonce-table churn,
+    // and a legitimate replay surfaces the recorded `first_seen_at`
+    // for the audit event.
+    match nonce_tracker.check_and_record(&initiator_identity, &nonce, now) {
+        Ok(NonceFreshness::Fresh) => {}
+        Ok(NonceFreshness::Replay { first_seen_at }) => {
+            return Err(SyncHandshakeVerificationError::HandshakeNonceReplay {
+                first_seen_at,
+            });
+        }
+        Err(e) => {
+            return Err(SyncHandshakeVerificationError::NonceTrackerBackend(e));
+        }
+    }
+
+    Ok(VerifiedSyncHello::new_internal(
+        initiator_identity,
+        initiator_ver,
+        nonce,
+        scope,
+        at,
+    ))
+}
+
+/// Initiator-side verifier for `SyncChannelResponse` (§7.5).
+///
+/// Routes by wire-decode into Accept or Reject branch and verifies
+/// the responder's signature under [`crate::wire::ACCEPT_DOMAIN_TAG`] or
+/// [`crate::wire::REJECT_DOMAIN_TAG`] respectively. The `expected_responder_did`
+/// is the DID the initiator sent Hello to; per §7.5's "responder_
+/// identity unknown is discarded as no-message-received" prose,
+/// any responder identity that doesn't match this expected DID
+/// returns [`SyncHandshakeVerificationError::CounterpartyIdentityMismatch`].
+///
+/// The wire bytes carry an outer 1-byte discriminator (0x00 for
+/// Accept, 0x01 for Reject) prepended to the message bytes; this
+/// is the substrate's framing choice for the on-wire envelope.
+///
+/// # Errors
+///
+/// Returns [`SyncHandshakeVerificationError`] for any failure.
+pub async fn verify_sync_response(
+    wire_bytes: &[u8],
+    expected_responder_did: &Did,
+    resolver: &dyn DidResolver,
+    config: &SyncHandshakeVerificationConfig,
+    deadline: Instant,
+    trace_id: TraceId,
+) -> Result<VerifiedSyncResponse, SyncHandshakeVerificationError> {
+    if wire_bytes.is_empty() {
+        return Err(SyncHandshakeVerificationError::Malformed);
+    }
+    let (discriminator, body) = wire_bytes.split_first().expect("non-empty");
+    match discriminator {
+        0x00 => verify_sync_accept(body, expected_responder_did, resolver, config, deadline, trace_id)
+            .await
+            .map(VerifiedSyncResponse::Accept),
+        0x01 => verify_sync_reject(body, expected_responder_did, resolver, config, deadline, trace_id)
+            .await
+            .map(VerifiedSyncResponse::Reject),
+        _ => Err(SyncHandshakeVerificationError::Malformed),
+    }
+}
+
+async fn verify_sync_accept(
+    wire_bytes: &[u8],
+    expected_responder_did: &Did,
+    resolver: &dyn DidResolver,
+    config: &SyncHandshakeVerificationConfig,
+    deadline: Instant,
+    trace_id: TraceId,
+) -> Result<VerifiedSyncAccept, SyncHandshakeVerificationError> {
+    if wire_bytes.len() > MAX_HANDSHAKE_MESSAGE_SIZE {
+        return Err(SyncHandshakeVerificationError::TooLarge);
+    }
+    if !handshake_wire_is_canonical_accept(wire_bytes) {
+        return Err(SyncHandshakeVerificationError::Malformed);
+    }
+    let (responder_identity, responder_ver, session_id, negotiated_scope, at, signature) =
+        decode_accept_wire(wire_bytes)
+            .map_err(|()| SyncHandshakeVerificationError::Malformed)?;
+
+    if responder_identity.service_did() != expected_responder_did {
+        return Err(SyncHandshakeVerificationError::CounterpartyIdentityMismatch);
+    }
+    if !config.accepted_algorithms.contains(&signature.algorithm) {
+        return Err(SyncHandshakeVerificationError::UnsupportedAlgorithm(
+            signature.algorithm,
+        ));
+    }
+    check_at_window(at, SystemTime::now(), config.max_clock_skew)?;
+
+    let document = resolver
+        .resolve(expected_responder_did, deadline, trace_id)
+        .await
+        .map_err(SyncHandshakeVerificationError::CounterpartyResolutionFailed)?;
+    let public_key = select_handshake_signing_key(
+        &document,
+        responder_identity.key_id(),
+        signature.algorithm,
+    )?;
+    let sign_input = crate::wire::accept_sign_input(
+        &responder_identity,
+        responder_ver,
+        &session_id,
+        &negotiated_scope,
+        at,
+    );
+    if !crate::wire::verify_handshake_signature(&public_key, &sign_input, &signature) {
+        return Err(SyncHandshakeVerificationError::SignatureInvalid);
+    }
+
+    Ok(VerifiedSyncAccept::new_internal(
+        responder_identity,
+        responder_ver,
+        session_id,
+        negotiated_scope,
+        at,
+    ))
+}
+
+async fn verify_sync_reject(
+    wire_bytes: &[u8],
+    expected_responder_did: &Did,
+    resolver: &dyn DidResolver,
+    config: &SyncHandshakeVerificationConfig,
+    deadline: Instant,
+    trace_id: TraceId,
+) -> Result<VerifiedSyncReject, SyncHandshakeVerificationError> {
+    if wire_bytes.len() > MAX_HANDSHAKE_MESSAGE_SIZE {
+        return Err(SyncHandshakeVerificationError::TooLarge);
+    }
+    if !handshake_wire_is_canonical_reject(wire_bytes) {
+        return Err(SyncHandshakeVerificationError::Malformed);
+    }
+    let (reason, responder_identity, at, signature) = decode_reject_wire(wire_bytes)
+        .map_err(|()| SyncHandshakeVerificationError::Malformed)?;
+
+    if responder_identity.service_did() != expected_responder_did {
+        return Err(SyncHandshakeVerificationError::CounterpartyIdentityMismatch);
+    }
+    if !config.accepted_algorithms.contains(&signature.algorithm) {
+        return Err(SyncHandshakeVerificationError::UnsupportedAlgorithm(
+            signature.algorithm,
+        ));
+    }
+    check_at_window(at, SystemTime::now(), config.max_clock_skew)?;
+
+    let document = resolver
+        .resolve(expected_responder_did, deadline, trace_id)
+        .await
+        .map_err(SyncHandshakeVerificationError::CounterpartyResolutionFailed)?;
+    let public_key = select_handshake_signing_key(
+        &document,
+        responder_identity.key_id(),
+        signature.algorithm,
+    )?;
+    let sign_input = crate::wire::reject_sign_input(&reason, &responder_identity, at);
+    if !crate::wire::verify_handshake_signature(&public_key, &sign_input, &signature) {
+        return Err(SyncHandshakeVerificationError::SignatureInvalid);
+    }
+
+    Ok(VerifiedSyncReject::new_internal(reason, responder_identity, at))
+}
+
+/// Responder-side verifier for `SyncChannelEstablished` (§7.5).
+///
+/// The responder verifies the initiator's signature over
+/// `(session_id, responder_identity = self_identity, at)` under
+/// [`crate::wire::ESTABLISHED_DOMAIN_TAG`]. The responder's own identity is
+/// supplied as `local_identity`; the initiator's verifying key
+/// must come from the prior Hello-time DID resolution (`initiator_
+/// public_key`) since Established's wire envelope does NOT carry
+/// the initiator identity.
+///
+/// # Errors
+///
+/// Returns [`SyncHandshakeVerificationError`] for any failure.
+pub fn verify_sync_established(
+    wire_bytes: &[u8],
+    local_identity: &ServiceIdentity,
+    initiator_public_key: &PublicKey,
+    config: &SyncHandshakeVerificationConfig,
+) -> Result<VerifiedSyncEstablished, SyncHandshakeVerificationError> {
+    if wire_bytes.len() > MAX_HANDSHAKE_MESSAGE_SIZE {
+        return Err(SyncHandshakeVerificationError::TooLarge);
+    }
+    if !handshake_wire_is_canonical_established(wire_bytes) {
+        return Err(SyncHandshakeVerificationError::Malformed);
+    }
+    let (session_id, at, signature) = decode_established_wire(wire_bytes)
+        .map_err(|()| SyncHandshakeVerificationError::Malformed)?;
+    if !config.accepted_algorithms.contains(&signature.algorithm) {
+        return Err(SyncHandshakeVerificationError::UnsupportedAlgorithm(
+            signature.algorithm,
+        ));
+    }
+    check_at_window(at, SystemTime::now(), config.max_clock_skew)?;
+
+    let sign_input = crate::wire::established_sign_input(&session_id, local_identity, at);
+    if !crate::wire::verify_handshake_signature(initiator_public_key, &sign_input, &signature) {
+        return Err(SyncHandshakeVerificationError::SignatureInvalid);
+    }
+    Ok(VerifiedSyncEstablished::new_internal(session_id, at))
+}
+
+/// Verify a post-handshake §7.6 capability claim that arrived on
+/// an established sync channel.
+///
+/// Wraps [`verify_capability_claim`] and additionally enforces that
+/// the verified claim's issuer matches the session-bound peer
+/// identity (`session_peer`). Mid-session identity drift is a
+/// protocol violation and surfaces as
+/// [`SyncMessageVerificationError::PeerIdentityMismatch`].
+///
+/// The substrate dispatcher (or its sync-message handler) is
+/// responsible for the §7.5 `UnknownSessionMessage` audit emit
+/// when a sync-channel message arrives with a session id not in
+/// the local session table; this function operates on already-
+/// looked-up session state.
+///
+/// # Errors
+///
+/// Returns [`SyncMessageVerificationError`] for any failure.
+pub async fn verify_sync_message(
+    raw_header: &str,
+    session_id: SessionId,
+    session_peer: &ServiceIdentity,
+    local_audience: &ServiceIdentity,
+    resolver: &dyn DidResolver,
+    nonce_tracker: &dyn NonceTracker,
+    config: &ClaimVerificationConfig,
+    deadline: Instant,
+    trace_id: TraceId,
+) -> Result<VerifiedSyncMessage, SyncMessageVerificationError> {
+    let claim = verify_capability_claim(
+        raw_header,
+        local_audience,
+        resolver,
+        nonce_tracker,
+        config,
+        deadline,
+        trace_id,
+    )
+    .await?;
+    if claim.issuer() != session_peer {
+        return Err(SyncMessageVerificationError::PeerIdentityMismatch);
+    }
+    Ok(VerifiedSyncMessage::new_internal(
+        session_peer.clone(),
+        session_id,
+        claim,
+    ))
+}
+
+// ============================================================
+// §7.5 internal helpers.
+// ============================================================
+
+fn check_at_window(
+    at: SystemTime,
+    now: SystemTime,
+    skew: Duration,
+) -> Result<(), SyncHandshakeVerificationError> {
+    if at > now + skew {
+        return Err(SyncHandshakeVerificationError::NotYetValid);
+    }
+    // Reject `at` more than one skew window in the past — handshake
+    // messages are expected to be near-real-time. Operators with
+    // looser `at` semantics configure a wider `max_clock_skew`.
+    if let Ok(age) = now.duration_since(at) {
+        if age > skew {
+            return Err(SyncHandshakeVerificationError::TooOld);
+        }
+    }
+    Ok(())
+}
+
+fn select_handshake_signing_key(
+    document: &crate::resolver::DidDocument,
+    expected_key_id: KeyId,
+    algorithm: SignatureAlgorithm,
+) -> Result<PublicKey, SyncHandshakeVerificationError> {
+    for (kid, key) in document
+        .verification_methods
+        .iter()
+        .chain(document.rotation_history.iter())
+    {
+        if *kid == expected_key_id && key.algorithm == algorithm {
+            return Ok(*key);
+        }
+    }
+    Err(SyncHandshakeVerificationError::CounterpartyKeyNotInDocument)
+}
+
+fn handshake_wire_is_canonical_hello(bytes: &[u8]) -> bool {
+    decode_hello_wire(bytes)
+        .ok()
+        .map(|d| {
+            let h = SyncChannelHello {
+                initiator_identity: d.0,
+                initiator_lexicon_set_version: d.1,
+                proposed_session_nonce: d.2,
+                requested_scope: d.3,
+                at: d.4,
+                initiator_signature: d.5,
+            };
+            hello_to_wire_bytes(&h) == bytes
+        })
+        .unwrap_or(false)
+}
+
+fn handshake_wire_is_canonical_accept(bytes: &[u8]) -> bool {
+    decode_accept_wire(bytes)
+        .ok()
+        .map(|d| {
+            let a = SyncChannelAccept {
+                responder_identity: d.0,
+                responder_lexicon_set_version: d.1,
+                session_id: d.2,
+                negotiated_scope: d.3,
+                at: d.4,
+                responder_signature: d.5,
+            };
+            accept_to_wire_bytes(&a) == bytes
+        })
+        .unwrap_or(false)
+}
+
+fn handshake_wire_is_canonical_reject(bytes: &[u8]) -> bool {
+    decode_reject_wire(bytes)
+        .ok()
+        .map(|d| {
+            let r = SyncChannelReject {
+                reason: d.0,
+                responder_identity: d.1,
+                at: d.2,
+                responder_signature: d.3,
+            };
+            reject_to_wire_bytes(&r) == bytes
+        })
+        .unwrap_or(false)
+}
+
+fn handshake_wire_is_canonical_established(bytes: &[u8]) -> bool {
+    decode_established_wire(bytes)
+        .ok()
+        .map(|d| {
+            let e = SyncChannelEstablished {
+                session_id: d.0,
+                at: d.1,
+                initiator_signature: d.2,
+            };
+            established_to_wire_bytes(&e) == bytes
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2512,5 +3282,245 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ClaimVerificationError::IssuerKeyNotInDocument));
+    }
+
+    // ============================================================
+    // §7.5 — handshake verifier smoke tests.
+    // ============================================================
+
+    fn handshake_signing_pair(seed: u8) -> (SigningKey, PublicKey) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        (
+            sk,
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: vk.to_bytes(),
+            },
+        )
+    }
+
+    fn make_initiator_identity(seed: u8) -> (ServiceIdentity, SigningKey) {
+        let (sk, pk) = handshake_signing_pair(seed);
+        let did_str = format!("did:plc:{seed:02x}initiator0000000");
+        let did = Did::new(&did_str).unwrap();
+        let key_id = KeyId::from_bytes([seed; 32]);
+        let id = ServiceIdentity::new_internal(did, key_id, pk, None);
+        (id, sk)
+    }
+
+    fn handshake_test_resolver(initiator: &ServiceIdentity) -> Arc<MockResolver> {
+        let r = Arc::new(MockResolver::new());
+        r.insert(initiator.service_did(), initiator.key_id(), *initiator.key_material());
+        r
+    }
+
+    /// §7.5 happy path: verify_sync_hello accepts a freshly-signed
+    /// Hello and yields a sealed [`VerifiedSyncHello`].
+    #[tokio::test]
+    async fn verify_sync_hello_happy_path() {
+        let (initiator, sk) = make_initiator_identity(0x10);
+        let resolver = handshake_test_resolver(&initiator);
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig::default();
+
+        let nonce = SessionNonce::from_bytes([0x42; 32]);
+        let scope = SyncRequestedScope {
+            nsids: smallvec::SmallVec::new(),
+            time_window: None,
+            direction: crate::wire::SyncDirection::Bidirectional,
+        };
+        let at = SystemTime::now();
+        let sign_input = crate::wire::hello_sign_input(
+            &initiator,
+            SemVer::new(1, 0, 0),
+            &nonce,
+            &scope,
+            at,
+        );
+        let sig = crate::wire::sign_handshake_payload(&sk, &sign_input);
+        let hello = SyncChannelHello {
+            initiator_identity: initiator.clone(),
+            initiator_lexicon_set_version: SemVer::new(1, 0, 0),
+            proposed_session_nonce: nonce,
+            requested_scope: scope.clone(),
+            initiator_signature: sig,
+            at,
+        };
+        let bytes = hello_to_wire_bytes(&hello);
+
+        let v = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0xAB; 16]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v.initiator_identity(), &initiator);
+        assert_eq!(v.proposed_session_nonce(), &nonce);
+    }
+
+    /// §7.5 nonce-replay path: a second verify_sync_hello call
+    /// with the same nonce surfaces HandshakeNonceReplay carrying
+    /// the recorded first_seen_at.
+    #[tokio::test]
+    async fn verify_sync_hello_replay_returns_handshake_nonce_replay() {
+        let (initiator, sk) = make_initiator_identity(0x11);
+        let resolver = handshake_test_resolver(&initiator);
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig::default();
+
+        let nonce = SessionNonce::from_bytes([0x43; 32]);
+        let scope = SyncRequestedScope {
+            nsids: smallvec::SmallVec::new(),
+            time_window: None,
+            direction: crate::wire::SyncDirection::Receive,
+        };
+        let at = SystemTime::now();
+        let sign_input = crate::wire::hello_sign_input(
+            &initiator,
+            SemVer::new(1, 0, 0),
+            &nonce,
+            &scope,
+            at,
+        );
+        let sig = crate::wire::sign_handshake_payload(&sk, &sign_input);
+        let hello = SyncChannelHello {
+            initiator_identity: initiator.clone(),
+            initiator_lexicon_set_version: SemVer::new(1, 0, 0),
+            proposed_session_nonce: nonce,
+            requested_scope: scope,
+            initiator_signature: sig,
+            at,
+        };
+        let bytes = hello_to_wire_bytes(&hello);
+
+        verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0xAB; 16]),
+        )
+        .await
+        .unwrap();
+
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0xAB; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, SyncHandshakeVerificationError::HandshakeNonceReplay { .. }),
+            "expected HandshakeNonceReplay, got {err:?}"
+        );
+    }
+
+    /// §7.5 / §5.5 major-version skew: an initiator newer than the
+    /// responder by a major version surfaces
+    /// LexiconSetMajorVersionMismatch.
+    #[tokio::test]
+    async fn verify_sync_hello_rejects_major_version_skew() {
+        let (initiator, sk) = make_initiator_identity(0x12);
+        let resolver = handshake_test_resolver(&initiator);
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig {
+            local_lexicon_set_version: SemVer::new(1, 0, 0),
+            ..SyncHandshakeVerificationConfig::default()
+        };
+
+        let initiator_ver = SemVer::new(2, 0, 0);
+        let nonce = SessionNonce::from_bytes([0x44; 32]);
+        let scope = SyncRequestedScope {
+            nsids: smallvec::SmallVec::new(),
+            time_window: None,
+            direction: crate::wire::SyncDirection::Send,
+        };
+        let at = SystemTime::now();
+        let sign_input = crate::wire::hello_sign_input(
+            &initiator, initiator_ver, &nonce, &scope, at,
+        );
+        let sig = crate::wire::sign_handshake_payload(&sk, &sign_input);
+        let hello = SyncChannelHello {
+            initiator_identity: initiator,
+            initiator_lexicon_set_version: initiator_ver,
+            proposed_session_nonce: nonce,
+            requested_scope: scope,
+            initiator_signature: sig,
+            at,
+        };
+        let bytes = hello_to_wire_bytes(&hello);
+
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0xAB; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SyncHandshakeVerificationError::LexiconSetMajorVersionMismatch { .. }
+            ),
+            "expected LexiconSetMajorVersionMismatch, got {err:?}"
+        );
+    }
+
+    /// §7.5 W8: an Established message signed by an initiator
+    /// against a different responder identity than the one verifying
+    /// fails signature verification (the responder identity is
+    /// covered by the signature implicitly via the sign-input).
+    #[test]
+    fn verify_sync_established_fails_against_wrong_responder() {
+        let (sk, init_pk) = handshake_signing_pair(0x20);
+        let local_id_a = ServiceIdentity::new_internal(
+            Did::new("did:plc:respondera000000000000").unwrap(),
+            KeyId::from_bytes([0x21; 32]),
+            init_pk,
+            None,
+        );
+        let local_id_b = ServiceIdentity::new_internal(
+            Did::new("did:plc:responderb000000000000").unwrap(),
+            KeyId::from_bytes([0x22; 32]),
+            init_pk,
+            None,
+        );
+        let session_id = SessionId::from_bytes([0xCC; 32]);
+        let at = SystemTime::now();
+
+        // Initiator signs Established for responder A.
+        let sign_input =
+            crate::wire::established_sign_input(&session_id, &local_id_a, at);
+        let sig = crate::wire::sign_handshake_payload(&sk, &sign_input);
+        let est = SyncChannelEstablished {
+            session_id,
+            initiator_signature: sig,
+            at,
+        };
+        let bytes = established_to_wire_bytes(&est);
+        let cfg = SyncHandshakeVerificationConfig::default();
+
+        // Responder B tries to verify (wrong responder context):
+        // sign-input differs because local_identity differs.
+        let err = verify_sync_established(&bytes, &local_id_b, &init_pk, &cfg)
+            .unwrap_err();
+        assert!(matches!(err, SyncHandshakeVerificationError::SignatureInvalid));
+
+        // Responder A succeeds.
+        let v = verify_sync_established(&bytes, &local_id_a, &init_pk, &cfg).unwrap();
+        assert_eq!(v.session_id(), session_id);
     }
 }
