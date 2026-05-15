@@ -518,7 +518,7 @@ fn derivation_reason_value(r: &crate::ingress::DerivationReason) -> Value {
                 ),
                 (
                     Value::Text("trust_declaration_id".into()),
-                    Value::Text(trust_declaration_id.0.clone()),
+                    Value::Bytes(trust_declaration_id.as_bytes().to_vec()),
                 ),
             ])
         }

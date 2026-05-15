@@ -115,6 +115,14 @@ pub mod oracle;
 /// operator territory.
 pub mod resolver;
 
+/// §7.4 service-trust-declaration verification (Phase 4c).
+///
+/// Trust declarations are minted by operator tooling (typically a
+/// CLI signing with a hardware-token-held trust-root key). The
+/// crate provides the verification path; construction is operator-
+/// managed.
+pub mod trust;
+
 /// §4.1, §4.4 tier model and tier-aware envelope types.
 pub mod tier;
 

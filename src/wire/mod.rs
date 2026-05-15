@@ -31,6 +31,13 @@ pub(crate) use self::claim::{
     decode_wire as decode_wire_envelope,
     wire_bytes_are_canonical as wire_envelope_is_canonical, CLAIM_DOMAIN_TAG,
 };
+
+// Crate-internal re-exports for the `trust` submodule (Phase 4c
+// §7.4). The canonical-CBOR helpers are reused for trust-
+// declaration encode / decode + canonicality check.
+pub(crate) use self::canonical_cbor::{
+    from_bytes as canonical_cbor_decode, to_canonical_bytes as canonical_cbor_encode,
+};
 pub use self::nonce::{
     ClaimNonce, JwtNonce, NonceFreshness, NonceIssuerKey, NonceKind, NoncePrincipal,
     NonceTracker, NonceTrackerError,

@@ -251,10 +251,32 @@ pub enum DerivationReason {
 
 /// Operator-managed trust declaration identifier (§7.4).
 ///
-/// Phase 1 placeholder; the concrete shape is committed in §7.4.
-/// See CHAINLINKS #8.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TrustDeclarationId(pub String);
+/// 128-bit random identifier per §7.4. The substrate verifies
+/// signatures, validity windows, and trust-root authority; it
+/// does NOT maintain a substrate-side declaration-ID history or
+/// check for ID reuse.
+///
+/// 128 random bits make accidental collision astronomically
+/// unlikely. Deliberate reuse requires operator coordination
+/// across rotations (which is itself an operator-trust event);
+/// operators with revocation needs implement a declaration-status
+/// oracle or rely on the validity-window mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrustDeclarationId([u8; 16]);
+
+impl TrustDeclarationId {
+    /// Construct a [`TrustDeclarationId`] from raw bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        TrustDeclarationId(bytes)
+    }
+
+    /// Borrow the underlying bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
 
 /// Failure cases for [`AuthContext::derive_for`] (§4.2).
 #[non_exhaustive]
@@ -325,13 +347,85 @@ impl Narrowing for ServiceToService {}
 
 /// Operator-managed trust declaration (§7.4).
 ///
-/// Phase 1 placeholder shape; concrete content lands in Phase 4.
-/// See CHAINLINKS #8.
+/// Constructible only via [`crate::trust::verify_trust_declaration`]
+/// — every field is private including the
+/// `_private: PhantomData<sealed::Token>` marker. Operators
+/// receiving a `ServiceTrustDeclaration` need not re-verify or
+/// trust the caller; a successful return from
+/// `verify_trust_declaration` is the witness that all §7.4
+/// verification stages succeeded (signature against a configured
+/// trust root, validity window within
+/// [`crate::trust::MAX_TRUST_DECLARATION_VALIDITY`], canonical
+/// CBOR round-trip, domain separation).
+///
+/// ```compile_fail
+/// // Outside-crate construction must not work — every field is
+/// // private.
+/// use kryphocron::ingress::ServiceTrustDeclaration;
+/// let _v = ServiceTrustDeclaration {
+///     // fields private; this fails to compile.
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ServiceTrustDeclaration {
-    /// Declaration identifier.
-    pub id: TrustDeclarationId,
+    pub(crate) declaration_id: TrustDeclarationId,
+    pub(crate) from_service: ServiceIdentity,
+    pub(crate) to_service: ServiceIdentity,
+    pub(crate) capabilities: CapabilitySet,
+    pub(crate) resource_scope: crate::wire::ResourceScope,
+    pub(crate) issued_at: SystemTime,
+    pub(crate) expires_at: SystemTime,
+    pub(crate) trust_root: crate::trust::TrustRootIdentity,
+    pub(crate) signature: crate::trust::TrustRootSignature,
+    pub(crate) _private: PhantomData<sealed::Token>,
+}
+
+impl ServiceTrustDeclaration {
+    /// Borrow the declaration id.
+    #[must_use]
+    pub fn declaration_id(&self) -> &TrustDeclarationId {
+        &self.declaration_id
+    }
+    /// Borrow the from-service identity.
+    #[must_use]
+    pub fn from_service(&self) -> &ServiceIdentity {
+        &self.from_service
+    }
+    /// Borrow the to-service identity.
+    #[must_use]
+    pub fn to_service(&self) -> &ServiceIdentity {
+        &self.to_service
+    }
+    /// Borrow the capabilities being delegated.
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilitySet {
+        &self.capabilities
+    }
+    /// Borrow the resource scope.
+    #[must_use]
+    pub fn resource_scope(&self) -> &crate::wire::ResourceScope {
+        &self.resource_scope
+    }
+    /// Issued-at instant.
+    #[must_use]
+    pub fn issued_at(&self) -> SystemTime {
+        self.issued_at
+    }
+    /// Expires-at instant.
+    #[must_use]
+    pub fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
+    /// Borrow the trust-root identity that signed this declaration.
+    #[must_use]
+    pub fn trust_root(&self) -> &crate::trust::TrustRootIdentity {
+        &self.trust_root
+    }
+    /// Borrow the trust-root signature.
+    #[must_use]
+    pub fn signature(&self) -> &crate::trust::TrustRootSignature {
+        &self.signature
+    }
 }
 
 // ============================================================
