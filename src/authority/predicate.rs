@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::authority::capability::UserCapability;
+use crate::authority::capability::{CapabilityClass, UserCapability};
 use crate::identity::TraceId;
-use crate::ingress::{AttributionChain, Requester};
+use crate::ingress::{AttributionChain, Requester, RequesterKind};
 use crate::oracle::{
     AudienceOracleQuery, AudienceState, BlockOracleQuery, BlockState, OracleKind,
     OracleQueryKind,
@@ -230,6 +230,22 @@ pub enum AuthDenial {
         /// Granted scope set.
         granted: smallvec::SmallVec<[String; 4]>,
     },
+    /// §4.3 stage 1: the requester does not carry the authority
+    /// required to issue a capability of this class.
+    ///
+    /// User-class and channel-class accept [`RequesterKind::Did`]
+    /// and [`RequesterKind::Service`]. Substrate-class and
+    /// moderation-class accept only [`RequesterKind::Service`]
+    /// (per §4.6 read-everything-authority discipline and §4.3
+    /// moderation-as-service discipline). [`RequesterKind::Anonymous`]
+    /// fails for every class.
+    #[error("issuance: requester (kind {found:?}) lacks authority to issue {class:?}-class")]
+    RequesterLacksAuthority {
+        /// The capability class being requested.
+        class: CapabilityClass,
+        /// The requester kind found.
+        found: RequesterKind,
+    },
 }
 
 /// Semantic-version triplet used in deprecation state (§5.6).
@@ -354,5 +370,24 @@ mod tests {
         // §7.2 extends PipelineStage with JwtScope. Pin the variant
         // so the extension is part of Phase 1's surface.
         let _s = PipelineStage::JwtScope;
+    }
+
+    /// §4.3 stage 1 (Phase 7c): `RequesterLacksAuthority` carries
+    /// the capability class and the requester kind found. Pin the
+    /// variant shape so future refactors don't silently drop a
+    /// forensic-correlation field.
+    #[test]
+    fn requester_lacks_authority_carries_class_and_found_kind() {
+        let e = AuthDenial::RequesterLacksAuthority {
+            class: CapabilityClass::Substrate,
+            found: RequesterKind::Anonymous,
+        };
+        match e {
+            AuthDenial::RequesterLacksAuthority { class, found } => {
+                assert_eq!(class, CapabilityClass::Substrate);
+                assert_eq!(found, RequesterKind::Anonymous);
+            }
+            other => panic!("expected RequesterLacksAuthority, got {other:?}"),
+        }
     }
 }

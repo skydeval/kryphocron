@@ -173,7 +173,7 @@ pub use identity::{
 };
 pub use ingress::{
     AttributionChain, AttributionEntry, AuthContext, AuditSinks,
-    DerivationReason, DeriveError, Narrowing, OracleSet, Requester,
+    DerivationReason, DeriveError, Narrowing, OracleSet, Requester, RequesterKind,
     MAX_CHAIN_DEPTH,
 };
 pub use non_enumeration::Outcome;

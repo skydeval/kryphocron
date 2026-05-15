@@ -167,6 +167,40 @@ pub enum Requester {
     Anonymous,
 }
 
+impl Requester {
+    /// Return the [`RequesterKind`] discriminant.
+    ///
+    /// Used by the §4.3 issuance chokepoints to surface
+    /// requester-class mismatches in [`crate::AuthDenial::RequesterLacksAuthority`]
+    /// without leaking the underlying [`Did`] / [`ServiceIdentity`]
+    /// payload into the diagnostic.
+    #[must_use]
+    pub fn kind(&self) -> RequesterKind {
+        match self {
+            Requester::Did(_) => RequesterKind::Did,
+            Requester::Service(_) => RequesterKind::Service,
+            Requester::Anonymous => RequesterKind::Anonymous,
+        }
+    }
+}
+
+/// Discriminant variant of [`Requester`] (§4.3).
+///
+/// Carried by [`crate::AuthDenial::RequesterLacksAuthority`] so
+/// stage-1 issuance failures report what kind of requester was
+/// found (without leaking the requester identity into the
+/// diagnostic).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequesterKind {
+    /// User DID.
+    Did,
+    /// Substrate-internal or federation service.
+    Service,
+    /// Anonymous reader.
+    Anonymous,
+}
+
 /// Audit sinks installed at the substrate process boundary
 /// (§4.2). Carried by reference inside [`AuthContext`]; the
 /// substrate owns the sink lifetimes.
@@ -598,6 +632,21 @@ mod tests {
     fn max_chain_depth_pinned_at_8() {
         // §4.2 commits MAX_CHAIN_DEPTH = 8.
         assert_eq!(MAX_CHAIN_DEPTH, 8);
+    }
+
+    /// §4.3 stage 1 (Phase 7c): `Requester::kind()` returns the
+    /// matching [`RequesterKind`] discriminant for each variant.
+    #[test]
+    fn requester_kind_discriminant_matches_variant() {
+        assert_eq!(
+            Requester::Did(Did::new("did:plc:example").unwrap()).kind(),
+            RequesterKind::Did
+        );
+        assert_eq!(Requester::Anonymous.kind(), RequesterKind::Anonymous);
+        // Service variant covered indirectly via the issuance tests
+        // in src/authority/mod.rs which construct ServiceIdentity
+        // values; constructing one here would duplicate that
+        // fixture surface.
     }
 
     #[test]
