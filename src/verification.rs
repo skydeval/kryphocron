@@ -1595,10 +1595,83 @@ impl VerifiedSyncHello {
     pub fn proposed_session_nonce(&self) -> &SessionNonce {
         &self.proposed_session_nonce
     }
-    /// Borrow the requested scope.
+    /// The scope requested by the initiator, **before** any §7.5
+    /// federation narrowing has been applied.
+    ///
+    /// **WARNING: do not use for access control.** Federation
+    /// peers (`PeerKind::Federation`) requesting `time_window:
+    /// None` are subject to §7.5 line 6616's MUST-apply 7-day
+    /// narrowing under [`crate::wire::DEFAULT_FEDERATION_TIME_WINDOW`].
+    /// Internal peers (`PeerKind::Internal`) are exempt. The raw
+    /// requested scope returned here is appropriate for audit
+    /// logging only — for access-control decisions, ALWAYS call
+    /// [`Self::narrowed_scope`] with the resolved peer kind.
     #[must_use]
     pub fn requested_scope(&self) -> &SyncRequestedScope {
         &self.requested_scope
+    }
+    /// The scope after §7.5 federation narrowing has been applied
+    /// based on the resolved peer kind and any
+    /// `TrustedWithConstraints` override.
+    ///
+    /// **THIS is what access-control code must consume.** The
+    /// narrowing rules:
+    ///
+    /// - `PeerKind::Internal` → returns the requested scope
+    ///   unchanged. Substrate-internal components are exempt from
+    ///   the federation default per §7.5 line 6634.
+    /// - `PeerKind::Federation` + non-`None` `time_window` →
+    ///   returns the requested scope unchanged (the initiator
+    ///   already supplied a bound).
+    /// - `PeerKind::Federation` + `time_window: None` + no
+    ///   operator-policy override → narrows to `Some(SyncTimeWindow
+    ///   { start: now - DEFAULT_FEDERATION_TIME_WINDOW, end: now })`
+    ///   per §7.5 line 6616-6626.
+    /// - `PeerKind::Federation` + operator-supplied
+    ///   `PeerTrustConstraints` (Phase 4 placeholder; constraint-
+    ///   shape-extension lands in §7.7 Phase 4f or later) →
+    ///   honors the operator constraint over the default. The
+    ///   current `PeerTrustConstraints` is an empty struct (§7.7
+    ///   commitment with no field shape yet); when fields land,
+    ///   the override path activates here.
+    ///
+    /// `now` is supplied by the caller so test fixtures and
+    /// deterministic-clock callers can pin behavior; production
+    /// callers pass `SystemTime::now()`.
+    #[must_use]
+    pub fn narrowed_scope(
+        &self,
+        peer_kind: crate::resolver::PeerKind,
+        _constraints: Option<&crate::audit::PeerTrustConstraints>,
+        now: SystemTime,
+    ) -> SyncRequestedScope {
+        use crate::resolver::PeerKind;
+        use crate::wire::{SyncTimeWindow, DEFAULT_FEDERATION_TIME_WINDOW};
+
+        match peer_kind {
+            PeerKind::Internal => self.requested_scope.clone(),
+            PeerKind::Federation => {
+                if self.requested_scope.time_window.is_some() {
+                    self.requested_scope.clone()
+                } else {
+                    // §7.5 line 6616 narrowing: time_window: None
+                    // → 7-day window ending now. Operator
+                    // constraint override would activate here once
+                    // PeerTrustConstraints carries
+                    // `max_sync_scope` (Phase 4f or later); current
+                    // `_constraints` parameter is reserved.
+                    let mut narrowed = self.requested_scope.clone();
+                    let start = now
+                        .checked_sub(DEFAULT_FEDERATION_TIME_WINDOW)
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    narrowed.time_window = Some(SyncTimeWindow {
+                        start,
+                        end: now,
+                    });
+                    narrowed
+                }
+            }
+        }
     }
     /// Wallclock the initiator stamped.
     #[must_use]
@@ -3861,6 +3934,84 @@ mod tests {
         // Responder A succeeds.
         let v = verify_sync_established(&bytes, &local_id_a, &init_pk, &cfg).unwrap();
         assert_eq!(v.session_id(), session_id);
+    }
+
+    // ============================================================
+    // §7.5 / chainlink #45 — VerifiedSyncHello scope accessor split.
+    // ============================================================
+
+    fn fresh_verified_sync_hello(time_window: Option<crate::wire::SyncTimeWindow>) -> VerifiedSyncHello {
+        let scope = SyncRequestedScope {
+            nsids: smallvec::SmallVec::new(),
+            time_window,
+            direction: crate::wire::SyncDirection::Bidirectional,
+        };
+        VerifiedSyncHello::new_internal(
+            ServiceIdentity::new_internal(
+                Did::new("did:plc:initiator00000000000000").unwrap(),
+                KeyId::from_bytes([0x10; 32]),
+                PublicKey {
+                    algorithm: SignatureAlgorithm::Ed25519,
+                    bytes: [0x11; 32],
+                },
+                None,
+            ),
+            SemVer::new(1, 0, 0),
+            SessionNonce::from_bytes([0x42; 32]),
+            scope,
+            SystemTime::now(),
+        )
+    }
+
+    /// `PeerKind::Internal` is exempt from the §7.5 default
+    /// federation narrowing — even with `time_window: None`, the
+    /// scope is returned unchanged.
+    #[test]
+    fn narrowed_scope_internal_peer_unchanged_even_for_none_window() {
+        let v = fresh_verified_sync_hello(None);
+        let now = SystemTime::now();
+        let narrowed = v.narrowed_scope(crate::resolver::PeerKind::Internal, None, now);
+        assert!(narrowed.time_window.is_none());
+    }
+
+    /// `PeerKind::Federation` + `time_window: None` → narrowed to
+    /// the §7.5 default 7-day window ending `now`.
+    #[test]
+    fn narrowed_scope_federation_peer_with_none_window_narrows_to_7_days() {
+        let v = fresh_verified_sync_hello(None);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let narrowed = v.narrowed_scope(crate::resolver::PeerKind::Federation, None, now);
+        let window = narrowed.time_window.expect("federation None must narrow");
+        assert_eq!(window.end, now);
+        assert_eq!(
+            window.start,
+            now - crate::wire::DEFAULT_FEDERATION_TIME_WINDOW
+        );
+    }
+
+    /// `PeerKind::Federation` + already-bounded `time_window` →
+    /// returned unchanged (the initiator already supplied a
+    /// bound; the default-narrowing rule applies only when the
+    /// initiator left it open).
+    #[test]
+    fn narrowed_scope_federation_peer_with_bounded_window_unchanged() {
+        let initiator_window = crate::wire::SyncTimeWindow {
+            start: SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
+            end: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        };
+        let v = fresh_verified_sync_hello(Some(initiator_window));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_001);
+        let narrowed = v.narrowed_scope(crate::resolver::PeerKind::Federation, None, now);
+        assert_eq!(narrowed.time_window, Some(initiator_window));
+    }
+
+    /// `requested_scope` returns the unmodified initiator-requested
+    /// scope regardless of peer kind. (The accessor split's whole
+    /// point is that this is for audit logging only.)
+    #[test]
+    fn requested_scope_returns_raw_initiator_scope() {
+        let v = fresh_verified_sync_hello(None);
+        assert!(v.requested_scope().time_window.is_none());
     }
 
     // ============================================================
