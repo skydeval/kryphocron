@@ -99,4 +99,56 @@ mod tests {
         // The sum should be a small but non-trivial budget.
         assert!(BASE_AUTHORIZATION_OVERHEAD + SAFETY_MARGIN < Duration::from_secs(1));
     }
+
+    /// §4.6 happy path: an operation that completed faster than
+    /// the equalization target gets padded to the target floor.
+    #[tokio::test]
+    async fn equalize_timing_waits_until_target_when_op_was_fast() {
+        let start = Instant::now();
+        let target = Duration::from_millis(50);
+        equalize_timing(start, target).await;
+        let observed = start.elapsed();
+        // Allow ±10ms jitter for tokio::time::sleep granularity
+        // on Windows/WSL where the timer wheel resolution can be
+        // coarser than nominal.
+        assert!(
+            observed >= target,
+            "equalize_timing returned at {observed:?}, before target {target:?}"
+        );
+        assert!(
+            observed < target + Duration::from_millis(50),
+            "equalize_timing slept way past target: {observed:?} vs {target:?}"
+        );
+    }
+
+    /// §4.6 already-past-target path: an operation that already
+    /// exceeded the target returns near-immediately, no negative-
+    /// sleep, no spurious delay.
+    #[tokio::test]
+    async fn equalize_timing_returns_immediately_when_op_was_slow() {
+        // Synthesize a `start` that's already 100ms in the past.
+        let start = Instant::now() - Duration::from_millis(100);
+        let target = Duration::from_millis(50);
+        let call_start = Instant::now();
+        equalize_timing(start, target).await;
+        let call_elapsed = call_start.elapsed();
+        assert!(
+            call_elapsed < Duration::from_millis(10),
+            "equalize_timing returned in {call_elapsed:?}; expected near-immediate return"
+        );
+    }
+
+    /// §4.6 zero-target edge case: a `Duration::ZERO` target
+    /// returns immediately regardless of `start`.
+    #[tokio::test]
+    async fn equalize_timing_handles_zero_target() {
+        let start = Instant::now();
+        let call_start = Instant::now();
+        equalize_timing(start, Duration::ZERO).await;
+        let call_elapsed = call_start.elapsed();
+        assert!(
+            call_elapsed < Duration::from_millis(10),
+            "equalize_timing with ZERO target took {call_elapsed:?}; expected near-immediate"
+        );
+    }
 }
