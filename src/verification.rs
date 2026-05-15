@@ -826,6 +826,12 @@ pub struct VerifiedCapabilityClaim {
     trace_id: TraceId,
     issued_at: SystemTime,
     expires_at: SystemTime,
+    /// Verified upstream attribution chain (Phase 4e). `None` for
+    /// [`crate::wire::ClaimOrigin::SelfOriginated`]; `Some(chain)`
+    /// for `DelegatedFromUpstream`. The chain has been
+    /// signature- and monotonicity-verified by
+    /// [`verify_attribution_chain`].
+    chain: Option<crate::AttributionChain>,
     _private: PhantomData<sealed::Token>,
 }
 
@@ -843,6 +849,7 @@ impl VerifiedCapabilityClaim {
         trace_id: TraceId,
         issued_at: SystemTime,
         expires_at: SystemTime,
+        chain: Option<crate::AttributionChain>,
     ) -> Self {
         VerifiedCapabilityClaim {
             issuer,
@@ -852,6 +859,7 @@ impl VerifiedCapabilityClaim {
             trace_id,
             issued_at,
             expires_at,
+            chain,
             _private: PhantomData,
         }
     }
@@ -890,6 +898,14 @@ impl VerifiedCapabilityClaim {
     #[must_use]
     pub fn expires_at(&self) -> SystemTime {
         self.expires_at
+    }
+    /// Borrow the verified upstream attribution chain. Phase 4e:
+    /// returns `None` for `SelfOriginated` claims; `Some(chain)`
+    /// for `DelegatedFromUpstream` claims whose chain passed
+    /// [`verify_attribution_chain`].
+    #[must_use]
+    pub fn chain(&self) -> Option<&crate::AttributionChain> {
+        self.chain.as_ref()
     }
 }
 
@@ -1048,6 +1064,20 @@ pub enum ClaimVerificationError {
     /// checks.
     #[error("scope variant not permitted for class")]
     NonexhaustiveScopeForClass,
+    /// §4.8 W11 / W12 / W13 (Phase 4e): claim is
+    /// `DelegatedFromUpstream` but the wire chain failed
+    /// receipt-verification. Carries the per-hop failure detail
+    /// produced by [`verify_attribution_chain`].
+    #[error("attribution chain invalid")]
+    AttributionChainInvalid(BindError),
+    /// §4.8 W13 (Phase 4e): claim's `capabilities` exceeds the
+    /// last chain hop's `granted_capabilities`. The chain itself
+    /// passed receipt verification (every hop's signature valid
+    /// and inter-hop monotonicity held); the final claim attempted
+    /// to grant beyond what the last hop's principal was
+    /// authorized for.
+    #[error("claim capabilities exceed last chain hop's granted set")]
+    ClaimExceedsChainTail,
 }
 
 /// Verify a capability-claim wire envelope against the configured
@@ -1100,6 +1130,7 @@ pub async fn verify_capability_claim(
     config: &ClaimVerificationConfig,
     deadline: Instant,
     trace_id: TraceId,
+    origin_authorized_capabilities: &CapabilitySet,
 ) -> Result<VerifiedCapabilityClaim, ClaimVerificationError> {
     // 1. Strip `KryphocronClaim ` prefix (case-insensitive scheme)
     //    and base64url-decode.
@@ -1257,7 +1288,43 @@ pub async fn verify_capability_claim(
         NonceFreshness::Replay { .. } => return Err(ClaimVerificationError::NonceReplay),
     }
 
-    // 13. Construct VerifiedCapabilityClaim.
+    // 14. §4.8 W11 / W12 / W13 chain verification (Phase 4e).
+    //     If the claim is DelegatedFromUpstream, walk the chain
+    //     under origin_authorized_capabilities. The verifier's
+    //     request `trace_id` (not the claim's `trace_id_field`)
+    //     attributes resolution-side audit emits during the walk.
+    let verified_chain = match received_claim.origin() {
+        crate::wire::ClaimOrigin::SelfOriginated => None,
+        crate::wire::ClaimOrigin::DelegatedFromUpstream { chain } => {
+            let chain_clone = chain.clone();
+            let verified = verify_attribution_chain(
+                &chain_clone,
+                origin_authorized_capabilities,
+                resolver,
+                deadline,
+                trace_id,
+            )
+            .await
+            .map_err(ClaimVerificationError::AttributionChainInvalid)?;
+            // §4.8 W13 final-hop monotonicity: claim.capabilities
+            // ⊆ entries.last().granted_capabilities. The chain
+            // walker already verified hop[0..n] monotonicity; this
+            // closes the chain-tail-to-claim-payload gap.
+            let last_granted = chain_clone
+                .entries
+                .last()
+                .map(|e| e.granted_capabilities.clone())
+                .unwrap_or_default();
+            let claim_caps_set =
+                CapabilitySet::from_kinds(received_claim.capabilities().iter().copied());
+            if !last_granted.is_superset_of(&claim_caps_set) {
+                return Err(ClaimVerificationError::ClaimExceedsChainTail);
+            }
+            Some(verified)
+        }
+    };
+
+    // 15. Construct VerifiedCapabilityClaim.
     Ok(VerifiedCapabilityClaim::new_internal(
         issuer,
         subject,
@@ -1266,6 +1333,7 @@ pub async fn verify_capability_claim(
         trace_id_field,
         issued_at,
         expires_at,
+        verified_chain,
     ))
 }
 
@@ -2008,6 +2076,7 @@ pub async fn verify_sync_message(
     config: &ClaimVerificationConfig,
     deadline: Instant,
     trace_id: TraceId,
+    origin_authorized_capabilities: &CapabilitySet,
 ) -> Result<VerifiedSyncMessage, SyncMessageVerificationError> {
     let claim = verify_capability_claim(
         raw_header,
@@ -2017,6 +2086,7 @@ pub async fn verify_sync_message(
         config,
         deadline,
         trace_id,
+        origin_authorized_capabilities,
     )
     .await?;
     if claim.issuer() != session_peer {
@@ -3083,6 +3153,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap();
@@ -3107,6 +3178,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap();
@@ -3120,6 +3192,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3151,6 +3224,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3177,6 +3251,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3204,6 +3279,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3228,6 +3304,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3268,6 +3345,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3320,6 +3398,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3404,6 +3483,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3431,6 +3511,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
@@ -3486,6 +3567,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap();
@@ -3534,6 +3616,7 @@ mod tests {
             &cfg,
             deadline(),
             TraceId::from_bytes([0u8; 16]),
+            &CapabilitySet::empty(),
         )
         .await
         .unwrap_err();
