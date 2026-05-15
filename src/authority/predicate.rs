@@ -195,6 +195,37 @@ pub enum BindError {
     },
 }
 
+/// Phase 7d: surface `composite_audit` failures as bind errors.
+///
+/// Bind paths run their pipeline inside [`crate::composite_audit`]
+/// (§4.9) and need a `From<CompositeAuditError>` impl on
+/// [`BindError`] so the `?` operator propagates audit-machinery
+/// failures into the bind-error channel.
+///
+/// Mapping:
+/// - [`CompositeAuditError::SinkCommitFailed`] →
+///   [`BindError::AuditUnavailable`] (a sink rejected the event).
+/// - [`CompositeAuditError::RollbackDispatchFailed`] →
+///   [`BindError::AuditUnavailable`] (rollback dispatch failed
+///   after a commit failure; same surface).
+/// - [`CompositeAuditError::InconsistencyUnrecoverable`] →
+///   [`BindError::AuditPanicked`] (the fallback sink itself
+///   panicked — last-resort variant).
+/// - [`CompositeAuditError::TrackerFull`] →
+///   [`BindError::AuditUnavailable`] (reserved per-process
+///   tracker full; same surface).
+impl From<crate::audit::CompositeAuditError> for BindError {
+    fn from(e: crate::audit::CompositeAuditError) -> Self {
+        use crate::audit::CompositeAuditError;
+        match e {
+            CompositeAuditError::SinkCommitFailed { .. }
+            | CompositeAuditError::RollbackDispatchFailed { .. }
+            | CompositeAuditError::TrackerFull => BindError::AuditUnavailable,
+            CompositeAuditError::InconsistencyUnrecoverable => BindError::AuditPanicked,
+        }
+    }
+}
+
 /// Reborrow-specific failure (§4.3 reborrow re-checks expiry).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

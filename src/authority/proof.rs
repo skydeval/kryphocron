@@ -38,16 +38,101 @@
 //! dispatch; Phase 1 ships only the type architecture.
 
 use core::marker::PhantomData;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::authority::capability::{
     CapabilityKind, Endpoint, ModerationCapability, SubstrateScope, UserCapability,
 };
-use crate::authority::predicate::{BindError, BindFailureReason};
+use crate::authority::predicate::{BindError, BindFailureReason, DenialReason, PipelineStage};
 use crate::identity::TraceId;
-use crate::ingress::AuthContext;
+use crate::ingress::{AuthContext, Requester};
 use crate::proto::Did;
 use crate::sealed;
+
+// ============================================================
+// Phase 7d §4.3 bind/reborrow shared helpers + BindFlow.
+// ============================================================
+
+/// §4.3 bind-pipeline outcome carried via [`crate::composite_audit`]'s
+/// `R` channel.
+///
+/// Bind paths run their pipeline inside `composite_audit` and need
+/// the audit emission to be **committed** even on the denial path
+/// — composite_audit drops queued events when the op closure
+/// returns `Err`, so denial-with-audit cannot use the `Err`
+/// channel. Instead the closure always returns `Ok(BindFlow)` and
+/// the bind body unpacks the variant outside the audit call.
+#[derive(Debug)]
+enum BindFlow {
+    /// Pipeline reached stage 6 (post-emit); proof construction
+    /// proceeds.
+    Success,
+    /// A pipeline stage produced a structured denial. The audit
+    /// emit for the denial event already happened inside the
+    /// closure; the bind body surfaces the matching
+    /// [`BindError::DeniedAtPipeline`] to the caller.
+    DeniedAtPipeline {
+        stage: PipelineStage,
+        reason: DenialReason,
+    },
+}
+
+/// §4.3 precheck: the proof's `subject` must equal the bind-call
+/// `target`. Fail-fast precondition; runs before composite_audit
+/// and emits no audit (a target mismatch is a caller error, not a
+/// pipeline denial).
+fn precheck_target_match<S: PartialEq>(
+    proof_subject: &S,
+    target: &S,
+) -> Result<(), BindError> {
+    if proof_subject == target {
+        Ok(())
+    } else {
+        Err(BindError::TargetMismatch)
+    }
+}
+
+/// §4.3 precheck: the proof's recorded requester must match the
+/// AuthContext's resolved requester. Anonymous AuthContext can
+/// never match a Did-bearing proof; both Did and Service requesters
+/// project to a [`Did`] for comparison
+/// ([`crate::identity::ServiceIdentity::service_did`]).
+fn precheck_context_match(
+    proof_requester: &Did,
+    ctx: &AuthContext<'_>,
+) -> Result<(), BindError> {
+    let ctx_did = match ctx.requester() {
+        Requester::Did(did) => did,
+        Requester::Service(svc) => svc.service_did(),
+        Requester::Anonymous => return Err(BindError::ContextMismatch),
+    };
+    if proof_requester == ctx_did {
+        Ok(())
+    } else {
+        Err(BindError::ContextMismatch)
+    }
+}
+
+/// §4.3 / §4.7 precheck: the proof must not have aged past
+/// `max_age` since `issued_at`. Operators can shorten `max_age`
+/// below the capability's compile-time `MAX_AGE`; we take the
+/// caller's value verbatim.
+fn precheck_expired(issued_at: Instant, max_age: Duration) -> Result<(), BindError> {
+    if issued_at.elapsed() > max_age {
+        Err(BindError::Expired)
+    } else {
+        Ok(())
+    }
+}
+
+/// Convenience: current time as Unix-seconds. Powers
+/// [`super::check_stage_0_deprecation`]'s grace-window comparison.
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
 
 // ============================================================
 // AuthorityId — opaque issuer-identifier carried on every proof.
@@ -538,5 +623,244 @@ mod tests {
     fn authority_id_round_trips() {
         let a = AuthorityId::from_bytes([1; 16]);
         assert_eq!(a, a);
+    }
+
+    // ========================================================
+    // Phase 7d C3 — bind/reborrow shared-helper tests.
+    // ========================================================
+
+    /// §4.3 precheck: equal subject vs target → Ok; unequal → TargetMismatch.
+    #[test]
+    fn precheck_target_match_pins_equality() {
+        let a = "subject-a";
+        let b = "subject-b";
+        assert!(matches!(precheck_target_match(&a, &a), Ok(())));
+        assert!(matches!(
+            precheck_target_match(&a, &b),
+            Err(BindError::TargetMismatch)
+        ));
+    }
+
+    /// §4.3 precheck: a Did-bearing proof matched against an
+    /// AuthContext with the same Did → Ok. AuthContext with
+    /// Anonymous → ContextMismatch (anonymous can never carry an
+    /// authenticated Did).
+    #[test]
+    fn precheck_context_match_pins_did_comparison() {
+        use crate::ingress::{AttributionChain, AuditSinks, OracleSet};
+        use std::sync::Arc;
+
+        // Minimal fixture inline (proof.rs doesn't otherwise carry
+        // AuthContext fixtures — duplicate the C2 ContextFixture
+        // pattern here just enough to construct a context).
+        struct NoSink;
+        impl crate::audit::UserAuditSink for NoSink {
+            fn record(
+                &self,
+                _: crate::audit::UserAuditEvent,
+            ) -> Result<(), crate::audit::AuditError> {
+                Ok(())
+            }
+        }
+        impl crate::audit::ChannelAuditSink for NoSink {
+            fn record(
+                &self,
+                _: crate::audit::ChannelAuditEvent,
+            ) -> Result<(), crate::audit::AuditError> {
+                Ok(())
+            }
+        }
+        impl crate::audit::SubstrateAuditSink for NoSink {
+            fn record(
+                &self,
+                _: crate::audit::SubstrateAuditEvent,
+            ) -> Result<(), crate::audit::AuditError> {
+                Ok(())
+            }
+        }
+        impl crate::audit::ModerationAuditSink for NoSink {
+            fn record(
+                &self,
+                _: crate::audit::ModerationAuditEvent,
+            ) -> Result<(), crate::audit::AuditError> {
+                Ok(())
+            }
+        }
+        impl crate::audit::FallbackAuditSink for NoSink {
+            fn record_panic(
+                &self,
+                _: crate::audit::SinkKind,
+                _: TraceId,
+                _: CapabilityKind,
+                _: std::time::SystemTime,
+            ) {
+            }
+            fn record_composite_failure(
+                &self,
+                _: TraceId,
+                _: crate::audit::CompositeOpId,
+                _: &[crate::audit::SinkKind],
+                _: &[crate::audit::SinkKind],
+                _: std::time::SystemTime,
+            ) {
+            }
+            fn record_event(&self, _: crate::audit::FallbackAuditEvent) {}
+        }
+        struct NoOracle;
+        impl crate::oracle::BlockOracle for NoOracle {
+            fn block_state(&self, _: &Did, _: &Did) -> crate::oracle::BlockState {
+                crate::oracle::BlockState::None
+            }
+            fn last_synced_at(&self) -> std::time::SystemTime {
+                std::time::SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(&self, _: crate::oracle::BlockOracleQuery) -> Duration {
+                Duration::ZERO
+            }
+        }
+        impl crate::oracle::AudienceOracle for NoOracle {
+            fn audience_state(
+                &self,
+                _: &Did,
+                _: &crate::authority::ResourceId,
+            ) -> crate::oracle::AudienceState {
+                crate::oracle::AudienceState::NoAudienceConfigured
+            }
+            fn last_synced_at(&self) -> std::time::SystemTime {
+                std::time::SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(
+                &self,
+                _: crate::oracle::AudienceOracleQuery,
+            ) -> Duration {
+                Duration::ZERO
+            }
+        }
+        impl crate::oracle::MuteOracle for NoOracle {
+            fn mute_state(&self, _: &Did, _: &Did) -> crate::oracle::MuteState {
+                crate::oracle::MuteState::None
+            }
+            fn last_synced_at(&self) -> std::time::SystemTime {
+                std::time::SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(&self, _: crate::oracle::MuteOracleQuery) -> Duration {
+                Duration::ZERO
+            }
+        }
+
+        let sink: Arc<NoSink> = Arc::new(NoSink);
+        let oracle: Arc<NoOracle> = Arc::new(NoOracle);
+        let inspection: Arc<crate::authority::NoInspectionNotifications> =
+            Arc::new(crate::authority::NoInspectionNotifications);
+
+        let did_a = Did::new("did:plc:contextmatch-a").unwrap();
+        let did_b = Did::new("did:plc:contextmatch-b").unwrap();
+
+        let ctx_with_a = AuthContext::new_internal(
+            Requester::Did(did_a.clone()),
+            TraceId::from_bytes([0u8; 16]),
+            AuditSinks {
+                user: &*sink,
+                channel: &*sink,
+                substrate: &*sink,
+                moderation: &*sink,
+                fallback: &*sink,
+                inspection_queue: &*inspection,
+            },
+            OracleSet {
+                block: &*oracle,
+                audience: &*oracle,
+                mute: &*oracle,
+            },
+            AttributionChain::empty(),
+        );
+
+        // Match → Ok
+        assert!(matches!(precheck_context_match(&did_a, &ctx_with_a), Ok(())));
+        // Did mismatch → ContextMismatch
+        assert!(matches!(
+            precheck_context_match(&did_b, &ctx_with_a),
+            Err(BindError::ContextMismatch)
+        ));
+
+        // Anonymous AuthContext → ContextMismatch regardless of proof Did
+        let ctx_anon = AuthContext::new_internal(
+            Requester::Anonymous,
+            TraceId::from_bytes([0u8; 16]),
+            AuditSinks {
+                user: &*sink,
+                channel: &*sink,
+                substrate: &*sink,
+                moderation: &*sink,
+                fallback: &*sink,
+                inspection_queue: &*inspection,
+            },
+            OracleSet {
+                block: &*oracle,
+                audience: &*oracle,
+                mute: &*oracle,
+            },
+            AttributionChain::empty(),
+        );
+        assert!(matches!(
+            precheck_context_match(&did_a, &ctx_anon),
+            Err(BindError::ContextMismatch)
+        ));
+    }
+
+    /// §4.3 / §4.7 precheck: a proof inside the MAX_AGE window
+    /// passes; a proof with a backdated `issued_at` past the
+    /// window fails closed with `BindError::Expired`.
+    #[test]
+    fn precheck_expired_pins_max_age_window() {
+        // Inside window
+        let now = Instant::now();
+        assert!(matches!(
+            precheck_expired(now, Duration::from_secs(60)),
+            Ok(())
+        ));
+        // Backdated 200ms past a 100ms window → Expired
+        let past = Instant::now() - Duration::from_millis(200);
+        assert!(matches!(
+            precheck_expired(past, Duration::from_millis(100)),
+            Err(BindError::Expired)
+        ));
+    }
+
+    /// Phase 7d C3: `From<CompositeAuditError> for BindError`
+    /// maps audit-machinery failures to AuditUnavailable, with
+    /// InconsistencyUnrecoverable mapping to AuditPanicked.
+    #[test]
+    fn bind_error_from_composite_audit_error_pins_mapping() {
+        use crate::audit::{AuditError, CompositeAuditError, SinkKind};
+        let cae_commit = CompositeAuditError::SinkCommitFailed {
+            class: SinkKind::User,
+            source: AuditError::Unavailable,
+        };
+        assert!(matches!(BindError::from(cae_commit), BindError::AuditUnavailable));
+
+        let cae_rollback = CompositeAuditError::RollbackDispatchFailed {
+            class: SinkKind::User,
+            source: AuditError::Unavailable,
+        };
+        assert!(matches!(
+            BindError::from(cae_rollback),
+            BindError::AuditUnavailable
+        ));
+
+        let cae_tracker = CompositeAuditError::TrackerFull;
+        assert!(matches!(BindError::from(cae_tracker), BindError::AuditUnavailable));
+
+        let cae_unrec = CompositeAuditError::InconsistencyUnrecoverable;
+        assert!(matches!(BindError::from(cae_unrec), BindError::AuditPanicked));
     }
 }
