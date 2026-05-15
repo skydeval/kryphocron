@@ -94,7 +94,7 @@ getrandom = "0.2"
 # The path dependency is the development-tree shape. crates.io
 # publication (Phase 6) will replace it with a `version = "~0.1.0"`
 # pin matching the lexicon-set semver (§5.5).
-kryphocron-lexicons = { path = "../kryphocron-lexicons" }
+kryphocron-lexicons = { path = "../kryphocron-lexicons", version = "0.1" }
 
 [dev-dependencies]
 # `trybuild` for Phase B's "this should not compile" assertions.
