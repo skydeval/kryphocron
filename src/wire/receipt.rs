@@ -1,18 +1,42 @@
 //! §4.8 attribution-chain wire format + per-entry delegation
 //! receipts (round-4 + round-5 patches).
+//!
+//! Phase 4e wires the receipt-payload canonical CBOR encoder, the
+//! [`sign_delegation_receipt`] helper for operator tooling that
+//! signs delegation receipts, and the
+//! [`ATTRIBUTION_RECEIPT_DOMAIN_TAG`] constant that domain-
+//! separates receipt signatures from §4.8's other signing
+//! contexts (capability-claim, sync-handshake, trust-declaration).
 
-use std::time::SystemTime;
-
+use ciborium::Value;
+use ed25519_dalek::{Signer, SigningKey};
 use smallvec::SmallVec;
+use std::time::SystemTime;
 use thiserror::Error;
 
 use crate::authority::capability::CapabilitySet;
-use crate::identity::{KeyId, ServiceIdentity, SignatureAlgorithm};
+use crate::identity::{KeyId, PublicKey, ServiceIdentity, SignatureAlgorithm};
 use crate::ingress::{DerivationReason, MAX_CHAIN_DEPTH};
 use crate::proto::Did;
 use crate::resolver::DidResolutionError;
+use crate::wire::canonical_cbor;
 
 use super::signature::ClaimSignature;
+
+/// §4.8 W12 / W8: domain-separation prefix for delegation
+/// receipt signatures.
+///
+/// Distinct from [`crate::wire::CLAIM_DOMAIN_TAG`] (capability
+/// claim), [`crate::trust::TRUST_DECLARATION_DOMAIN_TAG`]
+/// (service trust declaration), and the four
+/// [`crate::wire`]`::HELLO_DOMAIN_TAG` / `ACCEPT_DOMAIN_TAG`
+/// / `REJECT_DOMAIN_TAG` / `ESTABLISHED_DOMAIN_TAG` (sync
+/// handshake) tags. A receipt-shaped signature computed under
+/// any other domain tag fails verification with
+/// [`ReceiptVerificationFailure::SignatureInvalid`] — W8 cross-
+/// domain-forgery defense.
+pub(crate) const ATTRIBUTION_RECEIPT_DOMAIN_TAG: &[u8] =
+    b"kryphocron/v1/attribution-receipt/";
 
 /// Wire-side principal in an attribution chain (§4.8).
 #[non_exhaustive]
@@ -181,6 +205,163 @@ pub enum ReceiptVerificationFailure {
         /// The unresolvable key id.
         previous_key_id: KeyId,
     },
+}
+
+// ============================================================
+// §4.8 W12 — receipt payload canonical CBOR + signing helper.
+// ============================================================
+
+/// Canonical RFC 8949 §4.2 CBOR encoding of a
+/// [`DelegationReceiptPayload`].
+///
+/// The encoding is stable across Rust struct-field ordering and
+/// across any in-memory representation differences: the canonical
+/// encoder sorts map keys length-then-bytewise per RFC 8949
+/// §4.2.1. Receivers re-encode the decoded payload with this
+/// helper and verify the result byte-equals the on-wire payload —
+/// the round-trip check that closes the §7 round-4 non-canonicality
+/// hazard symmetrically for receipts as Phase 4b did for
+/// capability claims.
+#[must_use]
+pub(crate) fn delegation_receipt_payload_canonical_bytes(
+    payload: &DelegationReceiptPayload,
+) -> Vec<u8> {
+    canonical_cbor::to_canonical_bytes(delegation_receipt_payload_value(payload))
+}
+
+fn delegation_receipt_payload_value(p: &DelegationReceiptPayload) -> Value {
+    Value::Map(vec![
+        (
+            Value::Text("previous_principal_did".into()),
+            Value::Text(p.previous_principal_did.as_str().to_string()),
+        ),
+        (
+            Value::Text("previous_key_id".into()),
+            Value::Bytes(p.previous_key_id.as_bytes().to_vec()),
+        ),
+        (
+            Value::Text("recipient_principal_did".into()),
+            Value::Text(p.recipient_principal_did.as_str().to_string()),
+        ),
+        (
+            Value::Text("recipient_key_id".into()),
+            Value::Bytes(p.recipient_key_id.as_bytes().to_vec()),
+        ),
+        (
+            Value::Text("derivation_reason".into()),
+            derivation_reason_value(&p.derivation_reason),
+        ),
+        (
+            Value::Text("granted_capabilities".into()),
+            capability_set_value(&p.granted_capabilities),
+        ),
+        (
+            Value::Text("derived_at".into()),
+            system_time_value(p.derived_at),
+        ),
+    ])
+}
+
+fn derivation_reason_value(r: &DerivationReason) -> Value {
+    match r {
+        DerivationReason::DropPrivilegeToAnonymous => Value::Map(vec![(
+            Value::Text("kind".into()),
+            Value::Text("drop_privilege_to_anonymous".into()),
+        )]),
+        DerivationReason::NarrowCapabilities { dropped } => Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text("narrow_capabilities".into())),
+            (Value::Text("dropped".into()), capability_set_value(dropped)),
+        ]),
+        DerivationReason::ServiceToServiceDelegation { trust_declaration_id } => {
+            Value::Map(vec![
+                (
+                    Value::Text("kind".into()),
+                    Value::Text("service_to_service_delegation".into()),
+                ),
+                (
+                    Value::Text("trust_declaration_id".into()),
+                    Value::Bytes(trust_declaration_id.as_bytes().to_vec()),
+                ),
+            ])
+        }
+    }
+}
+
+fn capability_set_value(s: &CapabilitySet) -> Value {
+    Value::Array(
+        s.kinds()
+            .iter()
+            .map(|c| Value::Text(c.wire_name().to_string()))
+            .collect(),
+    )
+}
+
+fn system_time_value(t: SystemTime) -> Value {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("SystemTime before UNIX_EPOCH not supported")
+        .as_secs();
+    Value::Integer(secs.into())
+}
+
+/// Sign a [`DelegationReceiptPayload`] under the previous
+/// principal's signing key, producing a [`DelegationReceipt`].
+///
+/// The signature covers the canonical-CBOR encoding of the
+/// payload, prefixed with the crate-internal
+/// `ATTRIBUTION_RECEIPT_DOMAIN_TAG`
+/// (`b"kryphocron/v1/attribution-receipt/"`).
+/// Operators producing delegation chains call this helper once per
+/// hop with the previous principal's signing key; the resulting
+/// receipt is paired with the recipient principal's
+/// [`AttributionEntryWire`] in the wire chain.
+///
+/// All v1 receipts are Ed25519 (§7.5 / §4.8 algorithm allowlist).
+#[must_use]
+pub fn sign_delegation_receipt(
+    payload: &DelegationReceiptPayload,
+    signing_key: &SigningKey,
+) -> DelegationReceipt {
+    let canonical = delegation_receipt_payload_canonical_bytes(payload);
+    let mut signing_input =
+        Vec::with_capacity(ATTRIBUTION_RECEIPT_DOMAIN_TAG.len() + canonical.len());
+    signing_input.extend_from_slice(ATTRIBUTION_RECEIPT_DOMAIN_TAG);
+    signing_input.extend_from_slice(&canonical);
+    let sig = signing_key.sign(&signing_input);
+    DelegationReceipt {
+        algorithm: SignatureAlgorithm::Ed25519,
+        bytes: sig.to_bytes(),
+    }
+}
+
+/// Verify a [`DelegationReceipt`] against the previous principal's
+/// public key and the canonical encoding of the receipt's payload.
+///
+/// Used internally by the chain walker; not part of the public
+/// surface because chain walking carries additional invariants
+/// (rotation-history walking, capability monotonicity) the
+/// receipt-only verifier does not enforce.
+pub(crate) fn verify_delegation_receipt(
+    payload: &DelegationReceiptPayload,
+    receipt: &DelegationReceipt,
+    public_key: &PublicKey,
+) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    if receipt.algorithm != SignatureAlgorithm::Ed25519
+        || public_key.algorithm != SignatureAlgorithm::Ed25519
+    {
+        return false;
+    }
+    let Ok(vk) = VerifyingKey::from_bytes(&public_key.bytes) else {
+        return false;
+    };
+    let canonical = delegation_receipt_payload_canonical_bytes(payload);
+    let mut signing_input =
+        Vec::with_capacity(ATTRIBUTION_RECEIPT_DOMAIN_TAG.len() + canonical.len());
+    signing_input.extend_from_slice(ATTRIBUTION_RECEIPT_DOMAIN_TAG);
+    signing_input.extend_from_slice(&canonical);
+    let sig = Signature::from_bytes(&receipt.bytes);
+    vk.verify(&signing_input, &sig).is_ok()
 }
 
 #[cfg(test)]

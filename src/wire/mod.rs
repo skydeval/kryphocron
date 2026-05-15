@@ -48,8 +48,22 @@ pub use self::tracker::{
     DefaultNonceTracker, DEFAULT_NONCE_RETENTION, DEFAULT_PER_PARTITION_CAP,
 };
 pub use self::receipt::{
-    AttributionChainWire, AttributionEntryWire, AttributionPrincipal, DelegationReceipt,
-    DelegationReceiptPayload, ReceiptVerificationFailure,
+    sign_delegation_receipt, AttributionChainWire, AttributionEntryWire,
+    AttributionPrincipal, DelegationReceipt, DelegationReceiptPayload,
+    ReceiptVerificationFailure,
+};
+
+// Crate-internal: chain walker reaches into receipt.rs for the
+// payload canonicalization + signature-verify helpers. The
+// `delegation_receipt_payload_canonical_bytes` and
+// `ATTRIBUTION_RECEIPT_DOMAIN_TAG` re-exports stay declared so
+// future submodules (Phase 4e + later) can pull them through the
+// crate-internal namespace; current usage is via the
+// `verify_delegation_receipt` helper which encapsulates both.
+#[allow(unused_imports)]
+pub(crate) use self::receipt::{
+    delegation_receipt_payload_canonical_bytes, verify_delegation_receipt,
+    ATTRIBUTION_RECEIPT_DOMAIN_TAG,
 };
 pub use self::signature::ClaimSignature;
 

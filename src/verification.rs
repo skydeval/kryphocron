@@ -34,13 +34,17 @@ use crate::proto::Did;
 use crate::resolver::{DidResolutionError, DidResolver};
 use crate::sealed;
 use crate::audit::BatchRejectionReason;
+use crate::authority::capability::CapabilitySet;
+use crate::authority::predicate::BindError;
 use crate::wire::{
     accept_to_wire_bytes, decode_accept_wire, decode_established_wire,
     decode_hello_wire, decode_reject_wire, decode_wire_envelope,
     established_to_wire_bytes, hello_to_wire_bytes, reject_to_wire_bytes,
-    wire_envelope_is_canonical, CapabilityClaim, HandshakeNonceTracker,
-    JwtNonce, NonceFreshness, NonceIssuerKey, NoncePrincipal, NonceTracker,
-    NonceTrackerError, ResourceScope, SessionNonce, SyncChannelAccept,
+    verify_delegation_receipt, wire_envelope_is_canonical, AttributionChainWire,
+    AttributionEntryWire, AttributionPrincipal, CapabilityClaim,
+    DelegationReceiptPayload, HandshakeNonceTracker, JwtNonce, NonceFreshness,
+    NonceIssuerKey, NoncePrincipal, NonceTracker, NonceTrackerError,
+    ReceiptVerificationFailure, ResourceScope, SessionNonce, SyncChannelAccept,
     SyncChannelEstablished, SyncChannelHello, SyncChannelReject,
     SyncRequestedScope, CLAIM_DOMAIN_TAG, MAX_CAPABILITY_CLAIM_SIZE,
     MAX_HANDSHAKE_MESSAGE_SIZE,
@@ -2128,6 +2132,258 @@ fn handshake_wire_is_canonical_established(bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+// ============================================================
+// §4.8 W11 / W12 / W13 — attribution chain verification.
+// ============================================================
+
+/// Verify a wire-form attribution chain into a verified
+/// [`crate::AttributionChain`] (§4.8 W11 / W12 / W13).
+///
+/// The eight-stage chain:
+///
+/// 1. **Depth bound:** `chain_wire.entries.len()` ≤
+///    `MAX_CHAIN_DEPTH` (8) per §4.2 / §4.8.
+/// 2. **Per-hop loop, in order from i = 0:**
+///    1. Identify `previous_principal` — `chain_wire.origin` for
+///       i = 0, otherwise `chain_wire.entries[i-1].principal`.
+///    2. Resolve previous principal's DID via `DidResolver::resolve(_, trace_id)`.
+///    3. **W12 algorithm check:** receipt's algorithm in allowlist
+///       → else `AlgorithmNotAccepted`.
+///    4. **W12 rotation tolerance + key discovery:** walk the
+///       resolved DID document's `verification_methods +
+///       rotation_history`. For each candidate `(key_id, key)`
+///       reconstruct the canonical `DelegationReceiptPayload` with
+///       `previous_key_id = key_id`, attempt signature verification.
+///       The first that verifies is the signing key for this hop.
+///       (Trial verification: at most
+///       `MAX_ROTATION_DEPTH × MAX_CHAIN_DEPTH` Ed25519 verifies
+///       per chain.)
+///    5. **W12 fail modes:** no candidate verified → if any key
+///       was tried under the wrong algorithm,
+///       `KeyNotInRotationHistory`; if signatures were tried but
+///       all failed, `SignatureInvalid`.
+///    6. **W13 monotonicity:** `entries[i].granted_capabilities`
+///       ⊆ `previous_authorized_capabilities` (where the previous
+///       authorized set is `origin_authorized_capabilities` for
+///       i = 0, else `entries[i-1].granted_capabilities`). Else
+///       `CapabilityExpansion { hop, attempted, available }`.
+///    7. Update `previous_authorized_capabilities` to the current
+///       hop's `granted_capabilities` for the next iteration.
+/// 3. Build the verified [`crate::AttributionChain`] from the wire
+///    form by walking each verified hop into a
+///    [`crate::AttributionEntry`].
+///
+/// **Fail-fast at the first failing hop.** §4.8 W13 commits the
+/// `failing_hop` index in [`BindError::AttributionReceiptInvalid`]
+/// as a lower bound on chain failure extent, not exhaustive.
+///
+/// **Timing equalization considered.** §4.6's `equalize_timing`
+/// discipline absorbs the hop-by-hop variance at the consuming
+/// bind paths. This verifier does NOT add equalization plumbing
+/// itself — the bind paths that consume the verified chain pull
+/// in equalization for the capability classes that need it.
+///
+/// **Pattern B authority plumbing.** The
+/// `origin_authorized_capabilities` parameter is supplied by the
+/// caller (typically [`verify_capability_claim`] derived from the
+/// originating JWT scope or service-claim authority). The
+/// alternative ("Pattern A": chain root carries the authority via
+/// extended `DerivationReason` variants) was considered and
+/// declined for Phase 4e — see the Phase 4e completion report.
+///
+/// # Errors
+///
+/// Returns [`BindError::AttributionReceiptInvalid`] for any
+/// receipt-verification failure with the failing hop index and
+/// the specific [`ReceiptVerificationFailure`] variant.
+pub async fn verify_attribution_chain(
+    chain_wire: &AttributionChainWire,
+    origin_authorized_capabilities: &CapabilitySet,
+    resolver: &dyn DidResolver,
+    deadline: Instant,
+    trace_id: TraceId,
+) -> Result<crate::AttributionChain, BindError> {
+    // Stage 1: depth bound.
+    if chain_wire.entries.len() > crate::ingress::MAX_CHAIN_DEPTH {
+        return Err(BindError::AttributionReceiptInvalid {
+            failing_hop: chain_wire.entries.len() as u8,
+            reason: ReceiptVerificationFailure::Malformed,
+        });
+    }
+
+    let static_allowlist: &[SignatureAlgorithm] = &[SignatureAlgorithm::Ed25519];
+
+    let mut previous_principal: AttributionPrincipalRef<'_> =
+        AttributionPrincipalRef::FromOrigin(&chain_wire.origin);
+    let mut previous_authorized = origin_authorized_capabilities.clone();
+    let mut verified_entries: Vec<crate::AttributionEntry> = Vec::new();
+
+    for (hop_index, entry) in chain_wire.entries.iter().enumerate() {
+        let hop = u8::try_from(hop_index).unwrap_or(u8::MAX);
+
+        verify_hop(
+            entry,
+            hop,
+            &previous_principal,
+            &previous_authorized,
+            static_allowlist,
+            resolver,
+            deadline,
+            trace_id,
+        )
+        .await
+        .map_err(|reason| BindError::AttributionReceiptInvalid {
+            failing_hop: hop,
+            reason,
+        })?;
+
+        // The verified hop becomes an in-process AttributionEntry.
+        // The signing key id used at this hop is captured during
+        // verify_hop's trial-verification; for the in-process
+        // chain we record the recipient's key_id (which is what the
+        // §4.2 chain shape pins).
+        let key_id_used = entry.principal.key_id();
+        verified_entries.push(crate::AttributionEntry {
+            requester: principal_to_requester(&entry.principal),
+            derivation_reason: entry.derivation_reason.clone(),
+            derived_at: entry.derived_at,
+            key_id_used,
+        });
+
+        previous_principal = AttributionPrincipalRef::FromEntry(&entry.principal);
+        previous_authorized = entry.granted_capabilities.clone();
+    }
+
+    // Build the in-process AttributionChain from the verified
+    // entries. The chain's depth invariant is enforced by the
+    // crate-internal try_push helper.
+    let mut chain = crate::AttributionChain::empty();
+    for entry in verified_entries {
+        chain
+            .try_push(entry)
+            .map_err(|_| BindError::AttributionReceiptInvalid {
+                failing_hop: chain_wire.entries.len() as u8,
+                reason: ReceiptVerificationFailure::Malformed,
+            })?;
+    }
+    Ok(chain)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_hop(
+    entry: &AttributionEntryWire,
+    hop: u8,
+    previous_principal: &AttributionPrincipalRef<'_>,
+    previous_authorized: &CapabilitySet,
+    accepted_algorithms: &[SignatureAlgorithm],
+    resolver: &dyn DidResolver,
+    deadline: Instant,
+    trace_id: TraceId,
+) -> Result<(), ReceiptVerificationFailure> {
+    // 2c — algorithm allowlist.
+    if !accepted_algorithms.contains(&entry.receipt.algorithm) {
+        return Err(ReceiptVerificationFailure::AlgorithmNotAccepted(
+            entry.receipt.algorithm,
+        ));
+    }
+
+    // 2b — resolve previous principal's DID document.
+    let previous_did = previous_principal.did();
+    let document = resolver
+        .resolve(previous_did, deadline, trace_id)
+        .await
+        .map_err(ReceiptVerificationFailure::PreviousPrincipalUnresolvable)?;
+
+    // 2d — trial verification across the previous principal's
+    // current methods + rotation history. The first key whose
+    // canonical reconstruction signature-verifies is the signing
+    // key for this hop.
+    let recipient_did = entry.principal.did().clone();
+    let recipient_key_id = entry.principal.key_id().unwrap_or(KeyId::from_bytes([0u8; 32]));
+
+    let mut tried_any_key = false;
+    let mut tried_matching_alg = false;
+    for (candidate_key_id, candidate_key) in document
+        .verification_methods
+        .iter()
+        .chain(document.rotation_history.iter())
+    {
+        tried_any_key = true;
+        if candidate_key.algorithm != entry.receipt.algorithm {
+            continue;
+        }
+        tried_matching_alg = true;
+
+        let payload = DelegationReceiptPayload {
+            previous_principal_did: previous_did.clone(),
+            previous_key_id: *candidate_key_id,
+            recipient_principal_did: recipient_did.clone(),
+            recipient_key_id,
+            derivation_reason: entry.derivation_reason.clone(),
+            granted_capabilities: entry.granted_capabilities.clone(),
+            derived_at: entry.derived_at,
+        };
+        if verify_delegation_receipt(&payload, &entry.receipt, candidate_key) {
+            // 2f — W13 monotonicity check. Apply AFTER signature
+            // verification: a forged signature would be rejected
+            // before the monotonicity check has a chance to run.
+            if !previous_authorized.is_superset_of(&entry.granted_capabilities) {
+                return Err(ReceiptVerificationFailure::CapabilityExpansion {
+                    hop,
+                    attempted: entry.granted_capabilities.clone(),
+                    available: previous_authorized.clone(),
+                });
+            }
+            return Ok(());
+        }
+    }
+
+    if !tried_any_key {
+        // Document had no keys at all — treat as the resolved
+        // principal having no signing key id we can verify
+        // against.
+        return Err(ReceiptVerificationFailure::KeyNotInRotationHistory {
+            previous_key_id: KeyId::from_bytes([0u8; 32]),
+        });
+    }
+    if !tried_matching_alg {
+        // No keys with the receipt's algorithm — closest fit is
+        // KeyNotInRotationHistory because the algorithm match is
+        // structural (a key's algorithm tag is part of its
+        // identity in the rotation set).
+        return Err(ReceiptVerificationFailure::KeyNotInRotationHistory {
+            previous_key_id: KeyId::from_bytes([0u8; 32]),
+        });
+    }
+    Err(ReceiptVerificationFailure::SignatureInvalid)
+}
+
+/// Borrowed previous-principal accessor used inside the per-hop
+/// loop. Lets the loop carry either an [`AttributionPrincipal`]
+/// owned by `chain_wire.origin` or one borrowed from the prior
+/// entry without cloning.
+enum AttributionPrincipalRef<'a> {
+    FromOrigin(&'a AttributionPrincipal),
+    FromEntry(&'a AttributionPrincipal),
+}
+
+impl<'a> AttributionPrincipalRef<'a> {
+    fn did(&self) -> &Did {
+        match self {
+            AttributionPrincipalRef::FromOrigin(p) | AttributionPrincipalRef::FromEntry(p) => {
+                p.did()
+            }
+        }
+    }
+}
+
+fn principal_to_requester(p: &AttributionPrincipal) -> crate::ingress::Requester {
+    match p {
+        AttributionPrincipal::User(did) => crate::ingress::Requester::Did(did.clone()),
+        AttributionPrincipal::Service(s) => crate::ingress::Requester::Service(s.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3522,5 +3778,370 @@ mod tests {
         // Responder A succeeds.
         let v = verify_sync_established(&bytes, &local_id_a, &init_pk, &cfg).unwrap();
         assert_eq!(v.session_id(), session_id);
+    }
+
+    // ============================================================
+    // §4.8 W11 / W12 / W13 — chain verification tests.
+    // ============================================================
+
+    use crate::wire::{sign_delegation_receipt, DelegationReceipt};
+
+    fn chain_test_pair(seed: u8) -> (SigningKey, PublicKey, KeyId, Did) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        let pk = PublicKey {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: vk.to_bytes(),
+        };
+        let key_id = KeyId::from_bytes([seed; 32]);
+        let did_str = format!("did:plc:{seed:02x}principal000000");
+        let did = Did::new(&did_str).unwrap();
+        (sk, pk, key_id, did)
+    }
+
+    fn chain_test_resolver_for(pairs: &[(Did, KeyId, PublicKey)]) -> Arc<MockResolver> {
+        let r = Arc::new(MockResolver::new());
+        for (did, key_id, key) in pairs {
+            r.insert(did, *key_id, *key);
+        }
+        r
+    }
+
+    fn build_signed_entry(
+        previous_did: &Did,
+        previous_key_id: KeyId,
+        previous_signing_key: &SigningKey,
+        recipient_did: &Did,
+        recipient_key_id: KeyId,
+        recipient_pk: PublicKey,
+        granted: CapabilitySet,
+    ) -> AttributionEntryWire {
+        let derived_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let payload = DelegationReceiptPayload {
+            previous_principal_did: previous_did.clone(),
+            previous_key_id,
+            recipient_principal_did: recipient_did.clone(),
+            recipient_key_id,
+            derivation_reason: crate::ingress::DerivationReason::DropPrivilegeToAnonymous,
+            granted_capabilities: granted.clone(),
+            derived_at,
+        };
+        let receipt = sign_delegation_receipt(&payload, previous_signing_key);
+        AttributionEntryWire {
+            principal: AttributionPrincipal::Service(
+                ServiceIdentity::new_internal(
+                    recipient_did.clone(),
+                    recipient_key_id,
+                    recipient_pk,
+                    None,
+                ),
+            ),
+            derivation_reason: crate::ingress::DerivationReason::DropPrivilegeToAnonymous,
+            derived_at,
+            granted_capabilities: granted,
+            receipt,
+        }
+    }
+
+    /// §4.8 W11/W12/W13 happy path: a single-hop chain with valid
+    /// receipt and monotonic capabilities verifies.
+    #[tokio::test]
+    async fn verify_attribution_chain_happy_path_single_hop() {
+        let (sk_a, pk_a, kid_a, did_a) = chain_test_pair(0xA0);
+        let (_sk_b, pk_b, kid_b, did_b) = chain_test_pair(0xB0);
+        let resolver = chain_test_resolver_for(&[(did_a.clone(), kid_a, pk_a)]);
+        let origin_caps = CapabilitySet::from_kinds(vec![CapabilityKind::ViewPrivate]);
+
+        let entry = build_signed_entry(
+            &did_a, kid_a, &sk_a,
+            &did_b, kid_b, pk_b,
+            origin_caps.clone(),
+        );
+        let chain = AttributionChainWire {
+            origin: AttributionPrincipal::Service(ServiceIdentity::new_internal(
+                did_a.clone(),
+                kid_a,
+                pk_a,
+                None,
+            )),
+            entries: smallvec::smallvec![entry],
+        };
+
+        let verified = verify_attribution_chain(
+            &chain,
+            &origin_caps,
+            resolver.as_ref() as &dyn DidResolver,
+            deadline(),
+            TraceId::from_bytes([0xCD; 16]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified.entries().len(), 1);
+    }
+
+    /// §4.8 W13 capability-laundering probe: a hop attempting to
+    /// grant a capability the previous hop did not authorize fails
+    /// with `CapabilityExpansion { hop, attempted, available }`.
+    #[tokio::test]
+    async fn verify_attribution_chain_w13_capability_expansion_fails_closed() {
+        let (sk_a, pk_a, kid_a, did_a) = chain_test_pair(0xA1);
+        let (_sk_b, pk_b, kid_b, did_b) = chain_test_pair(0xB1);
+        let resolver = chain_test_resolver_for(&[(did_a.clone(), kid_a, pk_a)]);
+
+        // Origin authorized: only CreateRecord.
+        let origin_caps = CapabilitySet::from_kinds(vec![CapabilityKind::ViewPrivate]);
+
+        // Hop 0 attempts CreateRecord + DeleteRecord → expansion.
+        let attempted = CapabilitySet::from_kinds(vec![
+            CapabilityKind::ViewPrivate,
+            CapabilityKind::EditPrivatePost,
+        ]);
+        let entry = build_signed_entry(
+            &did_a, kid_a, &sk_a,
+            &did_b, kid_b, pk_b,
+            attempted,
+        );
+        let chain = AttributionChainWire {
+            origin: AttributionPrincipal::Service(ServiceIdentity::new_internal(
+                did_a.clone(),
+                kid_a,
+                pk_a,
+                None,
+            )),
+            entries: smallvec::smallvec![entry],
+        };
+
+        let err = verify_attribution_chain(
+            &chain,
+            &origin_caps,
+            resolver.as_ref() as &dyn DidResolver,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            BindError::AttributionReceiptInvalid {
+                failing_hop,
+                reason: ReceiptVerificationFailure::CapabilityExpansion { hop, .. },
+            } => {
+                assert_eq!(failing_hop, 0);
+                assert_eq!(hop, 0);
+            }
+            other => panic!("expected CapabilityExpansion at hop 0, got {other:?}"),
+        }
+    }
+
+    /// §4.8 W12 SignatureInvalid: a hop whose receipt was signed
+    /// by a different key than the previous principal's resolved
+    /// key fails with `SignatureInvalid`.
+    #[tokio::test]
+    async fn verify_attribution_chain_signature_invalid() {
+        let (sk_a, pk_a, kid_a, did_a) = chain_test_pair(0xA2);
+        let (sk_imposter, _, _, _) = chain_test_pair(0xC2);
+        let (_sk_b, pk_b, kid_b, did_b) = chain_test_pair(0xB2);
+        // Resolver returns A's real public key; receipt was signed
+        // by an imposter signing key → SignatureInvalid (no key in
+        // A's rotation history matches).
+        let resolver = chain_test_resolver_for(&[(did_a.clone(), kid_a, pk_a)]);
+        let origin_caps = CapabilitySet::from_kinds(vec![CapabilityKind::ViewPrivate]);
+
+        let entry = build_signed_entry(
+            &did_a, kid_a, &sk_imposter,
+            &did_b, kid_b, pk_b,
+            origin_caps.clone(),
+        );
+        // Suppress the unused-warning for sk_a — sk_a is what
+        // would have signed legitimately; we use sk_imposter.
+        let _ = &sk_a;
+        let chain = AttributionChainWire {
+            origin: AttributionPrincipal::Service(ServiceIdentity::new_internal(
+                did_a.clone(), kid_a, pk_a, None,
+            )),
+            entries: smallvec::smallvec![entry],
+        };
+
+        let err = verify_attribution_chain(
+            &chain, &origin_caps,
+            resolver.as_ref() as &dyn DidResolver,
+            deadline(), TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BindError::AttributionReceiptInvalid {
+                reason: ReceiptVerificationFailure::SignatureInvalid,
+                ..
+            }
+        ));
+    }
+
+    /// §4.8 W12 KeyNotInRotationHistory: previous principal's
+    /// resolved DID document carries no Ed25519 key (only Es256).
+    #[tokio::test]
+    async fn verify_attribution_chain_key_not_in_rotation_history() {
+        let (sk_a, _pk_a, kid_a, did_a) = chain_test_pair(0xA3);
+        // Resolved doc has an Es256 key, not Ed25519. Receipt
+        // claims Ed25519 algorithm.
+        let pk_a_es256 = PublicKey {
+            algorithm: SignatureAlgorithm::Es256,
+            bytes: [0x33; 32],
+        };
+        let (_sk_b, pk_b, kid_b, did_b) = chain_test_pair(0xB3);
+        let resolver = chain_test_resolver_for(&[(did_a.clone(), kid_a, pk_a_es256)]);
+        let origin_caps = CapabilitySet::from_kinds(vec![CapabilityKind::ViewPrivate]);
+
+        let entry = build_signed_entry(
+            &did_a, kid_a, &sk_a,
+            &did_b, kid_b, pk_b,
+            origin_caps.clone(),
+        );
+        let chain = AttributionChainWire {
+            origin: AttributionPrincipal::Service(ServiceIdentity::new_internal(
+                did_a.clone(), kid_a, pk_a_es256, None,
+            )),
+            entries: smallvec::smallvec![entry],
+        };
+
+        let err = verify_attribution_chain(
+            &chain, &origin_caps,
+            resolver.as_ref() as &dyn DidResolver,
+            deadline(), TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BindError::AttributionReceiptInvalid {
+                reason: ReceiptVerificationFailure::KeyNotInRotationHistory { .. },
+                ..
+            }
+        ));
+    }
+
+    /// §4.8 W12 PreviousPrincipalUnresolvable: resolver returns
+    /// NotFound for the previous principal's DID.
+    #[tokio::test]
+    async fn verify_attribution_chain_previous_principal_unresolvable() {
+        let (sk_a, pk_a, kid_a, did_a) = chain_test_pair(0xA4);
+        let (_sk_b, pk_b, kid_b, did_b) = chain_test_pair(0xB4);
+        // Resolver insert_err for the previous principal.
+        let r = Arc::new(MockResolver::new());
+        r.insert_err(&did_a, DidResolutionError::NotFound);
+        let origin_caps = CapabilitySet::from_kinds(vec![CapabilityKind::ViewPrivate]);
+
+        let entry = build_signed_entry(
+            &did_a, kid_a, &sk_a,
+            &did_b, kid_b, pk_b,
+            origin_caps.clone(),
+        );
+        let chain = AttributionChainWire {
+            origin: AttributionPrincipal::Service(ServiceIdentity::new_internal(
+                did_a.clone(), kid_a, pk_a, None,
+            )),
+            entries: smallvec::smallvec![entry],
+        };
+
+        let err = verify_attribution_chain(
+            &chain, &origin_caps,
+            r.as_ref() as &dyn DidResolver,
+            deadline(), TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BindError::AttributionReceiptInvalid {
+                reason: ReceiptVerificationFailure::PreviousPrincipalUnresolvable(_),
+                ..
+            }
+        ));
+    }
+
+    /// §4.8 W12 AlgorithmNotAccepted: receipt's algorithm is
+    /// outside the verifier's allowlist (Ed25519 only in v1).
+    #[tokio::test]
+    async fn verify_attribution_chain_algorithm_not_accepted() {
+        let (sk_a, pk_a, kid_a, did_a) = chain_test_pair(0xA5);
+        let (_sk_b, pk_b, kid_b, did_b) = chain_test_pair(0xB5);
+        let resolver = chain_test_resolver_for(&[(did_a.clone(), kid_a, pk_a)]);
+        let origin_caps = CapabilitySet::from_kinds(vec![CapabilityKind::ViewPrivate]);
+
+        let mut entry = build_signed_entry(
+            &did_a, kid_a, &sk_a,
+            &did_b, kid_b, pk_b,
+            origin_caps.clone(),
+        );
+        // Stamp the receipt's algorithm to Es256 so the allowlist
+        // check fires before signature verification.
+        entry.receipt = DelegationReceipt {
+            algorithm: SignatureAlgorithm::Es256,
+            bytes: entry.receipt.bytes,
+        };
+        let chain = AttributionChainWire {
+            origin: AttributionPrincipal::Service(ServiceIdentity::new_internal(
+                did_a.clone(), kid_a, pk_a, None,
+            )),
+            entries: smallvec::smallvec![entry],
+        };
+
+        let err = verify_attribution_chain(
+            &chain, &origin_caps,
+            resolver.as_ref() as &dyn DidResolver,
+            deadline(), TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BindError::AttributionReceiptInvalid {
+                reason: ReceiptVerificationFailure::AlgorithmNotAccepted(SignatureAlgorithm::Es256),
+                ..
+            }
+        ));
+    }
+
+    /// §4.8 chain depth bound: chain with > MAX_CHAIN_DEPTH entries
+    /// fails as Malformed before any per-hop work runs.
+    #[tokio::test]
+    async fn verify_attribution_chain_over_depth_returns_malformed() {
+        let (sk_a, pk_a, kid_a, did_a) = chain_test_pair(0xA6);
+        let (_, pk_b, kid_b, did_b) = chain_test_pair(0xB6);
+        let resolver = chain_test_resolver_for(&[(did_a.clone(), kid_a, pk_a)]);
+        let origin_caps = CapabilitySet::from_kinds(vec![CapabilityKind::ViewPrivate]);
+
+        let entry = build_signed_entry(
+            &did_a, kid_a, &sk_a,
+            &did_b, kid_b, pk_b,
+            origin_caps.clone(),
+        );
+        // Build MAX_CHAIN_DEPTH + 1 entries — over the cap.
+        let mut entries: smallvec::SmallVec<[AttributionEntryWire; 8]> =
+            smallvec::SmallVec::new();
+        for _ in 0..(crate::ingress::MAX_CHAIN_DEPTH + 1) {
+            entries.push(entry.clone());
+        }
+        let chain = AttributionChainWire {
+            origin: AttributionPrincipal::Service(ServiceIdentity::new_internal(
+                did_a.clone(), kid_a, pk_a, None,
+            )),
+            entries,
+        };
+
+        let err = verify_attribution_chain(
+            &chain, &origin_caps,
+            resolver.as_ref() as &dyn DidResolver,
+            deadline(), TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BindError::AttributionReceiptInvalid {
+                reason: ReceiptVerificationFailure::Malformed,
+                ..
+            }
+        ));
     }
 }
