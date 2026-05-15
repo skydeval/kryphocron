@@ -75,7 +75,7 @@ pub use self::v1::{
 /// - **Stage 3 — proof construction.** Builds a
 ///   [`UserProof<C>`] with `issued_at = Instant::now()` and a
 ///   process-static [`AuthorityId`] (see
-///   [`process_authority_id`]).
+///   `process_authority_id`).
 ///
 /// Stage 0 (§5.6 lexicon-deprecation gate) and stage 2 (subject
 /// ownership / authority check) defer to bind (Phase 7d). Stage 0
@@ -120,7 +120,8 @@ where
 ///   process-static [`AuthorityId`].
 ///
 /// Stage 0 (lexicon deprecation) does not apply to channel-class
-/// — channel subjects ([`crate::ChannelBinding`]) carry no NSID.
+/// — channel subjects ([`crate::authority::ChannelBinding`])
+/// carry no NSID.
 /// Stage 2 (endpoint validation) is the bind-time predicate's
 /// domain.
 ///
@@ -161,11 +162,12 @@ where
 ///   [`SubstrateProof<S>`] with `issued_at = Instant::now()` and a
 ///   process-static [`AuthorityId`].
 ///
-/// Stage 0 does not apply (substrate subjects [`crate::ScopeSelector`]
-/// carry no NSID). Stage 2 (scope-vs-trust-declaration check)
-/// is the bind-time predicate's domain; the
-/// [`crate::ServiceTrustDeclaration`] surface that powers it
-/// lands as part of Phase 7d.
+/// Stage 0 does not apply (substrate subjects
+/// [`crate::authority::ScopeSelector`] carry no NSID). Stage 2
+/// (scope-vs-trust-declaration check) is the bind-time
+/// predicate's domain; the
+/// [`crate::ingress::ServiceTrustDeclaration`] surface that
+/// powers it lands as part of Phase 7d.
 ///
 /// # Errors
 ///
