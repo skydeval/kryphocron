@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Capability-claim signing-key resolution: exact-match-only in 4b; rotation-history walking lands in Phase 4c (#35)
 - Phase 4 orientation document referenced in 4a kickoff is missing from the repo (#30)
 - `InspectionNotification` shape change (Phase 1 → Phase 3) breaking for any prototype queue impls (#25)
 - `FallbackAuditSink::record_panic` / `record_composite_failure` trait signatures gained `at: SystemTime` parameter (Phase 1 → Phase 3 breaking) (#24)
