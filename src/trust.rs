@@ -2,7 +2,7 @@
 //!
 //! Trust declarations are minted by operator tooling, NOT by the
 //! substrate. The crate provides the verification path
-//! ([`verify_trust_declaration`]) and the type shape
+//! ([`crate::trust::verify_trust_declaration`]) and the type shape
 //! ([`crate::ingress::ServiceTrustDeclaration`]); construction is
 //! operator-managed (typically a CLI signing with a hardware-token-
 //! held trust-root key).
@@ -16,10 +16,11 @@
 //!    operator's configured trust roots.
 //! 3. Re-encode the canonical payload (sans signature) and verify
 //!    the Ed25519 signature with domain separation
-//!    [`TRUST_DECLARATION_DOMAIN_TAG`].
+//!    `b"kryphocron/v1/service-trust-declaration/"` (the
+//!    crate-internal `TRUST_DECLARATION_DOMAIN_TAG` constant).
 //! 4. Validity-window enforcement: `iat` past with skew, `exp`
 //!    future with skew, `exp - iat` ≤
-//!    [`MAX_TRUST_DECLARATION_VALIDITY`].
+//!    [`crate::trust::MAX_TRUST_DECLARATION_VALIDITY`].
 //! 5. Construct [`crate::ingress::ServiceTrustDeclaration`] via the
 //!    crate-internal constructor.
 
@@ -73,7 +74,9 @@ pub struct TrustRootIdentity {
 ///
 /// Signed by a [`TrustRootIdentity`] over the deterministic-CBOR
 /// encoding of the declaration's payload (sans this `signature`
-/// field) with domain separation [`TRUST_DECLARATION_DOMAIN_TAG`].
+/// field) with domain separation
+/// `b"kryphocron/v1/service-trust-declaration/"` (the
+/// crate-internal `TRUST_DECLARATION_DOMAIN_TAG` constant).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TrustRootSignature {
