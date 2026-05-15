@@ -459,44 +459,63 @@ impl ServiceTrustDeclaration {
 
 /// Construct [`AuthContext`] from a verified XRPC JWT (§4.2).
 ///
-/// **Phase 1 stub.** Phase 4 wires the chain-rehydration logic
-/// and the JWT-scope plumb-through.
+/// The resulting context's [`Requester`] is [`Requester::Did`]
+/// carrying the JWT's `iss` claim. The attribution chain is
+/// empty: an XRPC request IS the origin, so there's no upstream
+/// delegation to rehydrate.
+///
+/// Phase 4e wires this entry point. The JWT scope itself is not
+/// projected into the AuthContext at this layer — downstream
+/// access-control code consults the [`crate::verification::VerifiedJwt`]
+/// directly when it needs to make scope-derived decisions; the
+/// AuthContext carries the requester identity, the trace_id, the
+/// audit sinks, and the oracles.
 #[must_use]
 pub fn from_xrpc_request<'a>(
-    _evidence: crate::verification::VerifiedJwt,
-    _trace_id: TraceId,
-    _sinks: AuditSinks<'a>,
-    _oracles: OracleSet<'a>,
+    evidence: crate::verification::VerifiedJwt,
+    trace_id: TraceId,
+    sinks: AuditSinks<'a>,
+    oracles: OracleSet<'a>,
 ) -> AuthContext<'a> {
-    unimplemented!(
-        "§4.2 ingress::from_xrpc_request: Phase 4 wires AuthContext rehydration"
-    );
+    AuthContext::new_internal(
+        Requester::Did(evidence.issuer().clone()),
+        trace_id,
+        sinks,
+        oracles,
+        AttributionChain::empty(),
+    )
 }
 
 /// Construct [`AuthContext`] from a verified service-issued
 /// capability claim (§7.6).
 ///
-/// Parallel to [`from_xrpc_request`] but for the
-/// substrate-internal trust context: the resulting context's
-/// [`Requester`] variant is [`Requester::Service`] carrying the
-/// claim's issuer identity.
+/// The resulting context's [`Requester`] is [`Requester::Service`]
+/// carrying the claim's issuer identity. The attribution chain is
+/// rehydrated from the claim's verified upstream chain (Phase 4e):
 ///
-/// **Phase 4b stub.** The constructor signature ships with the
-/// `VerifiedCapabilityClaim` type from §7.6 wired, but
-/// `AuthContext` construction still requires the same
-/// chain-rehydration / sink-plumbing wiring [`from_xrpc_request`]
-/// is awaiting (Phase 4d / 4e). Both stubs land together when
-/// the broader `AuthContext` construction path crystalizes.
+/// - For `ClaimOrigin::SelfOriginated` claims, the chain is empty
+///   — the issuer IS the origin.
+/// - For `ClaimOrigin::DelegatedFromUpstream` claims, the
+///   verified `crate::AttributionChain` returned by
+///   [`crate::verification::verify_attribution_chain`] (carried
+///   inside the `VerifiedCapabilityClaim` per Phase 4e C3) is
+///   unpacked into the AuthContext.
 #[must_use]
 pub fn from_service_request<'a>(
-    _evidence: crate::verification::VerifiedCapabilityClaim,
-    _trace_id: TraceId,
-    _sinks: AuditSinks<'a>,
-    _oracles: OracleSet<'a>,
+    evidence: crate::verification::VerifiedCapabilityClaim,
+    trace_id: TraceId,
+    sinks: AuditSinks<'a>,
+    oracles: OracleSet<'a>,
 ) -> AuthContext<'a> {
-    unimplemented!(
-        "§7.6 ingress::from_service_request: Phase 4d/4e wires AuthContext rehydration"
-    );
+    let issuer = evidence.issuer().clone();
+    let chain = evidence.chain().cloned().unwrap_or_else(AttributionChain::empty);
+    AuthContext::new_internal(
+        Requester::Service(issuer),
+        trace_id,
+        sinks,
+        oracles,
+        chain,
+    )
 }
 
 /// Construct [`AuthContext`] from a verified sync-channel
@@ -519,9 +538,12 @@ pub fn from_sync_channel_handshake<'a>(
 /// The resulting context's [`Requester`] is
 /// [`Requester::Service`] carrying the session-bound peer
 /// identity from the originating handshake. The attribution chain
-/// starts empty; Phase 4e adds upstream-delegation rehydration
-/// from the inner claim's `ClaimOrigin::DelegatedFromUpstream`
-/// variant (chainlink tracked).
+/// is rehydrated from the inner [`crate::verification::VerifiedCapabilityClaim`]'s
+/// verified chain (Phase 4e). The sync-channel hop itself is
+/// transport, not delegation, so no extra entry is recorded for
+/// it — the `Requester::Service(session_peer)` carries the
+/// transport context, while the chain captures upstream
+/// delegation history.
 ///
 /// The substrate dispatcher is responsible for the §7.5
 /// `UnknownSessionMessage` audit emit when a sync-channel message
@@ -530,11 +552,6 @@ pub fn from_sync_channel_handshake<'a>(
 /// session lookup succeeded and
 /// [`crate::verification::verify_sync_message`] returned a
 /// [`crate::verification::VerifiedSyncMessage`].
-///
-/// **Sibling-stub status.** Phase 4d wires this entry point.
-/// [`from_xrpc_request`] and [`from_service_request`] still stub
-/// (Phase 4e wires both alongside the broader §4.2
-/// chain-rehydration discipline; chainlink tracks).
 #[must_use]
 pub fn from_sync_channel_message<'a>(
     evidence: crate::verification::VerifiedSyncMessage,
@@ -543,12 +560,17 @@ pub fn from_sync_channel_message<'a>(
     oracles: OracleSet<'a>,
 ) -> AuthContext<'a> {
     let session_identity = evidence.session_identity().clone();
+    let chain = evidence
+        .payload()
+        .chain()
+        .cloned()
+        .unwrap_or_else(AttributionChain::empty);
     AuthContext::new_internal(
         Requester::Service(session_identity),
         trace_id,
         sinks,
         oracles,
-        AttributionChain::empty(),
+        chain,
     )
 }
 
