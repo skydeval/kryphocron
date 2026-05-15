@@ -238,18 +238,50 @@ impl CompositeAuditScope {
 }
 
 /// Composite-audit failure cases (§4.9).
+///
+/// The op's own error type `E` is returned directly via the
+/// `E: From<CompositeAuditError>` bound on [`composite_audit`];
+/// composite-machinery errors convert into `E` along the same
+/// path. Operators define an outer error enum embedding
+/// `CompositeAuditError` plus their op-specific variants.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CompositeAuditError {
-    /// Wrapped operation returned an error.
-    #[error("composite op failed")]
-    OpFailed,
+    /// A sink's `record(event)` call failed during the commit
+    /// phase (after the op returned Ok). Identifies which class
+    /// failed and the underlying [`AuditError`]. Rollback
+    /// markers fire for any sinks that committed before this
+    /// failure.
+    #[error("composite commit failed at {class:?} sink: {source}")]
+    SinkCommitFailed {
+        /// Which sink class failed to commit.
+        class: SinkKind,
+        /// The underlying sink error.
+        source: AuditError,
+    },
+    /// A rollback marker dispatch failed. Identifies which
+    /// rollback target failed and the underlying error.
+    /// composite_audit escalates to
+    /// [`crate::audit::FallbackAuditSink::record_composite_failure`]
+    /// after a rollback dispatch failure; this variant captures
+    /// the rollback failure that triggered the escalation.
+    #[error("composite rollback dispatch failed at {class:?} sink: {source}")]
+    RollbackDispatchFailed {
+        /// Which sink class the rollback marker targeted.
+        class: SinkKind,
+        /// The underlying dispatch error.
+        source: AuditError,
+    },
     /// Rollback marker emission failed past
-    /// [`crate::audit::FallbackAuditSink`].
-    #[error("composite inconsistency unrecoverable")]
+    /// [`crate::audit::FallbackAuditSink::record_composite_failure`].
+    /// Last-resort error when even the fallback escalation
+    /// panics. Operators should treat this as substrate-fatal.
+    #[error("composite inconsistency unrecoverable (fallback sink panicked)")]
     InconsistencyUnrecoverable,
     /// Tracker is at capacity; the substrate cannot accept new
-    /// composite scopes.
+    /// composite scopes. Reserved for the per-process
+    /// [`CompositeOpId`] tracker that lands in a future cycle;
+    /// not currently emitted by [`composite_audit`].
     #[error("composite tracker full")]
     TrackerFull,
 }
@@ -375,22 +407,176 @@ pub(in crate::audit::composite) fn emit_rollback_marker(
 
 /// Composite-audit entrypoint (§4.9).
 ///
-/// **Phase 1 stub.** Phase 4 wires the multi-sink commit-or-roll-
-/// back machinery; in Phase 1 the function signature is exposed
-/// so consumer code can compile.
+/// Wraps a multi-sink operation in commit-or-rollback semantics:
+///
+/// 1. The op closure receives a `&CompositeAuditScope` and
+///    queues events via `emit_user` / `emit_channel` /
+///    `emit_substrate` / `emit_moderation`. Events are NOT
+///    delivered to sinks during the op.
+/// 2. If the op returns `Err(e)`: queued events are dropped;
+///    `Err(e)` is returned unchanged. No sink is touched. No
+///    rollback markers fire (nothing committed).
+/// 3. If the op returns `Ok(r)`: queued events are committed
+///    to the operator-installed sinks in [`COMMIT_PRIORITY_ORDER`]
+///    (substrate → moderation → user → channel). Within each
+///    class, the op's emit-order is preserved.
+/// 4. If a commit fails partway: rollback markers fire to all
+///    sinks that already committed (deduplicated by class), in
+///    reverse [`COMMIT_PRIORITY_ORDER`]. The error returned is
+///    [`CompositeAuditError::SinkCommitFailed { class, source }`]
+///    converted to `E` via `From<CompositeAuditError>`.
+/// 5. If a rollback marker dispatch itself fails: escalates to
+///    [`crate::audit::FallbackAuditSink::record_composite_failure`].
+///    Returns [`CompositeAuditError::RollbackDispatchFailed`].
+/// 6. If the FallbackAuditSink escalation itself panics:
+///    returns [`CompositeAuditError::InconsistencyUnrecoverable`];
+///    operators should treat this as substrate-fatal.
+///
+/// **`E: From<CompositeAuditError>`** lets the op's error type
+/// embed the composite-machinery error variants. The natural
+/// pattern is an operator-side enum:
+///
+/// ```text
+/// #[derive(Debug, thiserror::Error)]
+/// enum MyOpError {
+///     #[error(transparent)]
+///     Composite(#[from] CompositeAuditError),
+///     #[error("my op-specific failure: {0}")]
+///     OpSpecific(String),
+/// }
+/// ```
 ///
 /// # Errors
 ///
-/// See [`CompositeAuditError`].
+/// Returns `Err(E)` either from the op directly or from
+/// [`CompositeAuditError`] converted via `From`. See variant
+/// docs for the failure modes.
 pub async fn composite_audit<F, R, E>(
-    _trace_id: TraceId,
-    _sinks: &crate::ingress::AuditSinks<'_>,
-    _op: F,
-) -> Result<R, CompositeAuditError>
+    trace_id: TraceId,
+    sinks: &crate::ingress::AuditSinks<'_>,
+    op: F,
+) -> Result<R, E>
 where
     F: AsyncFnOnce(&CompositeAuditScope) -> Result<R, E>,
+    E: From<CompositeAuditError>,
 {
-    unimplemented!("§4.9 composite_audit: Phase 4 wires the multi-sink machinery");
+    // Phase 7b: composite_op_id is generated fresh per scope.
+    // The per-process tracker for op_id collisions / GC lands
+    // in a future cycle (TRACKER_SHARDS / TRACKER_GRACE_WINDOW
+    // constants are reserved).
+    let composite_op_id = generate_composite_op_id();
+    let scope = CompositeAuditScope::new_internal(trace_id, composite_op_id);
+
+    // Phase 1: run the op.
+    let op_result = op(&scope).await;
+    let returned = match op_result {
+        Ok(r) => r,
+        Err(e) => {
+            // Op failed — drop queued events, return E unchanged.
+            // No commit, no rollback (nothing committed).
+            return Err(e);
+        }
+    };
+
+    // Phase 2: commit queued events in priority order.
+    let queued = scope.drain_queued_events();
+    let dispatcher = AuditSinksDispatcher { sinks };
+
+    for event in queued {
+        let class = event.class();
+        let commit_result = match event {
+            QueuedEvent::User(e) => sinks.user.record(e),
+            QueuedEvent::Channel(e) => sinks.channel.record(e),
+            QueuedEvent::Substrate(e) => sinks.substrate.record(e),
+            QueuedEvent::Moderation(e) => sinks.moderation.record(e),
+        };
+        match commit_result {
+            Ok(()) => scope.record_committed(class),
+            Err(commit_err) => {
+                // Phase 3: rollback. Fire markers to sinks that
+                // already committed (in reverse priority order).
+                handle_rollback(&scope, &dispatcher, sinks, class, commit_err).await
+                    .map_err(E::from)?;
+                // Unreachable in practice — handle_rollback
+                // returns the originating error on success;
+                // unreachable!() would be wrong because the
+                // error path above always returns. Drop through
+                // to the final unreachable! below.
+                unreachable!("handle_rollback always returns an error");
+            }
+        }
+    }
+
+    Ok(returned)
+}
+
+/// Generate a fresh [`CompositeOpId`] from the OS CSPRNG. Used
+/// once per [`composite_audit`] scope.
+fn generate_composite_op_id() -> CompositeOpId {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes)
+        .expect("OS CSPRNG must be available for composite_op_id generation");
+    CompositeOpId::from_bytes(bytes)
+}
+
+/// Handle the rollback path after a commit failure. Fires
+/// rollback markers to every sink class that committed before
+/// the failure (deduplicated by class), in reverse
+/// [`COMMIT_PRIORITY_ORDER`]. Always returns an Err — the
+/// originating commit failure is the meaningful error;
+/// rollback failures are escalated and reported via
+/// [`CompositeAuditError::RollbackDispatchFailed`] (which
+/// supersedes the originating commit failure since rollback
+/// failure is more severe).
+async fn handle_rollback(
+    scope: &CompositeAuditScope,
+    dispatcher: &AuditSinksDispatcher<'_, '_>,
+    sinks: &crate::ingress::AuditSinks<'_>,
+    failing_class: SinkKind,
+    originating_err: AuditError,
+) -> Result<(), CompositeAuditError> {
+    let committed = scope.committed_snapshot();
+    // Reverse priority order: rollback the most-recently-
+    // committed first.
+    let rollback_targets: Vec<SinkKind> = COMMIT_PRIORITY_ORDER
+        .iter()
+        .rev()
+        .filter(|c| committed.contains(c))
+        .copied()
+        .collect();
+
+    for target in rollback_targets {
+        if let Err(rollback_err) =
+            emit_rollback_marker(scope, dispatcher, target, failing_class)
+        {
+            // Rollback dispatch failed. Escalate to FallbackAuditSink.
+            // record_composite_failure returns unit; if it
+            // panics, we return InconsistencyUnrecoverable.
+            let escalation_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sinks.fallback.record_composite_failure(
+                    scope.trace_id,
+                    scope.composite_op_id,
+                    &committed[..],
+                    &[failing_class],
+                    std::time::SystemTime::now(),
+                );
+            }));
+            return match escalation_result {
+                Ok(()) => Err(CompositeAuditError::RollbackDispatchFailed {
+                    class: target,
+                    source: rollback_err,
+                }),
+                Err(_) => Err(CompositeAuditError::InconsistencyUnrecoverable),
+            };
+        }
+    }
+
+    // All rollback markers dispatched cleanly. Return the
+    // originating commit failure.
+    Err(CompositeAuditError::SinkCommitFailed {
+        class: failing_class,
+        source: originating_err,
+    })
 }
 
 #[cfg(test)]
