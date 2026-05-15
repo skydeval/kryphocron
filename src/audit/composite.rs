@@ -287,7 +287,10 @@ impl CompositeRollbackMarker {
 ///
 /// Routes rollback-marker events to the appropriate class sink
 /// based on [`SinkKind`]. Used only by
-/// [`emit_rollback_marker`]; not exposed to consumers.
+/// [`emit_rollback_marker`]; not exposed to consumers. The
+/// concrete implementation [`AuditSinksDispatcher`] wraps
+/// [`crate::ingress::AuditSinks`] and constructs the per-class
+/// `CompositeRollbackMarker` event variant for each sink kind.
 pub(in crate::audit) trait SinkDispatcher {
     fn dispatch(
         &self,
@@ -296,15 +299,78 @@ pub(in crate::audit) trait SinkDispatcher {
     ) -> Result<(), AuditError>;
 }
 
+/// Crate-internal [`SinkDispatcher`] implementation over
+/// operator-supplied [`crate::ingress::AuditSinks`]. Routes
+/// rollback markers to the per-class sink as the matching
+/// `*::CompositeRollbackMarker` event variant.
+pub(in crate::audit) struct AuditSinksDispatcher<'a, 'b> {
+    pub(in crate::audit) sinks: &'a crate::ingress::AuditSinks<'b>,
+}
+
+impl<'a, 'b> SinkDispatcher for AuditSinksDispatcher<'a, 'b> {
+    fn dispatch(
+        &self,
+        sink: SinkKind,
+        marker: CompositeRollbackMarker,
+    ) -> Result<(), AuditError> {
+        let at = std::time::SystemTime::now();
+        match sink {
+            SinkKind::User => self.sinks.user.record(UserAuditEvent::CompositeRollbackMarker {
+                trace_id: marker.trace_id,
+                composite_op_id: marker.composite_op_id,
+                failing_sink: marker.failing_sink,
+                at,
+            }),
+            SinkKind::Channel => {
+                self.sinks.channel.record(ChannelAuditEvent::CompositeRollbackMarker {
+                    trace_id: marker.trace_id,
+                    composite_op_id: marker.composite_op_id,
+                    failing_sink: marker.failing_sink,
+                    at,
+                })
+            }
+            SinkKind::Substrate => {
+                self.sinks.substrate.record(SubstrateAuditEvent::CompositeRollbackMarker {
+                    trace_id: marker.trace_id,
+                    composite_op_id: marker.composite_op_id,
+                    failing_sink: marker.failing_sink,
+                    at,
+                })
+            }
+            SinkKind::Moderation => {
+                self.sinks.moderation.record(ModerationAuditEvent::CompositeRollbackMarker {
+                    trace_id: marker.trace_id,
+                    composite_op_id: marker.composite_op_id,
+                    failing_sink: marker.failing_sink,
+                    at,
+                })
+            }
+        }
+    }
+}
+
 /// Crate-internal rollback-marker emission entrypoint
 /// (§4.9 A6).
-#[allow(dead_code)]
+///
+/// Constructs a [`CompositeRollbackMarker`] from the scope's
+/// trace_id + composite_op_id and the supplied
+/// `failing_sink`, then dispatches via the supplied
+/// [`SinkDispatcher`]. Returns the dispatcher's [`AuditError`]
+/// on dispatch failure; callers escalate to
+/// [`crate::audit::FallbackAuditSink::record_composite_failure`]
+/// at that point.
 pub(in crate::audit::composite) fn emit_rollback_marker(
-    _scope: &CompositeAuditScope,
-    _sink_dispatch: &dyn SinkDispatcher,
-    _failing_sink: SinkKind,
+    scope: &CompositeAuditScope,
+    sink_dispatch: &dyn SinkDispatcher,
+    target_sink: SinkKind,
+    failing_sink: SinkKind,
 ) -> Result<(), AuditError> {
-    unimplemented!("§4.9 composite::emit_rollback_marker: Phase 4 wires");
+    let marker = CompositeRollbackMarker::new_internal(
+        scope.trace_id,
+        scope.composite_op_id,
+        failing_sink,
+    );
+    sink_dispatch.dispatch(target_sink, marker)
 }
 
 /// Composite-audit entrypoint (§4.9).
