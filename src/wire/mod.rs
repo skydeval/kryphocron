@@ -14,6 +14,7 @@
 mod canonical_cbor;
 mod claim;
 mod handshake;
+mod handshake_tracker;
 mod nonce;
 mod receipt;
 mod signature;
@@ -61,6 +62,10 @@ pub use self::handshake::{
     SyncTimeWindow, ACCEPT_DOMAIN_TAG, DEFAULT_FEDERATION_TIME_WINDOW,
     ESTABLISHED_DOMAIN_TAG, HELLO_DOMAIN_TAG, MAX_HANDSHAKE_MESSAGE_SIZE,
     REJECT_DOMAIN_TAG,
+};
+pub use self::handshake_tracker::{
+    DefaultHandshakeNonceTracker, HandshakeNonceTracker,
+    MAX_HANDSHAKE_NONCE_REPLAY_WINDOW, MAX_HANDSHAKE_NONCE_TRACKER_ENTRIES,
 };
 
 // Crate-internal re-exports for `verification` (Phase 4d
