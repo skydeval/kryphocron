@@ -1433,6 +1433,10 @@ mod tests {
                 did: did.clone(),
                 verification_methods: vec![(key_id, key)],
                 rotation_history: vec![],
+                services: vec![],
+                also_known_as: vec![],
+                resolved_at: SystemTime::now(),
+                resolver_cache_max_age: Duration::from_secs(3600),
             };
             self.documents.lock().unwrap().insert(did.as_str().to_string(), Ok(doc));
         }
@@ -1783,6 +1787,10 @@ mod tests {
             did: issuer_did(),
             verification_methods: vec![],
             rotation_history: vec![],
+            services: vec![],
+            also_known_as: vec![],
+            resolved_at: SystemTime::now(),
+            resolver_cache_max_age: Duration::from_secs(3600),
         };
         r.documents.lock().unwrap().insert(issuer_did().as_str().to_string(), Ok(empty_doc));
         let cfg = JwtVerificationConfig::default();
