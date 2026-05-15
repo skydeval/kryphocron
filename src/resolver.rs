@@ -114,22 +114,36 @@ pub enum DidResolutionError {
 /// services (PLC directory HTTP, did:web HTTPS fetch) honor the
 /// deadline against upstream latency.
 ///
+/// All methods also accept a `trace_id: TraceId` parameter for
+/// audit-event correlation: when [`DefaultDidResolver`] detects
+/// rotation or processes invalidation it emits
+/// [`crate::audit::SubstrateAuditEvent::DidDocumentRotated`] /
+/// `DidDocumentInvalidated`, and the audit event must be
+/// attributable to the request that triggered the cache miss
+/// (or, for invalidation, the operator action). Phase 4d adds
+/// the parameter; the resolver-internal audit-emit sites
+/// previously used a placeholder zero-id (chainlink #41).
+///
 /// Phase 4c lands [`DefaultDidResolver`] as a substrate-side
 /// default; operators can substitute their own implementations
 /// when they want different cache or transport behavior.
 #[async_trait]
 pub trait DidResolver: Send + Sync {
-    /// Resolve `did` to a [`DidDocument`].
+    /// Resolve `did` to a [`DidDocument`]. The `trace_id` is used
+    /// to attribute any audit events emitted as a side effect of
+    /// the resolution (rotation detection in particular).
     async fn resolve(
         &self,
         did: &Did,
         deadline: Instant,
+        trace_id: TraceId,
     ) -> Result<DidDocument, DidResolutionError>;
 
     /// Invalidate the cached document for `did`. Operators use
     /// this on out-of-band signals (security advisory, user
-    /// report).
-    async fn invalidate(&self, did: &Did);
+    /// report). The `trace_id` is used to attribute the
+    /// invalidation audit event to the operator action.
+    async fn invalidate(&self, did: &Did, trace_id: TraceId);
 
     /// Return the DID methods this resolver can handle (§7.3).
     /// Default implementation returns `&["plc", "web"]` —
@@ -300,6 +314,7 @@ impl<F: HttpDidFetcher> DefaultDidResolver<F> {
         &self,
         did: &Did,
         deadline: Instant,
+        trace_id: TraceId,
         cache: &Mutex<HashMap<Did, CachedEntry>>,
         cache_max_age: Duration,
     ) -> Result<DidDocument, DidResolutionError> {
@@ -360,7 +375,7 @@ impl<F: HttpDidFetcher> DefaultDidResolver<F> {
         };
         if let Some(prev) = &previous {
             if prev.verification_methods != document.verification_methods {
-                self.emit_rotation_audit(did, prev, &document);
+                self.emit_rotation_audit(did, prev, &document, trace_id);
             }
         }
 
@@ -393,10 +408,12 @@ impl<F: HttpDidFetcher> DefaultDidResolver<F> {
         &self,
         did: &Did,
         deadline: Instant,
+        trace_id: TraceId,
     ) -> Result<DidDocument, DidResolutionError> {
         self.resolve_with_cache(
             did,
             deadline,
+            trace_id,
             &self.trust_root_cache,
             self.config.max_trust_root_cache_age,
         )
@@ -408,10 +425,11 @@ impl<F: HttpDidFetcher> DefaultDidResolver<F> {
         did: &Did,
         previous: &DidDocument,
         current: &DidDocument,
+        trace_id: TraceId,
     ) {
         let Some(sink) = &self.audit_sink else { return };
         let event = SubstrateAuditEvent::DidDocumentRotated {
-            trace_id: TraceId::from_bytes([0u8; 16]),
+            trace_id,
             did: did.clone(),
             previous_methods: previous
                 .verification_methods
@@ -432,10 +450,11 @@ impl<F: HttpDidFetcher> DefaultDidResolver<F> {
         &self,
         did: &Did,
         source: crate::audit::InvalidationSource,
+        trace_id: TraceId,
     ) {
         let Some(sink) = &self.audit_sink else { return };
         let event = SubstrateAuditEvent::DidDocumentInvalidated {
-            trace_id: TraceId::from_bytes([0u8; 16]),
+            trace_id,
             did: did.clone(),
             invalidated_by: source,
             at: SystemTime::now(),
@@ -450,17 +469,19 @@ impl<F: HttpDidFetcher> DidResolver for DefaultDidResolver<F> {
         &self,
         did: &Did,
         deadline: Instant,
+        trace_id: TraceId,
     ) -> Result<DidDocument, DidResolutionError> {
         self.resolve_with_cache(
             did,
             deadline,
+            trace_id,
             &self.document_cache,
             self.config.max_document_cache_age,
         )
         .await
     }
 
-    async fn invalidate(&self, did: &Did) {
+    async fn invalidate(&self, did: &Did, trace_id: TraceId) {
         let removed_doc = self
             .document_cache
             .lock()
@@ -475,6 +496,7 @@ impl<F: HttpDidFetcher> DidResolver for DefaultDidResolver<F> {
             self.emit_invalidation_audit(
                 did,
                 crate::audit::InvalidationSource::Operator,
+                trace_id,
             );
         }
     }
@@ -867,6 +889,10 @@ mod tests {
         Instant::now() + Duration::from_secs(30)
     }
 
+    fn test_trace_id() -> TraceId {
+        TraceId::from_bytes([0xAB; 16])
+    }
+
     /// §7.3 ceilings pinned.
     #[test]
     fn cache_age_constants_pinned_per_7_3() {
@@ -893,10 +919,11 @@ mod tests {
                 &self,
                 _did: &Did,
                 _deadline: Instant,
+                _trace_id: TraceId,
             ) -> Result<DidDocument, DidResolutionError> {
                 unimplemented!()
             }
-            async fn invalidate(&self, _did: &Did) {}
+            async fn invalidate(&self, _did: &Did, _trace_id: TraceId) {}
         }
         let r = BareImpl;
         assert_eq!(r.supported_methods(), &["plc", "web"]);
@@ -1008,10 +1035,10 @@ mod tests {
         );
         let resolver = DefaultDidResolver::new(fetcher);
         // First resolve hits the fetcher.
-        let _doc1 = resolver.resolve(&did, deadline()).await.unwrap();
+        let _doc1 = resolver.resolve(&did, deadline(), test_trace_id()).await.unwrap();
         // Second resolve hits the cache; fetcher call count
         // remains at 1.
-        let _doc2 = resolver.resolve(&did, deadline()).await.unwrap();
+        let _doc2 = resolver.resolve(&did, deadline(), test_trace_id()).await.unwrap();
         let calls = *resolver.fetcher.plc_calls.lock().unwrap();
         assert_eq!(calls, 1, "expected one fetch, got {calls}");
     }
@@ -1029,10 +1056,10 @@ mod tests {
             }),
         );
         let resolver = DefaultDidResolver::new(fetcher);
-        let _doc1 = resolver.resolve(&did, deadline()).await.unwrap();
-        resolver.invalidate(&did).await;
+        let _doc1 = resolver.resolve(&did, deadline(), test_trace_id()).await.unwrap();
+        resolver.invalidate(&did, test_trace_id()).await;
         // After invalidation the next resolve fetches fresh.
-        let _doc2 = resolver.resolve(&did, deadline()).await.unwrap();
+        let _doc2 = resolver.resolve(&did, deadline(), test_trace_id()).await.unwrap();
         let calls = *resolver.fetcher.plc_calls.lock().unwrap();
         assert_eq!(calls, 2, "expected two fetches after invalidation, got {calls}");
     }
@@ -1043,8 +1070,8 @@ mod tests {
         let did = sample_did();
         fetcher.set(&did, Err(DidResolutionError::Tombstoned));
         let resolver = DefaultDidResolver::new(fetcher);
-        let err1 = resolver.resolve(&did, deadline()).await.unwrap_err();
-        let err2 = resolver.resolve(&did, deadline()).await.unwrap_err();
+        let err1 = resolver.resolve(&did, deadline(), test_trace_id()).await.unwrap_err();
+        let err2 = resolver.resolve(&did, deadline(), test_trace_id()).await.unwrap_err();
         assert!(matches!(err1, DidResolutionError::Tombstoned));
         assert!(matches!(err2, DidResolutionError::Tombstoned));
         // Only the first fetch triggers a network call; the
@@ -1067,18 +1094,18 @@ mod tests {
         );
         let resolver = DefaultDidResolver::new(fetcher);
         // Per-request cache fetches once.
-        let _doc_a = resolver.resolve(&did, deadline()).await.unwrap();
+        let _doc_a = resolver.resolve(&did, deadline(), test_trace_id()).await.unwrap();
         // Trust-root cache is a separate code path; it fetches
         // independently of the per-request cache.
-        let _doc_b = resolver.resolve_for_trust_root(&did, deadline()).await.unwrap();
+        let _doc_b = resolver.resolve_for_trust_root(&did, deadline(), test_trace_id()).await.unwrap();
         let calls = *resolver.fetcher.plc_calls.lock().unwrap();
         assert_eq!(calls, 2, "expected two fetches across two caches, got {calls}");
         // Per-request cache hit: third call to resolve doesn't
         // touch the fetcher.
-        let _doc_c = resolver.resolve(&did, deadline()).await.unwrap();
+        let _doc_c = resolver.resolve(&did, deadline(), test_trace_id()).await.unwrap();
         // Trust-root cache hit: third call to resolve_for_trust_root
         // doesn't touch the fetcher either.
-        let _doc_d = resolver.resolve_for_trust_root(&did, deadline()).await.unwrap();
+        let _doc_d = resolver.resolve_for_trust_root(&did, deadline(), test_trace_id()).await.unwrap();
         let calls_after = *resolver.fetcher.plc_calls.lock().unwrap();
         assert_eq!(calls_after, 2, "both caches should hit; got {calls_after}");
     }
@@ -1088,7 +1115,7 @@ mod tests {
         let fetcher = MockFetcher::new();
         let resolver = DefaultDidResolver::new(fetcher);
         let weird_did = Did::new("did:weird:something").unwrap();
-        let err = resolver.resolve(&weird_did, deadline()).await.unwrap_err();
+        let err = resolver.resolve(&weird_did, deadline(), test_trace_id()).await.unwrap_err();
         assert!(matches!(err, DidResolutionError::MethodNotSupported(_)));
     }
 

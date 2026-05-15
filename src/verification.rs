@@ -315,7 +315,7 @@ pub async fn verify_jwt(
     resolver: &dyn DidResolver,
     config: &JwtVerificationConfig,
     deadline: Instant,
-    _trace_id: TraceId,
+    trace_id: TraceId,
 ) -> Result<VerifiedJwt, JwtVerificationError> {
     // 1. Strip `Bearer ` prefix if present and structurally parse
     //    the three base64url segments.
@@ -339,7 +339,7 @@ pub async fn verify_jwt(
     //    document order.
     let issuer = parsed.payload_iss()?;
     let document = resolver
-        .resolve(&issuer, deadline)
+        .resolve(&issuer, deadline, trace_id)
         .await
         .map_err(JwtVerificationError::IssuerResolutionFailed)?;
     let public_key = select_signing_key(&document, parsed.kid_hint(), parsed.algorithm)?;
@@ -1087,7 +1087,7 @@ pub async fn verify_capability_claim(
     nonce_tracker: &dyn NonceTracker,
     config: &ClaimVerificationConfig,
     deadline: Instant,
-    _trace_id: TraceId,
+    trace_id: TraceId,
 ) -> Result<VerifiedCapabilityClaim, ClaimVerificationError> {
     // 1. Strip `KryphocronClaim ` prefix (case-insensitive scheme)
     //    and base64url-decode.
@@ -1180,9 +1180,15 @@ pub async fn verify_capability_claim(
         });
     }
 
-    // 10. Issuer DID resolution + signing-key selection.
+    // 10. Issuer DID resolution + signing-key selection. The
+    //     verifier's request `trace_id` (not the claim's
+    //     `trace_id_field`) is what attributes any rotation /
+    //     invalidation audit emitted as a side-effect of this
+    //     resolution: rotations detected during this verification
+    //     are events of the verifier's request, not of the original
+    //     issuer-side context.
     let document = resolver
-        .resolve(issuer.service_did(), deadline)
+        .resolve(issuer.service_did(), deadline, trace_id)
         .await
         .map_err(ClaimVerificationError::IssuerResolutionFailed)?;
     let public_key = select_signing_key_for_claim(
@@ -1463,6 +1469,7 @@ mod tests {
             &self,
             did: &Did,
             _deadline: Instant,
+            _trace_id: TraceId,
         ) -> Result<DidDocument, DidResolutionError> {
             self.documents
                 .lock()
@@ -1472,7 +1479,7 @@ mod tests {
                 .unwrap_or(Err(DidResolutionError::NotFound))
         }
 
-        async fn invalidate(&self, _did: &Did) {}
+        async fn invalidate(&self, _did: &Did, _trace_id: TraceId) {}
     }
 
     fn deadline() -> Instant {
