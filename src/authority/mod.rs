@@ -18,10 +18,10 @@ pub(crate) mod proof;
 pub(crate) mod subjects;
 pub(crate) mod v1;
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::identity::TraceId;
-use crate::ingress::AuthContext;
+use crate::ingress::{AuthContext, Requester};
 use crate::proto::Did;
 
 pub use self::capability::{
@@ -65,27 +65,45 @@ pub use self::v1::{
 
 /// Issue a user-class capability proof (§4.3).
 ///
-/// **Phase 1 stub.** Returns
-/// [`AuthDenial::AuditUnavailable`]. Phase 4 wires:
+/// Pipeline (Phase 7c v0.1):
 ///
-/// 1. Stage-0 deprecation gate (§5.6).
-/// 2. Two-tier per-issuer rate limiting (§4.9).
-/// 3. Oracle freshness check.
-/// 4. Capability-issuance pipeline.
-/// 5. Proof construction with current `Instant`.
+/// - **Stage 1 — requester authority.** User-class accepts
+///   [`Requester::Did`] (the user themselves) and
+///   [`Requester::Service`] (a substrate dispatching on the
+///   user's behalf). [`Requester::Anonymous`] fails closed with
+///   [`AuthDenial::RequesterLacksAuthority`].
+/// - **Stage 3 — proof construction.** Builds a
+///   [`UserProof<C>`] with `issued_at = Instant::now()` and a
+///   process-static [`AuthorityId`] (see
+///   [`process_authority_id`]).
+///
+/// Stage 0 (§5.6 lexicon-deprecation gate) and stage 2 (subject
+/// ownership / authority check) defer to bind (Phase 7d). Stage 0
+/// requires generic NSID extraction from the typed `Subject`; stage 2
+/// is the bind-time predicate's domain
+/// ([`DenialReason::OwnershipCheckFailed`](crate::DenialReason)).
 ///
 /// # Errors
 ///
-/// Returns [`AuthDenial`] on any pipeline denial, rate-limiting,
-/// oracle staleness, or audit-sink failure.
+/// Returns [`AuthDenial::RequesterLacksAuthority`] if the
+/// requester is anonymous. Future variants (oracle-staleness,
+/// rate-limiting, JWT-scope mismatch routed through
+/// [`check_jwt_scope_for`]) land in subsequent phases.
 pub fn issue_user<C>(
-    _ctx: &AuthContext<'_>,
-    _target: <C as UserCapability>::Subject,
+    ctx: &AuthContext<'_>,
+    subject: <C as UserCapability>::Subject,
 ) -> Result<UserProof<C>, AuthDenial>
 where
     C: UserCapability + IssuancePolicy,
 {
-    unimplemented!("§4.3 authority::issue_user: Phase 4 wires the pipeline");
+    let requester = stage1_extract_requester_did(ctx, CapabilityClass::User, true)?;
+    Ok(UserProof::new_internal(
+        requester,
+        subject,
+        Instant::now(),
+        process_authority_id(),
+        ctx.trace_id(),
+    ))
 }
 
 /// Issue a channel-class capability proof (§4.3).
@@ -202,21 +220,57 @@ pub(crate) fn check_jwt_scope_required(
 }
 
 // ============================================================
-// Crate-internal construction helpers (used by Phase 4).
+// Phase 7c §4.3 issuance internals.
 // ============================================================
 
-/// Crate-internal constructor for [`UserProof`]. Reserved for
-/// Phase 4f's pipeline implementation.
-#[doc(hidden)]
-#[allow(dead_code)]
-pub(crate) fn construct_user_proof<C: UserCapability>(
-    requester: Did,
-    subject: <C as UserCapability>::Subject,
-    issued_at: Instant,
-    issuer: AuthorityId,
-    trace_id: TraceId,
-) -> UserProof<C> {
-    UserProof::new_internal(requester, subject, issued_at, issuer, trace_id)
+/// §4.3 stage 1: extract the requester [`Did`] from `ctx`,
+/// failing with [`AuthDenial::RequesterLacksAuthority`] if the
+/// requester does not carry the authority required to issue
+/// `class`.
+///
+/// `accept_did` controls whether [`Requester::Did`] is admitted:
+/// user-class and channel-class pass `true` (interactive issuance
+/// allowed); substrate-class and moderation-class pass `false`
+/// (Service-only issuance, per §4.6 read-everything-authority and
+/// §4.3 moderation-as-service discipline). [`Requester::Anonymous`]
+/// is rejected by every chokepoint regardless of `accept_did`.
+fn stage1_extract_requester_did(
+    ctx: &AuthContext<'_>,
+    class: CapabilityClass,
+    accept_did: bool,
+) -> Result<Did, AuthDenial> {
+    match ctx.requester() {
+        Requester::Did(did) if accept_did => Ok(did.clone()),
+        Requester::Service(service) => Ok(service.service_did().clone()),
+        other => Err(AuthDenial::RequesterLacksAuthority {
+            class,
+            found: other.kind(),
+        }),
+    }
+}
+
+/// Process-static [`AuthorityId`] (§4.3).
+///
+/// Lazy-initialized from the OS CSPRNG on first use via
+/// [`OnceLock`] + [`getrandom::getrandom`]. The `AuthorityId`
+/// names the substrate's authority-module instance for the
+/// lifetime of the process; multiple substrates running in
+/// distinct processes will pick distinct ids with overwhelming
+/// probability (16 bytes from CSPRNG).
+///
+/// CSPRNG failure is treated as fatal: if `getrandom` itself
+/// fails (a rare condition signalling OS-level entropy
+/// unavailability), the substrate cannot establish a stable
+/// authority identity and the panic surfaces the failure rather
+/// than falsifying it with all-zeros.
+fn process_authority_id() -> AuthorityId {
+    static AUTHORITY_ID: OnceLock<AuthorityId> = OnceLock::new();
+    *AUTHORITY_ID.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes)
+            .expect("§4.3 authority-id init: OS CSPRNG unavailable");
+        AuthorityId::from_bytes(bytes)
+    })
 }
 
 #[cfg(test)]
