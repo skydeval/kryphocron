@@ -202,8 +202,9 @@ pub(crate) fn check_jwt_scope_required(
 // ============================================================
 
 /// Crate-internal constructor for [`UserProof`]. Reserved for
-/// Phase 4's pipeline implementation.
+/// Phase 4f's pipeline implementation.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub(crate) fn construct_user_proof<C: UserCapability>(
     requester: Did,
     subject: <C as UserCapability>::Subject,

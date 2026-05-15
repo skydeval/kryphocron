@@ -687,7 +687,7 @@ fn system_time_value(t: SystemTime) -> Value {
 /// variant. The returned tuple matches
 /// [`CapabilityClaim::new_internal_received`]'s parameter order
 /// minus the signature.
-#[allow(clippy::type_complexity, clippy::too_many_lines)]
+#[allow(clippy::type_complexity, clippy::too_many_lines, dead_code)]
 pub(crate) fn decode_payload(
     bytes: &[u8],
 ) -> Result<

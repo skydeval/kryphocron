@@ -75,13 +75,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![doc(html_no_source)]
-// Phase 1 ships the type architecture with stubbed runtime logic
-// (§4.10 pipeline implementation lives in Phase 4). Many
-// crate-internal constructors and fields are referenced only by
-// Phase-4 callers that haven't landed yet; the `dead_code` warning
-// is the natural consequence and not load-bearing here. CHAINLINKS
-// #11 tracks reverting this allow once Phase 4 wires the pipeline.
-#![allow(dead_code)]
+// Phase 4e (resolves CHAINLINKS #11): the crate-level
+// `allow(dead_code)` shipped in Phase 1 is gone now that Phase 4
+// has wired every pipeline stub. Remaining dead-code lints are
+// addressed per-item with targeted `#[allow]` annotations where
+// the type/function is part of the public surface but not
+// consumed by the crate itself yet (Phase 5 / Phase 6 territory).
 
 // Internal modules.
 mod sealed;

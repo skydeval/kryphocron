@@ -1,5 +1,13 @@
 //! §4.9 composite-audit rollback machinery.
 //!
+//! Phase 4e (resolves CHAINLINKS #11 partial): `dead_code` allowed
+//! at module level because composite-audit dispatch is the
+//! downstream substrate's wiring responsibility — Phase 4 ships
+//! the rollback vocabulary; Phase 5 / 6 may extend with concrete
+//! dispatch implementations the crate itself doesn't carry.
+#![allow(dead_code)]
+
+//!
 //! [`composite_audit`] wraps a multi-sink operation. On mid-flight
 //! failure, rollback markers fire on already-committed sinks; on
 //! marker-emission failure, the substrate calls

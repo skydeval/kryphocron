@@ -1,5 +1,14 @@
 //! §4.3 capability proof types — four parallel families.
 //!
+//! Phase 4e (resolves CHAINLINKS #11): `dead_code` allowed at
+//! module level because the proof types are public surface for
+//! downstream substrates that bind / hold / consume proofs;
+//! the kryphocron crate itself constructs them but does not
+//! consume their fields directly. Phase 4f / Phase 5 wire
+//! the consuming code paths.
+#![allow(dead_code)]
+
+//!
 //! Each capability class has a triple:
 //!
 //! - `*Proof<C>` — the unbound proof issued by [`crate::authority`].

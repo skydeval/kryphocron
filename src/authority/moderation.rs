@@ -129,7 +129,11 @@ pub enum InspectionKind {
 /// Crate-internal queue emit-side trait (§6.7 / §4.9).
 ///
 /// `pub(in crate::authority::moderation)` so only this module can
-/// enqueue.
+/// enqueue. Phase 4e: not yet implemented by any concrete queue
+/// type — Phase 4f / Phase 5 will land the moderator-action queue
+/// implementation that satisfies this trait. `dead_code` allowed
+/// per-item until then.
+#[allow(dead_code)]
 pub(in crate::authority::moderation) trait InspectionNotificationQueueImpl {
     fn enqueue(&self, owner: &Did, event: InspectionNotification);
 }
