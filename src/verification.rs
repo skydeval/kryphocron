@@ -1302,13 +1302,24 @@ fn select_signing_key_for_claim(
     expected_key_id: KeyId,
     algorithm: SignatureAlgorithm,
 ) -> Result<PublicKey, ClaimVerificationError> {
-    for (kid, key) in &document.verification_methods {
+    // Phase 4c (resolves chainlink #35): walk both the current
+    // verification_methods AND the document's rotation_history.
+    // §4.8 W12 commits rotation-tolerant verification — a claim
+    // signed under a previously-active key still verifies if the
+    // key is present in the resolved DID document's rotation
+    // history. Exact-match-only would reject claims signed under
+    // a key that was rotated out between issuance and verification,
+    // even when the signature itself is cryptographically valid
+    // against the historical key.
+    for (kid, key) in document
+        .verification_methods
+        .iter()
+        .chain(document.rotation_history.iter())
+    {
         if *kid == expected_key_id && key.algorithm == algorithm {
             return Ok(*key);
         }
     }
-    // Phase 4c lands rotation-history walking via RotationChain;
-    // for 4b, exact-match-in-current-methods only.
     Err(ClaimVerificationError::IssuerKeyNotInDocument)
 }
 
@@ -2394,5 +2405,105 @@ mod tests {
             err,
             ClaimVerificationError::UnsupportedAlgorithm(SignatureAlgorithm::Ed25519)
         ));
+    }
+
+    /// §4.8 W12 / chainlink #35 (Phase 4c): a claim signed by a
+    /// key that has been rotated out — present in the resolver's
+    /// `rotation_history`, absent from `verification_methods` —
+    /// still verifies. Phase 4b's exact-match-only logic would
+    /// have rejected with `IssuerKeyNotInDocument` here.
+    #[tokio::test]
+    async fn claim_signed_by_rotated_out_key_still_verifies_via_rotation_history() {
+        let claim = build_claim();
+        let issuer = issuer_service_identity();
+        // Build a resolver document where the issuer's current
+        // key is a *different* one (rotated in), but the claim's
+        // actual signing key is in rotation_history.
+        let r = Arc::new(MockResolver::new());
+        let rotated_in_key = ed25519_dalek::SigningKey::from_bytes(&[99u8; 32]);
+        let rotated_in_pub = PublicKey {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: rotated_in_key.verifying_key().to_bytes(),
+        };
+        let mut doc = crate::resolver::DidDocument {
+            did: issuer.service_did().clone(),
+            verification_methods: vec![(KeyId::from_bytes([0xFF; 32]), rotated_in_pub)],
+            rotation_history: vec![(issuer.key_id(), *issuer.key_material())],
+            services: vec![],
+            also_known_as: vec![],
+            resolved_at: SystemTime::now(),
+            resolver_cache_max_age: Duration::from_secs(3600),
+        };
+        // Also keep the rotation-history field's KeyId aligned
+        // with the claim issuer's KeyId so the lookup matches.
+        doc.rotation_history = vec![(issuer.key_id(), *issuer.key_material())];
+        r.documents
+            .lock()
+            .unwrap()
+            .insert(issuer.service_did().as_str().to_string(), Ok(doc));
+
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let header = format!("KryphocronClaim {}", b64u_wire(&claim));
+        let v = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*r,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v.issuer().service_did().as_str(), "did:plc:claimissuer");
+    }
+
+    /// Negative: a claim signed by a key whose KeyId is NOT in
+    /// verification_methods OR rotation_history fails with
+    /// `IssuerKeyNotInDocument`. Pins that the rotation walk
+    /// doesn't accept arbitrary keys (the lookup is by KeyId,
+    /// not by bytewise key-material comparison).
+    #[tokio::test]
+    async fn claim_signed_by_unknown_key_returns_issuer_key_not_in_document() {
+        let claim = build_claim();
+        let issuer = issuer_service_identity();
+        // The claim's `issuer.key_id()` is [0xAA; 32]
+        // (per `issuer_service_identity()`). Build a document
+        // whose KeyIds don't include [0xAA; 32].
+        let r = Arc::new(MockResolver::new());
+        let unrelated_key = ed25519_dalek::SigningKey::from_bytes(&[123u8; 32]);
+        let unrelated_pub = PublicKey {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: unrelated_key.verifying_key().to_bytes(),
+        };
+        let doc = crate::resolver::DidDocument {
+            did: issuer.service_did().clone(),
+            verification_methods: vec![(KeyId::from_bytes([0x11; 32]), unrelated_pub)],
+            rotation_history: vec![(KeyId::from_bytes([0x22; 32]), unrelated_pub)],
+            services: vec![],
+            also_known_as: vec![],
+            resolved_at: SystemTime::now(),
+            resolver_cache_max_age: Duration::from_secs(3600),
+        };
+        r.documents
+            .lock()
+            .unwrap()
+            .insert(issuer.service_did().as_str().to_string(), Ok(doc));
+        let tracker = DefaultNonceTracker::new();
+        let cfg = ClaimVerificationConfig::default();
+        let header = format!("KryphocronClaim {}", b64u_wire(&claim));
+        let err = verify_capability_claim(
+            &header,
+            &audience_service_identity(),
+            &*r,
+            &tracker,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0u8; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ClaimVerificationError::IssuerKeyNotInDocument));
     }
 }
