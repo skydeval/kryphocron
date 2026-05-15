@@ -153,9 +153,10 @@ pub use authority::{
     check_jwt_scope_for, AuthDenial, AuthorityId, BindError, BindFailureReason,
     BindOutcomeRepr, BoundChannelProof, BoundModerationProof, BoundSubstrateProof,
     BoundUserProof, CapabilityClass, CapabilityKind, CapabilitySemantics, CapabilitySet,
-    ChannelProof, ChannelProofRef, DenialReason, Endpoint, InspectionKind,
-    InspectionNotification, InspectionNotificationQueueReader, IssuancePolicy,
-    ModerationCapability, ModerationProof, ModerationProofRef, NotificationId,
+    ChannelProof, ChannelProofRef, DenialReason, Endpoint, HasResourceLocation,
+    InspectionKind, InspectionNotification, InspectionNotificationQueueImpl,
+    InspectionNotificationQueueReader, IssuancePolicy, ModerationCapability,
+    ModerationProof, ModerationProofRef, NoInspectionNotifications, NotificationId,
     PipelineStage, PredicateContext, ResourceId, SubstrateProof, SubstrateProofRef,
     SubstrateScope, UserCapability, UserProof, UserProofRef,
 };

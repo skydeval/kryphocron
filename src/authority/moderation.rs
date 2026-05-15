@@ -130,16 +130,57 @@ pub enum InspectionKind {
     },
 }
 
-/// Crate-internal queue emit-side trait (§6.7 / §4.9).
+/// Public queue emit-side trait (§6.7 / §4.9).
 ///
-/// `pub(in crate::authority::moderation)` so only this module can
-/// enqueue. Phase 4e: not yet implemented by any concrete queue
-/// type — Phase 4f / Phase 5 will land the moderator-action queue
-/// implementation that satisfies this trait. `dead_code` allowed
-/// per-item until then.
-#[allow(dead_code)]
-pub(in crate::authority::moderation) trait InspectionNotificationQueueImpl {
+/// Implemented by operator-installed inspection-notification
+/// queues; consumed by the moderation-class bind path
+/// ([`crate::authority::ModerationProof::bind`], Phase 7d) to
+/// fan an [`InspectionNotification`] out to the resource owner's
+/// queue alongside the per-class moderation audit emission.
+///
+/// **Inspection emission is OUTSIDE composite-audit rollback
+/// semantics** (§6.7's "notifications are diagnostic, not
+/// authoritative"): bind first commits the
+/// [`crate::audit::ModerationAuditEvent`] via [`crate::composite_audit`],
+/// then enqueues the matching inspection notification. If the
+/// audit commit succeeds but the inspection enqueue fails, the
+/// audit stands; the operator's queue implementation surfaces
+/// the inspection failure on its own. Bind does not roll the
+/// audit back on inspection-emit failure.
+///
+/// Operators not running an inspection-queue install
+/// [`NoInspectionNotifications`] (the no-op default).
+pub trait InspectionNotificationQueueImpl: Send + Sync {
+    /// Enqueue `event` for the resource `owner`.
+    ///
+    /// Failure mode is operator-defined; the trait method returns
+    /// unit. Implementations that need to surface enqueue failures
+    /// out-of-band (e.g., via a side-channel monitor) do so
+    /// internally — bind does not consume a structured error.
     fn enqueue(&self, owner: &Did, event: InspectionNotification);
+}
+
+/// No-op default [`InspectionNotificationQueueImpl`] (§6.7).
+///
+/// Operators not running an inspection-notification queue install
+/// this in [`crate::ingress::AuditSinks::inspection_queue`];
+/// `enqueue` returns immediately and queues nothing. The §6.7
+/// inspection-notification machinery is operator-pluggable, not
+/// crate-mandatory; this default lets the bind path emit
+/// unconditionally without forcing every deployment to ship a
+/// queue implementation.
+///
+/// Parallels the wire-side `NoEncryption` default and Phase 7c's
+/// process-static `AuthorityId` placeholder: ship the discipline,
+/// let operators upgrade to a real implementation when their
+/// deployment needs the feature.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoInspectionNotifications;
+
+impl InspectionNotificationQueueImpl for NoInspectionNotifications {
+    fn enqueue(&self, _owner: &Did, _event: InspectionNotification) {
+        // No-op: inspection-notification queue not configured.
+    }
 }
 
 /// Public queue read-side trait (§6.7 / §4.9).
@@ -198,6 +239,33 @@ mod tests {
                 | InspectionKind::QueueOverflowed { .. } => {}
             }
         }
+    }
+
+    /// Phase 7d C2: `NoInspectionNotifications` is the no-op
+    /// default operators install when not running an inspection-
+    /// notification queue. `enqueue` returns immediately and
+    /// queues nothing. Trait-object dispatch via
+    /// `&dyn InspectionNotificationQueueImpl` works (the field
+    /// shape used by [`crate::ingress::AuditSinks::inspection_queue`]).
+    #[test]
+    fn no_inspection_notifications_is_callable_as_trait_object() {
+        let queue: &dyn InspectionNotificationQueueImpl = &NoInspectionNotifications;
+        let owner = Did::new("did:plc:phase7dtest").unwrap();
+        let notification = InspectionNotification {
+            notification_id: NotificationId::from_bytes([0u8; 16]),
+            trace_id: TraceId::from_bytes([0u8; 16]),
+            kind: InspectionKind::QueueOverflowed { events_dropped: 0 },
+            target_repr: TargetRepresentation::structural_only(
+                crate::StructuralRepresentation::Resource {
+                    did: owner.clone(),
+                    nsid: crate::Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+                },
+            ),
+            at: SystemTime::UNIX_EPOCH,
+        };
+        // The no-op should not panic, allocate, or otherwise
+        // observably affect anything.
+        queue.enqueue(&owner, notification);
     }
 
     /// §6.7 commits `InspectionNotification` with five fields:

@@ -852,12 +852,19 @@ mod tests {
         moderation: &'a MockSink<ModerationAuditEvent>,
         fallback: &'a MockFallback,
     ) -> crate::ingress::AuditSinks<'a> {
+        // Composite-audit tests don't exercise the inspection
+        // queue (it's outside composite-rollback semantics per
+        // §6.7). Use the no-op default to satisfy the AuditSinks
+        // shape.
+        static NO_INSPECTION: crate::authority::NoInspectionNotifications =
+            crate::authority::NoInspectionNotifications;
         crate::ingress::AuditSinks {
             user,
             channel,
             substrate,
             moderation,
             fallback,
+            inspection_queue: &NO_INSPECTION,
         }
     }
 

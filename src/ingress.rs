@@ -26,6 +26,7 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::authority::capability::CapabilitySet;
+use crate::authority::moderation::InspectionNotificationQueueImpl;
 use crate::audit::{
     ChannelAuditSink, FallbackAuditSink, ModerationAuditSink, SubstrateAuditSink,
     UserAuditSink,
@@ -217,6 +218,18 @@ pub struct AuditSinks<'a> {
     pub moderation: &'a dyn ModerationAuditSink,
     /// Fallback sink for sink-panic / composite-failure events.
     pub fallback: &'a dyn FallbackAuditSink,
+    /// §6.7 inspection-notification queue — moderation-class
+    /// bind ([`crate::authority::ModerationProof::bind`]) fans
+    /// inspection events to the resource owner alongside the
+    /// composite-audit moderation emission. Operators not running
+    /// an inspection queue install
+    /// [`crate::authority::NoInspectionNotifications`].
+    ///
+    /// Inspection emission is OUTSIDE composite-audit rollback
+    /// semantics per §6.7's "notifications are diagnostic, not
+    /// authoritative" — see [`InspectionNotificationQueueImpl`]
+    /// for the discipline.
+    pub inspection_queue: &'a dyn InspectionNotificationQueueImpl,
 }
 
 /// Oracle set installed at the substrate process boundary
