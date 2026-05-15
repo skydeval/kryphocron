@@ -13,6 +13,7 @@
 
 mod canonical_cbor;
 mod claim;
+mod handshake;
 mod nonce;
 mod receipt;
 mod signature;
@@ -50,6 +51,28 @@ pub use self::receipt::{
     DelegationReceiptPayload, ReceiptVerificationFailure,
 };
 pub use self::signature::ClaimSignature;
+
+// §7.5 sync-handshake protocol surface.
+pub use self::handshake::{
+    accept_sign_input, derive_session_id, established_sign_input, hello_sign_input,
+    reject_sign_input, sign_handshake_payload, verify_handshake_signature,
+    SessionNonce, SyncChannelAccept, SyncChannelEstablished, SyncChannelHello,
+    SyncChannelReject, SyncChannelResponse, SyncDirection, SyncRequestedScope,
+    SyncTimeWindow, ACCEPT_DOMAIN_TAG, DEFAULT_FEDERATION_TIME_WINDOW,
+    ESTABLISHED_DOMAIN_TAG, HELLO_DOMAIN_TAG, MAX_HANDSHAKE_MESSAGE_SIZE,
+    REJECT_DOMAIN_TAG,
+};
+
+// Crate-internal re-exports for `verification` (Phase 4d
+// follow-up): receive-side decoders + canonicality re-encoders.
+// Wired up in Commit 5 (verify_sync_handshake); silenced now to
+// keep this commit's surface usable by the next one.
+#[allow(unused_imports)]
+pub(crate) use self::handshake::{
+    accept_to_wire_bytes, decode_accept_wire, decode_established_wire,
+    decode_hello_wire, decode_reject_wire, established_to_wire_bytes,
+    hello_to_wire_bytes, reject_to_wire_bytes,
+};
 
 /// Maximum entries in an [`AttributionChainWire`] (§4.8). Matches
 /// the in-process [`crate::ingress::MAX_CHAIN_DEPTH`].

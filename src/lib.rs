@@ -198,12 +198,18 @@ pub use timing::{
     BASE_AUTHORIZATION_OVERHEAD, SAFETY_MARGIN,
 };
 pub use wire::{
+    accept_sign_input, derive_session_id, established_sign_input, hello_sign_input,
+    reject_sign_input, sign_handshake_payload, verify_handshake_signature,
     AttributionChainWire, AttributionEntryWire, AttributionPrincipal,
     CapabilityClaim, ClaimConstructionError, ClaimNonce, ClaimOrigin,
     ClaimSignature, DefaultNonceTracker, DelegationReceipt,
     DelegationReceiptPayload, JwtNonce, NonceFreshness, NonceIssuerKey,
     NonceKind, NoncePrincipal, NonceTracker, NonceTrackerError,
-    ReceiptVerificationFailure, ResourceScope, ScopeVariantName,
-    DEFAULT_NONCE_RETENTION, DEFAULT_PER_PARTITION_CAP,
-    MAX_CAPABILITY_CLAIM_SIZE, MAX_CLAIM_VALIDITY, MAX_ROTATION_DEPTH,
+    ReceiptVerificationFailure, ResourceScope, ScopeVariantName, SessionNonce,
+    SyncChannelAccept, SyncChannelEstablished, SyncChannelHello,
+    SyncChannelReject, SyncChannelResponse, SyncDirection, SyncRequestedScope,
+    SyncTimeWindow, ACCEPT_DOMAIN_TAG, DEFAULT_FEDERATION_TIME_WINDOW,
+    DEFAULT_NONCE_RETENTION, DEFAULT_PER_PARTITION_CAP, ESTABLISHED_DOMAIN_TAG,
+    HELLO_DOMAIN_TAG, MAX_CAPABILITY_CLAIM_SIZE, MAX_CLAIM_VALIDITY,
+    MAX_HANDSHAKE_MESSAGE_SIZE, MAX_ROTATION_DEPTH, REJECT_DOMAIN_TAG,
 };
