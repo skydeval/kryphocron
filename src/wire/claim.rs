@@ -208,6 +208,133 @@ impl CapabilityClaim {
         })
     }
 
+    /// Construct a delegated [`CapabilityClaim`] (§4.8 W11).
+    ///
+    /// Parallel to [`Self::new`] but for the
+    /// [`ClaimOrigin::DelegatedFromUpstream`] case: the issuer is
+    /// acting on behalf of an upstream principal, with the full
+    /// delegation chain attached as `chain`. Every Phase 4b
+    /// validation stage runs identically; the only structural
+    /// difference is the `origin` field.
+    ///
+    /// **Pre-construction discipline.** The chain's per-hop
+    /// receipts must be signed by their respective previous
+    /// principals BEFORE this constructor is called — the
+    /// constructor does NOT verify the chain's signatures (that's
+    /// receive-side). Use [`crate::wire::sign_delegation_receipt`]
+    /// to produce per-hop receipts; assemble the chain manually;
+    /// pass to this constructor.
+    ///
+    /// **Empty-chain rejection.** A delegated claim with zero hops
+    /// is malformed per §4.8 W11; rejected at construction with
+    /// [`ClaimConstructionError::EmptyDelegationChain`]. Receive-
+    /// side decoders apply the same rejection.
+    ///
+    /// **Size ceiling.** The chain contributes to the canonical
+    /// CBOR size; deeply-nested chains can blow past
+    /// [`MAX_CAPABILITY_CLAIM_SIZE`]. Operators producing chains
+    /// near the depth limit should expect to manage chain depth
+    /// against the size ceiling. Construction returns
+    /// [`ClaimConstructionError::ClaimTooLarge`] if exceeded.
+    ///
+    /// # Errors
+    ///
+    /// See [`ClaimConstructionError`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_delegated(
+        issuer: ServiceIdentity,
+        audience: ServiceIdentity,
+        subject: Did,
+        capabilities: Vec<CapabilityKind>,
+        resource_scope: ResourceScope,
+        nonce: ClaimNonce,
+        trace_id: TraceId,
+        validity: Duration,
+        chain: AttributionChainWire,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<Self, ClaimConstructionError> {
+        // 0. Empty-chain rejection per §4.8 W11. A delegated claim
+        //    with zero hops carries no attribution evidence.
+        if chain.entries.is_empty() {
+            return Err(ClaimConstructionError::EmptyDelegationChain);
+        }
+        // 1. Validity ceiling.
+        if validity > MAX_CLAIM_VALIDITY {
+            return Err(ClaimConstructionError::ValidityTooLong {
+                requested: validity,
+                max: MAX_CLAIM_VALIDITY,
+            });
+        }
+        // 2. W6: substrate / moderation never wire-eligible.
+        for cap in &capabilities {
+            if !cap.is_wire_eligible() {
+                return Err(ClaimConstructionError::NonWireEligibleCapability(*cap));
+            }
+        }
+        // 3. W9 / W10 per-class scope restrictions.
+        for cap in &capabilities {
+            check_scope_for_class(*cap, &resource_scope)?;
+        }
+        // 4. Issuer / signing-key coherence.
+        let derived_public = signing_key.verifying_key().to_bytes();
+        if derived_public != issuer.key_material().bytes {
+            return Err(ClaimConstructionError::SigningFailed);
+        }
+
+        let now = SystemTime::now();
+        let issued_at = now;
+        let expires_at = now + validity;
+        let origin = ClaimOrigin::DelegatedFromUpstream { chain };
+
+        // 5. Canonical-CBOR encode the payload.
+        let canonical_bytes = encode_payload(
+            &issuer,
+            &audience,
+            &subject,
+            &origin,
+            &capabilities,
+            &resource_scope,
+            &nonce,
+            &trace_id,
+            issued_at,
+            expires_at,
+        );
+
+        // 6. §7.6 size ceiling — chain bytes count too.
+        if canonical_bytes.len() > MAX_CAPABILITY_CLAIM_SIZE {
+            return Err(ClaimConstructionError::ClaimTooLarge {
+                size: canonical_bytes.len(),
+                max: MAX_CAPABILITY_CLAIM_SIZE,
+            });
+        }
+
+        // 7. W8 domain-separated Ed25519 signature.
+        let mut signing_input =
+            Vec::with_capacity(CLAIM_DOMAIN_TAG.len() + canonical_bytes.len());
+        signing_input.extend_from_slice(CLAIM_DOMAIN_TAG);
+        signing_input.extend_from_slice(&canonical_bytes);
+        let sig = signing_key.sign(&signing_input);
+        let signature = ClaimSignature {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: sig.to_bytes(),
+        };
+
+        Ok(CapabilityClaim {
+            issuer,
+            audience,
+            subject,
+            origin,
+            capabilities,
+            resource_scope,
+            nonce,
+            trace_id,
+            issued_at,
+            expires_at,
+            signature,
+            _private: PhantomData,
+        })
+    }
+
     /// Crate-internal constructor for received claims. Reserved
     /// for [`crate::verification::verify_capability_claim`] after
     /// every §7.6 verification stage has succeeded; not reachable
@@ -836,21 +963,144 @@ fn decode_claim_origin(v: &Value) -> Result<ClaimOrigin, ()> {
     match kind {
         "self_originated" => Ok(ClaimOrigin::SelfOriginated),
         "delegated_from_upstream" => {
-            // Phase 4b decodes the chain bytes structurally so
-            // round-trip canonicality holds; receipt verification
-            // (W11/W12/W13) lands in Phase 4e. For 4b, the chain
-            // surface is parsed but receipt signatures are not
-            // walked. See chainlink for the 4e wire-up.
-            let _chain_value = map_get(&map, "chain")?;
-            // Phase 4b minimum: reject delegated claims at the
-            // boundary because verification is incomplete; 4e
-            // closes this gap. Receivers wanting to admit
-            // self-originated claims succeed; delegated claims
-            // are deferred.
-            Err(())
+            // Phase 4e wires full chain decode. The §4.8 W11 wire
+            // chain decodes structurally; per-hop signature
+            // verification (W12) and capability monotonicity
+            // (W13) are the verifier's responsibility via
+            // verify_attribution_chain. Empty chains are
+            // structurally malformed (§4.8: a delegated claim
+            // with zero hops carries no attribution evidence).
+            let chain = decode_attribution_chain(map_get(&map, "chain")?)?;
+            if chain.entries.is_empty() {
+                return Err(());
+            }
+            Ok(ClaimOrigin::DelegatedFromUpstream { chain })
         }
         _ => Err(()),
     }
+}
+
+fn decode_attribution_chain(v: &Value) -> Result<AttributionChainWire, ()> {
+    let m = into_map(v)?;
+    let origin = decode_attribution_principal(map_get(&m, "origin")?)?;
+    let entries_value = map_get(&m, "entries")?;
+    let entries_arr = match entries_value {
+        Value::Array(a) => a,
+        _ => return Err(()),
+    };
+    if entries_arr.len() > crate::ingress::MAX_CHAIN_DEPTH {
+        return Err(());
+    }
+    let mut entries: smallvec::SmallVec<[AttributionEntryWire; crate::ingress::MAX_CHAIN_DEPTH]> =
+        smallvec::SmallVec::new();
+    for item in entries_arr {
+        entries.push(decode_attribution_entry(item)?);
+    }
+    Ok(AttributionChainWire { origin, entries })
+}
+
+fn decode_attribution_principal(v: &Value) -> Result<AttributionPrincipal, ()> {
+    let m = into_map(v)?;
+    let kind = match map_get(&m, "kind")? {
+        Value::Text(s) => s.as_str(),
+        _ => return Err(()),
+    };
+    match kind {
+        "user" => {
+            let did = decode_did(map_get(&m, "did")?)?;
+            Ok(AttributionPrincipal::User(did))
+        }
+        "service" => {
+            let identity = decode_service_identity(map_get(&m, "identity")?)?;
+            Ok(AttributionPrincipal::Service(identity))
+        }
+        _ => Err(()),
+    }
+}
+
+fn decode_attribution_entry(v: &Value) -> Result<AttributionEntryWire, ()> {
+    let m = into_map(v)?;
+    let principal = decode_attribution_principal(map_get(&m, "principal")?)?;
+    let derivation_reason =
+        decode_derivation_reason(map_get(&m, "derivation_reason")?)?;
+    let derived_at = decode_system_time(map_get(&m, "derived_at")?)?;
+    let granted_capabilities = decode_capability_set(map_get(&m, "granted_capabilities")?)?;
+    let receipt = decode_delegation_receipt(map_get(&m, "receipt")?)?;
+    Ok(AttributionEntryWire {
+        principal,
+        derivation_reason,
+        derived_at,
+        granted_capabilities,
+        receipt,
+    })
+}
+
+fn decode_derivation_reason(v: &Value) -> Result<crate::ingress::DerivationReason, ()> {
+    use crate::ingress::DerivationReason;
+    let m = into_map(v)?;
+    let kind = match map_get(&m, "kind")? {
+        Value::Text(s) => s.as_str(),
+        _ => return Err(()),
+    };
+    match kind {
+        "drop_privilege_to_anonymous" => Ok(DerivationReason::DropPrivilegeToAnonymous),
+        "narrow_capabilities" => {
+            let dropped = decode_capability_set(map_get(&m, "dropped")?)?;
+            Ok(DerivationReason::NarrowCapabilities { dropped })
+        }
+        "service_to_service_delegation" => {
+            let id_bytes = match map_get(&m, "trust_declaration_id")? {
+                Value::Bytes(b) if b.len() == 16 => {
+                    let mut a = [0u8; 16];
+                    a.copy_from_slice(b);
+                    a
+                }
+                _ => return Err(()),
+            };
+            Ok(DerivationReason::ServiceToServiceDelegation {
+                trust_declaration_id: crate::ingress::TrustDeclarationId::from_bytes(id_bytes),
+            })
+        }
+        _ => Err(()),
+    }
+}
+
+fn decode_capability_set(
+    v: &Value,
+) -> Result<crate::authority::capability::CapabilitySet, ()> {
+    let arr = match v {
+        Value::Array(a) => a,
+        _ => return Err(()),
+    };
+    let mut kinds: Vec<CapabilityKind> = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = match item {
+            Value::Text(s) => s.as_str(),
+            _ => return Err(()),
+        };
+        kinds.push(CapabilityKind::from_wire_name(s).ok_or(())?);
+    }
+    Ok(crate::authority::capability::CapabilitySet::from_kinds(kinds))
+}
+
+fn decode_delegation_receipt(v: &Value) -> Result<DelegationReceipt, ()> {
+    let m = into_map(v)?;
+    let alg = match map_get(&m, "alg")? {
+        Value::Text(s) => decode_signature_alg(s).ok_or(())?,
+        _ => return Err(()),
+    };
+    let bytes: [u8; 64] = match map_get(&m, "bytes")? {
+        Value::Bytes(b) if b.len() == 64 => {
+            let mut a = [0u8; 64];
+            a.copy_from_slice(b);
+            a
+        }
+        _ => return Err(()),
+    };
+    Ok(DelegationReceipt {
+        algorithm: alg,
+        bytes,
+    })
 }
 
 fn decode_nonce(v: &Value) -> Result<ClaimNonce, ()> {
@@ -1011,6 +1261,11 @@ pub enum ClaimConstructionError {
         /// Maximum permitted.
         max: usize,
     },
+    /// `new_delegated` was called with a chain whose `entries`
+    /// vector is empty (§4.8: a delegated claim with zero hops is
+    /// malformed).
+    #[error("delegation chain has zero entries")]
+    EmptyDelegationChain,
 }
 
 #[cfg(test)]
@@ -1301,6 +1556,140 @@ mod tests {
             &d_trace_id,
             d_issued_at,
             d_expires_at,
+        );
+        assert_eq!(bytes, re_encoded);
+    }
+
+    // ============================================================
+    // Phase 4e — new_delegated + chain decoder tests.
+    // ============================================================
+
+    use crate::wire::{sign_delegation_receipt, DelegationReceiptPayload};
+
+    fn build_one_hop_chain() -> AttributionChainWire {
+        // Origin: a service principal A that signs a single-hop
+        // chain delegating to recipient B.
+        let sk_a = SigningKey::from_bytes(&[0xA0u8; 32]);
+        let pk_a = PublicKey {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: sk_a.verifying_key().to_bytes(),
+        };
+        let kid_a = KeyId::from_bytes([0xA0; 32]);
+        let did_a = Did::new("did:plc:originservice00000000").unwrap();
+        let identity_a = ServiceIdentity::new_internal(did_a.clone(), kid_a, pk_a, None);
+
+        let did_b = Did::new("did:plc:recipientservice00000").unwrap();
+        let kid_b = KeyId::from_bytes([0xB0; 32]);
+        let pk_b = PublicKey {
+            algorithm: SignatureAlgorithm::Ed25519,
+            bytes: SigningKey::from_bytes(&[0xB0u8; 32]).verifying_key().to_bytes(),
+        };
+        let identity_b = ServiceIdentity::new_internal(did_b.clone(), kid_b, pk_b, None);
+
+        let granted = crate::authority::capability::CapabilitySet::from_kinds(vec![
+            CapabilityKind::ViewPrivate,
+        ]);
+        let derived_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let payload = DelegationReceiptPayload {
+            previous_principal_did: did_a.clone(),
+            previous_key_id: kid_a,
+            recipient_principal_did: did_b.clone(),
+            recipient_key_id: kid_b,
+            derivation_reason: crate::ingress::DerivationReason::DropPrivilegeToAnonymous,
+            granted_capabilities: granted.clone(),
+            derived_at,
+        };
+        let receipt = sign_delegation_receipt(&payload, &sk_a);
+        let entry = AttributionEntryWire {
+            principal: AttributionPrincipal::Service(identity_b),
+            derivation_reason: crate::ingress::DerivationReason::DropPrivilegeToAnonymous,
+            derived_at,
+            granted_capabilities: granted,
+            receipt,
+        };
+        AttributionChainWire {
+            origin: AttributionPrincipal::Service(identity_a),
+            entries: smallvec::smallvec![entry],
+        }
+    }
+
+    /// `new_delegated` happy path — a one-hop chain produces a
+    /// `CapabilityClaim` whose origin is `DelegatedFromUpstream`.
+    #[test]
+    fn new_delegated_constructs_with_one_hop_chain() {
+        let signing = fixed_signing_key();
+        let chain = build_one_hop_chain();
+        let claim = CapabilityClaim::new_delegated(
+            fixed_service_identity("did:web:i"),
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ViewPrivate],
+            ResourceScope::Resource(sample_resource()),
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            Duration::from_secs(60),
+            chain,
+            &signing,
+        )
+        .unwrap();
+        assert!(matches!(claim.origin(), ClaimOrigin::DelegatedFromUpstream { .. }));
+    }
+
+    /// `new_delegated` rejects empty chains structurally.
+    #[test]
+    fn new_delegated_rejects_empty_chain() {
+        let signing = fixed_signing_key();
+        let empty_chain = AttributionChainWire {
+            origin: AttributionPrincipal::User(Did::new("did:plc:u").unwrap()),
+            entries: smallvec::SmallVec::new(),
+        };
+        let err = CapabilityClaim::new_delegated(
+            fixed_service_identity("did:web:i"),
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ViewPrivate],
+            ResourceScope::Resource(sample_resource()),
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            Duration::from_secs(60),
+            empty_chain,
+            &signing,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClaimConstructionError::EmptyDelegationChain));
+    }
+
+    /// Wire round-trip: a delegated claim's wire bytes decode back
+    /// to the same chain shape (canonicality holds).
+    #[test]
+    fn delegated_origin_wire_round_trip() {
+        let signing = fixed_signing_key();
+        let chain = build_one_hop_chain();
+        let claim = CapabilityClaim::new_delegated(
+            fixed_service_identity("did:web:i"),
+            fixed_service_identity("did:web:a"),
+            Did::new("did:plc:s").unwrap(),
+            vec![CapabilityKind::ViewPrivate],
+            ResourceScope::Resource(sample_resource()),
+            ClaimNonce::from_bytes([0; 16]),
+            TraceId::from_bytes([0; 16]),
+            Duration::from_secs(60),
+            chain,
+            &signing,
+        )
+        .unwrap();
+        let bytes = claim.canonical_payload_bytes();
+        let decoded = decode_payload(&bytes).unwrap();
+        let (
+            d_issuer, d_audience, d_subject, d_origin,
+            d_capabilities, d_resource_scope, d_nonce,
+            d_trace_id, d_issued_at, d_expires_at,
+        ) = decoded;
+        assert!(matches!(d_origin, ClaimOrigin::DelegatedFromUpstream { .. }));
+        let re_encoded = encode_payload(
+            &d_issuer, &d_audience, &d_subject, &d_origin,
+            &d_capabilities, &d_resource_scope, &d_nonce,
+            &d_trace_id, d_issued_at, d_expires_at,
         );
         assert_eq!(bytes, re_encoded);
     }
