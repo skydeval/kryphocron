@@ -351,7 +351,9 @@ fn process_authority_id() -> AuthorityId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::v1::ViewPrivate;
+    use crate::authority::v1::{
+        EmitToSyncChannel, ModeratorRead, ScanShard, ViewPrivate,
+    };
     use crate::verification::JwtScope;
     use smallvec::{smallvec, SmallVec};
 
@@ -444,5 +446,424 @@ mod tests {
                 granted: SmallVec::new(),
             },
         };
+    }
+
+    // ========================================================
+    // Phase 7c §4.3 issuance chokepoint tests.
+    // ========================================================
+    //
+    // Coverage matrix (10 scenarios):
+    //
+    // | Class       | Happy (Did) | Happy (Service) | Anonymous fails | Did fails |
+    // | ----------- | ----------- | --------------- | --------------- | --------- |
+    // | User        |  ✓          | (covered above) | ✓               | n/a       |
+    // | Channel     |  ✓          | (covered above) | ✓               | n/a       |
+    // | Substrate   | n/a         | ✓               | ✓               | ✓         |
+    // | Moderation  | n/a         | ✓               | ✓               | ✓         |
+    //
+    // The Service-happy paths for User and Channel are subsumed by
+    // Substrate / Moderation happy paths — the same Service requester
+    // is admitted for all four classes.
+
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use crate::audit::{
+        AuditError, ChannelAuditEvent, ChannelAuditSink, CompositeOpId, FallbackAuditEvent,
+        FallbackAuditSink, ModerationAuditEvent, ModerationAuditSink, SinkKind,
+        SubstrateAuditEvent, SubstrateAuditSink, UserAuditEvent, UserAuditSink,
+    };
+    use crate::authority::subjects::{
+        ChannelBinding, ModerationCaseId, ModerationSubject, ResourceId, ScopeSelector,
+        ShardId, ShardRange,
+    };
+    use crate::identity::{
+        KeyId, PublicKey, ServiceIdentity, SessionId, SignatureAlgorithm, TraceId,
+    };
+    use crate::ingress::{AttributionChain, AuditSinks, OracleSet, RequesterKind};
+    use crate::oracle::{
+        AudienceOracle, AudienceOracleQuery, AudienceState, BlockOracle, BlockOracleQuery,
+        BlockState, MuteOracle, MuteOracleQuery, MuteState,
+    };
+    use crate::proto::{Did, Nsid, Rkey};
+
+    // ---- No-op sinks/oracles for AuthContext construction ----
+
+    struct NoopUserSink;
+    impl UserAuditSink for NoopUserSink {
+        fn record(&self, _: UserAuditEvent) -> Result<(), AuditError> {
+            Ok(())
+        }
+    }
+    struct NoopChannelSink;
+    impl ChannelAuditSink for NoopChannelSink {
+        fn record(&self, _: ChannelAuditEvent) -> Result<(), AuditError> {
+            Ok(())
+        }
+    }
+    struct NoopSubstrateSink;
+    impl SubstrateAuditSink for NoopSubstrateSink {
+        fn record(&self, _: SubstrateAuditEvent) -> Result<(), AuditError> {
+            Ok(())
+        }
+    }
+    struct NoopModerationSink;
+    impl ModerationAuditSink for NoopModerationSink {
+        fn record(&self, _: ModerationAuditEvent) -> Result<(), AuditError> {
+            Ok(())
+        }
+    }
+    struct NoopFallback;
+    impl FallbackAuditSink for NoopFallback {
+        fn record_panic(
+            &self,
+            _: SinkKind,
+            _: TraceId,
+            _: crate::authority::capability::CapabilityKind,
+            _: SystemTime,
+        ) {
+        }
+        fn record_composite_failure(
+            &self,
+            _: TraceId,
+            _: CompositeOpId,
+            _: &[SinkKind],
+            _: &[SinkKind],
+            _: SystemTime,
+        ) {
+        }
+        fn record_event(&self, _: FallbackAuditEvent) {}
+    }
+
+    struct NoopBlockOracle;
+    impl BlockOracle for NoopBlockOracle {
+        fn block_state(&self, _: &Did, _: &Did) -> BlockState {
+            BlockState::None
+        }
+        fn last_synced_at(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+        fn data_freshness_bound(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn worst_case_latency_for(&self, _: BlockOracleQuery) -> Duration {
+            Duration::ZERO
+        }
+    }
+    struct NoopAudienceOracle;
+    impl AudienceOracle for NoopAudienceOracle {
+        fn audience_state(&self, _: &Did, _: &ResourceId) -> AudienceState {
+            AudienceState::NoAudienceConfigured
+        }
+        fn last_synced_at(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+        fn data_freshness_bound(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn worst_case_latency_for(&self, _: AudienceOracleQuery) -> Duration {
+            Duration::ZERO
+        }
+    }
+    struct NoopMuteOracle;
+    impl MuteOracle for NoopMuteOracle {
+        fn mute_state(&self, _: &Did, _: &Did) -> MuteState {
+            MuteState::None
+        }
+        fn last_synced_at(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+        fn data_freshness_bound(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn worst_case_latency_for(&self, _: MuteOracleQuery) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    // ---- Fixture factories ----
+
+    fn sample_did() -> Did {
+        Did::new("did:plc:phase7ctest").unwrap()
+    }
+
+    fn sample_service_identity() -> ServiceIdentity {
+        ServiceIdentity::new_internal(
+            sample_did(),
+            KeyId::from_bytes([0u8; 32]),
+            PublicKey {
+                algorithm: SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    fn sample_resource_id() -> ResourceId {
+        ResourceId::new(
+            sample_did(),
+            Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+            Rkey::new("3jzfcijpj2z2a").unwrap(),
+        )
+    }
+
+    fn sample_channel_subject() -> ChannelBinding {
+        ChannelBinding {
+            peer: sample_service_identity(),
+            session_id: SessionId::from_bytes([0u8; 32]),
+        }
+    }
+
+    fn sample_substrate_subject() -> ScopeSelector {
+        ScopeSelector::Shard(
+            ShardRange::new(ShardId::from_bytes([0; 8]), ShardId::from_bytes([0xFF; 8]))
+                .unwrap(),
+        )
+    }
+
+    fn sample_moderation_subject() -> ModerationSubject {
+        ModerationSubject {
+            resource: sample_resource_id(),
+            case: ModerationCaseId::from_bytes([0u8; 16]),
+        }
+    }
+
+    /// Owned bundle: keeps the no-op sinks/oracles alive while the
+    /// borrowed [`AuthContext`] is in scope. The `Arc` discipline
+    /// is overkill (no sharing across threads in these tests) but
+    /// it keeps the fixture self-contained.
+    struct ContextFixture {
+        _user: Arc<NoopUserSink>,
+        _channel: Arc<NoopChannelSink>,
+        _substrate: Arc<NoopSubstrateSink>,
+        _moderation: Arc<NoopModerationSink>,
+        _fallback: Arc<NoopFallback>,
+        _block: Arc<NoopBlockOracle>,
+        _audience: Arc<NoopAudienceOracle>,
+        _mute: Arc<NoopMuteOracle>,
+    }
+
+    impl ContextFixture {
+        fn new() -> Self {
+            ContextFixture {
+                _user: Arc::new(NoopUserSink),
+                _channel: Arc::new(NoopChannelSink),
+                _substrate: Arc::new(NoopSubstrateSink),
+                _moderation: Arc::new(NoopModerationSink),
+                _fallback: Arc::new(NoopFallback),
+                _block: Arc::new(NoopBlockOracle),
+                _audience: Arc::new(NoopAudienceOracle),
+                _mute: Arc::new(NoopMuteOracle),
+            }
+        }
+
+        fn build_ctx(&self, requester: Requester) -> AuthContext<'_> {
+            AuthContext::new_internal(
+                requester,
+                TraceId::from_bytes([0xAB; 16]),
+                AuditSinks {
+                    user: &*self._user,
+                    channel: &*self._channel,
+                    substrate: &*self._substrate,
+                    moderation: &*self._moderation,
+                    fallback: &*self._fallback,
+                },
+                OracleSet {
+                    block: &*self._block,
+                    audience: &*self._audience,
+                    mute: &*self._mute,
+                },
+                AttributionChain::empty(),
+            )
+        }
+    }
+
+    // ---- Happy paths (4) ----
+
+    // Proof types do NOT impl Debug (§4.3 forbidden-derives discipline).
+    // Tests use `if let Ok(_)` / `if let Err(e)` patterns instead of
+    // .unwrap() / .unwrap_err() — the latter trigger Debug bounds.
+
+    /// §4.3 stage 1: user-class issuance with a [`Requester::Did`]
+    /// returns a sealed [`UserProof<ViewPrivate>`].
+    #[test]
+    fn issue_user_succeeds_with_did_requester() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let r = issue_user::<ViewPrivate>(&ctx, sample_resource_id());
+        assert!(r.is_ok(), "user-class issuance with Did requester should succeed");
+    }
+
+    /// §4.3 stage 1: channel-class issuance with a [`Requester::Did`]
+    /// returns a sealed [`ChannelProof<EmitToSyncChannel>`].
+    #[test]
+    fn issue_channel_succeeds_with_did_requester() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let r = issue_channel::<EmitToSyncChannel>(&ctx, sample_channel_subject());
+        assert!(r.is_ok(), "channel-class issuance with Did requester should succeed");
+    }
+
+    /// §4.3 stage 1 (§4.6): substrate-class issuance with a
+    /// [`Requester::Service`] returns a sealed
+    /// [`SubstrateProof<ScanShard>`].
+    #[test]
+    fn issue_substrate_succeeds_with_service_requester() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let r = issue_substrate::<ScanShard>(&ctx, sample_substrate_subject());
+        assert!(r.is_ok(), "substrate-class issuance with Service requester should succeed");
+    }
+
+    /// §4.3 stage 1: moderation-class issuance with a
+    /// [`Requester::Service`] returns a sealed
+    /// [`ModerationProof<ModeratorRead>`].
+    #[test]
+    fn issue_moderation_succeeds_with_service_requester() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let r = issue_moderation::<ModeratorRead>(&ctx, sample_moderation_subject());
+        assert!(r.is_ok(), "moderation-class issuance with Service requester should succeed");
+    }
+
+    // ---- Anonymous-rejected (4) ----
+    //
+    // Adversarial: every chokepoint rejects Anonymous at stage 1.
+    // The class field on RequesterLacksAuthority must match the
+    // chokepoint that denied — forensic clarity per §6.1.
+
+    #[test]
+    fn issue_user_rejects_anonymous_at_stage_1() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Anonymous);
+        let Err(err) = issue_user::<ViewPrivate>(&ctx, sample_resource_id()) else {
+            panic!("expected Err, got Ok");
+        };
+        match err {
+            AuthDenial::RequesterLacksAuthority { class, found } => {
+                assert_eq!(class, CapabilityClass::User);
+                assert_eq!(found, RequesterKind::Anonymous);
+            }
+            other => panic!("expected RequesterLacksAuthority(User, Anonymous), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_channel_rejects_anonymous_at_stage_1() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Anonymous);
+        let Err(err) = issue_channel::<EmitToSyncChannel>(&ctx, sample_channel_subject())
+        else {
+            panic!("expected Err, got Ok");
+        };
+        match err {
+            AuthDenial::RequesterLacksAuthority { class, found } => {
+                assert_eq!(class, CapabilityClass::Channel);
+                assert_eq!(found, RequesterKind::Anonymous);
+            }
+            other => panic!(
+                "expected RequesterLacksAuthority(Channel, Anonymous), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn issue_substrate_rejects_anonymous_at_stage_1() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Anonymous);
+        let Err(err) = issue_substrate::<ScanShard>(&ctx, sample_substrate_subject()) else {
+            panic!("expected Err, got Ok");
+        };
+        match err {
+            AuthDenial::RequesterLacksAuthority { class, found } => {
+                assert_eq!(class, CapabilityClass::Substrate);
+                assert_eq!(found, RequesterKind::Anonymous);
+            }
+            other => panic!(
+                "expected RequesterLacksAuthority(Substrate, Anonymous), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn issue_moderation_rejects_anonymous_at_stage_1() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Anonymous);
+        let Err(err) =
+            issue_moderation::<ModeratorRead>(&ctx, sample_moderation_subject())
+        else {
+            panic!("expected Err, got Ok");
+        };
+        match err {
+            AuthDenial::RequesterLacksAuthority { class, found } => {
+                assert_eq!(class, CapabilityClass::Moderation);
+                assert_eq!(found, RequesterKind::Anonymous);
+            }
+            other => panic!(
+                "expected RequesterLacksAuthority(Moderation, Anonymous), got {other:?}"
+            ),
+        }
+    }
+
+    // ---- Did-rejected for substrate / moderation (2) ----
+    //
+    // Adversarial: §4.6 read-everything-authority and §4.3
+    // moderation-as-service both forbid Did requesters. Failure
+    // surfaces at stage 1 — NOT stage 3 (proof construction).
+    // Stage matters: if a Did requester reached stage 3 and only
+    // failed there, the surface would have been broken (a
+    // SubstrateProof should never exist in a function that took
+    // a Did requester).
+
+    #[test]
+    fn issue_substrate_rejects_did_at_stage_1_per_4_6() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let Err(err) = issue_substrate::<ScanShard>(&ctx, sample_substrate_subject()) else {
+            panic!("expected Err, got Ok");
+        };
+        match err {
+            AuthDenial::RequesterLacksAuthority { class, found } => {
+                assert_eq!(class, CapabilityClass::Substrate);
+                assert_eq!(found, RequesterKind::Did);
+            }
+            other => panic!(
+                "expected RequesterLacksAuthority(Substrate, Did) per §4.6 read-everything-authority, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn issue_moderation_rejects_did_at_stage_1_per_moderation_as_service() {
+        let fixture = ContextFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let Err(err) =
+            issue_moderation::<ModeratorRead>(&ctx, sample_moderation_subject())
+        else {
+            panic!("expected Err, got Ok");
+        };
+        match err {
+            AuthDenial::RequesterLacksAuthority { class, found } => {
+                assert_eq!(class, CapabilityClass::Moderation);
+                assert_eq!(found, RequesterKind::Did);
+            }
+            other => panic!(
+                "expected RequesterLacksAuthority(Moderation, Did) per §4.3 moderation-as-service, got {other:?}"
+            ),
+        }
+    }
+
+    // ---- AuthorityId stability (1) ----
+
+    /// `process_authority_id` returns the same id across calls
+    /// within the same process (§4.3 "authority module instance"
+    /// framing). OnceLock initialization is exercised by the first
+    /// call from any of the issuance tests above; this test simply
+    /// pins the per-process stability.
+    #[test]
+    fn process_authority_id_is_stable_within_process() {
+        let a = process_authority_id();
+        let b = process_authority_id();
+        assert_eq!(a, b, "process_authority_id must be process-static");
     }
 }
