@@ -156,8 +156,11 @@ pub use authority::{
     SubstrateScope, UserCapability, UserProof, UserProofRef,
 };
 pub use encryption::{
-    AuditEncryptionAlgorithm, AuditEncryptionKeyId, EncryptionError,
-    RecordEncryptionAlgorithm, RecordEncryptionKeyId,
+    produce_sensitive_representation, AuditEncryptionAlgorithm,
+    AuditEncryptionKeyId, AuditEncryptionResolver, EncryptedRecord,
+    EncryptionContext, EncryptionError, EncryptionResolverSet, NoEncryption,
+    RecordEncryptionAlgorithm, RecordEncryptionContext,
+    RecordEncryptionKeyId, RecordEncryptionResolver,
 };
 pub use identity::{
     CorrelationKey, KeyId, PublicKey, RotationChain, RotationEntry,

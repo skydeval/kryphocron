@@ -234,6 +234,74 @@ pub trait EncryptionResolverSet: Send + Sync {
     fn record(&self) -> Option<Arc<dyn RecordEncryptionResolver>>;
 }
 
+/// **v1 default** [`EncryptionResolverSet`] implementation that
+/// returns `None` from both methods (§8.5).
+///
+/// Substrates configured with [`NoEncryption`] emit audit events
+/// with [`crate::target::TargetRepresentation::sensitive`] = `None`
+/// and store records as plaintext. This is the v1 baseline:
+/// operators wanting at-rest encryption ship their own
+/// [`EncryptionResolverSet`] implementation wrapping their
+/// audit and / or record resolvers.
+///
+/// The struct is zero-sized; `NoEncryption` instances are free.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoEncryption;
+
+impl EncryptionResolverSet for NoEncryption {
+    fn audit(&self) -> Option<Arc<dyn AuditEncryptionResolver>> {
+        None
+    }
+    fn record(&self) -> Option<Arc<dyn RecordEncryptionResolver>> {
+        None
+    }
+}
+
+// ============================================================
+// §8.4 audit-emission integration helper.
+// ============================================================
+
+/// Audit-emission integration helper (§8.4): produce a
+/// [`SensitiveRepresentation`] from `plaintext` using the
+/// installed audit resolver, OR return `None` when no resolver
+/// is installed.
+///
+/// Substrate components emitting audit events with sensitive
+/// data call this helper. The returned `Option` flows directly
+/// into [`crate::target::TargetRepresentation::sensitive`]:
+///
+/// ```text
+/// let sensitive = produce_sensitive_representation(
+///     plaintext_bytes,
+///     &EncryptionContext { capability, trace_id, operator_context },
+///     deadline,
+///     resolver_set.audit().as_deref(),
+/// ).await?;
+/// let target = TargetRepresentation { structural, sensitive };
+/// ```
+///
+/// **Errors propagate.** A resolver-side encryption failure
+/// surfaces as [`EncryptionError`]; the substrate's audit-emit
+/// path treats this as a hard failure (audit unavailability)
+/// rather than silently dropping the sensitive layer. §4.9
+/// commits the audit-unavailable bind-failure semantics.
+///
+/// # Errors
+///
+/// Returns [`EncryptionError`] from the resolver. When
+/// `resolver` is `None`, returns `Ok(None)` unconditionally.
+pub async fn produce_sensitive_representation(
+    plaintext: &[u8],
+    context: &EncryptionContext,
+    deadline: Instant,
+    resolver: Option<&dyn AuditEncryptionResolver>,
+) -> Result<Option<SensitiveRepresentation>, EncryptionError> {
+    match resolver {
+        None => Ok(None),
+        Some(r) => r.encrypt(plaintext, context, deadline).await.map(Some),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +328,193 @@ mod tests {
         let bytes = [0xCC; 32];
         assert_eq!(AuditEncryptionKeyId::from_bytes(bytes).as_bytes(), &bytes);
         assert_eq!(RecordEncryptionKeyId::from_bytes(bytes).as_bytes(), &bytes);
+    }
+
+    /// `NoEncryption` returns `None` from both `audit()` and
+    /// `record()` per §8.5's v1 default.
+    #[test]
+    fn no_encryption_returns_none_from_both_methods() {
+        let set = NoEncryption;
+        assert!(set.audit().is_none());
+        assert!(set.record().is_none());
+    }
+
+    /// `NoEncryption` is zero-sized — operators get the v1
+    /// default with no allocation cost.
+    #[test]
+    fn no_encryption_is_zero_sized() {
+        assert_eq!(std::mem::size_of::<NoEncryption>(), 0);
+    }
+
+    /// `EncryptionError` variant reachability — five of six
+    /// variants are constructible in v1. The sixth
+    /// (`AlgorithmNotSupported`) requires an
+    /// [`AuditEncryptionAlgorithm`] value, and the algorithm
+    /// enum is intentionally zero-variant in v1 (§8.5). The
+    /// variant exists in the type surface but cannot be
+    /// constructed until v1.x or v2 ships algorithm variants.
+    #[test]
+    fn encryption_error_constructible_variants_round_trip() {
+        let _v1 = EncryptionError::KeyNotFound {
+            key_id: AuditEncryptionKeyId::from_bytes([0; 32]),
+        };
+        let _v2 = EncryptionError::Malformed;
+        let _v3 = EncryptionError::AccessDenied {
+            reason: "test-only",
+        };
+        let _v4 = EncryptionError::DeadlineExceeded {
+            elapsed: Duration::from_secs(1),
+        };
+        let _v5 = EncryptionError::UpstreamError("kms unreachable".into());
+        // AlgorithmNotSupported(AuditEncryptionAlgorithm) is
+        // structurally present but uninhabited in v1; this is
+        // the §8.5 door-open posture.
+    }
+
+    /// `produce_sensitive_representation` returns `Ok(None)`
+    /// when no resolver is installed (the §8.4 default path).
+    #[tokio::test]
+    async fn produce_sensitive_returns_none_when_resolver_absent() {
+        let context = EncryptionContext {
+            capability: CapabilityKind::ViewPrivate,
+            trace_id: TraceId::from_bytes([0; 16]),
+            operator_context: SmallVec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let result = produce_sensitive_representation(
+            b"plaintext",
+            &context,
+            deadline,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    /// Mock [`AuditEncryptionResolver`] impl confirming the
+    /// trait is implementable in v1. The mock can return
+    /// [`EncryptionError`] error variants but cannot construct
+    /// a real [`SensitiveRepresentation`] — the
+    /// `SensitiveRepresentation::algorithm` field requires an
+    /// [`AuditEncryptionAlgorithm`] value, and the algorithm
+    /// enum is uninhabited in v1 (§8.5). Operators implementing
+    /// the trait in v1 can wire the surface but cannot return a
+    /// real ciphertext until algorithm variants ship — the
+    /// strict door-open posture.
+    struct AlwaysAccessDenied;
+
+    #[async_trait]
+    impl AuditEncryptionResolver for AlwaysAccessDenied {
+        async fn encrypt(
+            &self,
+            _plaintext: &[u8],
+            _context: &EncryptionContext,
+            _deadline: Instant,
+        ) -> Result<SensitiveRepresentation, EncryptionError> {
+            Err(EncryptionError::AccessDenied {
+                reason: "mock resolver: always denies",
+            })
+        }
+        async fn decrypt(
+            &self,
+            _sensitive: &SensitiveRepresentation,
+            _context: &EncryptionContext,
+            _deadline: Instant,
+        ) -> Result<Vec<u8>, EncryptionError> {
+            Err(EncryptionError::AccessDenied {
+                reason: "mock resolver: always denies",
+            })
+        }
+        fn active_key_id(&self) -> AuditEncryptionKeyId {
+            AuditEncryptionKeyId::from_bytes([0xFF; 32])
+        }
+    }
+
+    /// `produce_sensitive_representation` propagates resolver
+    /// errors as `EncryptionError`. The mock returns
+    /// `AccessDenied`; the helper returns it verbatim rather
+    /// than translating or swallowing.
+    #[tokio::test]
+    async fn produce_sensitive_propagates_resolver_error() {
+        let context = EncryptionContext {
+            capability: CapabilityKind::ViewPrivate,
+            trace_id: TraceId::from_bytes([0; 16]),
+            operator_context: SmallVec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let resolver = AlwaysAccessDenied;
+        let err = produce_sensitive_representation(
+            b"plaintext",
+            &context,
+            deadline,
+            Some(&resolver as &dyn AuditEncryptionResolver),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EncryptionError::AccessDenied {
+                reason: "mock resolver: always denies",
+            }
+        ));
+    }
+
+    /// Mock [`AuditEncryptionResolver`]'s `active_key_id`
+    /// accessor returns the configured id.
+    #[test]
+    fn mock_audit_resolver_active_key_id_round_trips() {
+        let resolver = AlwaysAccessDenied;
+        assert_eq!(resolver.active_key_id().as_bytes(), &[0xFF; 32]);
+    }
+
+    /// Mock [`RecordEncryptionResolver`] impl confirming the
+    /// record-side trait is implementable. Same v1 caveat as
+    /// the audit-side mock — the [`EncryptedRecord::algorithm`]
+    /// field requires a [`RecordEncryptionAlgorithm`] value,
+    /// uninhabited in v1.
+    struct AlwaysMalformedRecord;
+
+    #[async_trait]
+    impl RecordEncryptionResolver for AlwaysMalformedRecord {
+        async fn encrypt_record(
+            &self,
+            _plaintext: &[u8],
+            _context: &RecordEncryptionContext,
+            _deadline: Instant,
+        ) -> Result<EncryptedRecord, EncryptionError> {
+            Err(EncryptionError::Malformed)
+        }
+        async fn decrypt_record(
+            &self,
+            _encrypted: &EncryptedRecord,
+            _reader: &Did,
+            _context: &RecordEncryptionContext,
+            _deadline: Instant,
+        ) -> Result<Vec<u8>, EncryptionError> {
+            Err(EncryptionError::Malformed)
+        }
+    }
+
+    /// Mock record-resolver compiles + can be invoked, returning
+    /// `Malformed` on both encrypt and decrypt paths.
+    #[tokio::test]
+    async fn mock_record_resolver_returns_malformed() {
+        let nsid = Nsid::new("tools.kryphocron.feed.postPrivate").unwrap();
+        let did = Did::new("did:plc:exampleexampleexample").unwrap();
+        let context = RecordEncryptionContext {
+            nsid,
+            originator: did.clone(),
+            audience_list: None,
+            trace_id: TraceId::from_bytes([0; 16]),
+            operator_context: SmallVec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let resolver = AlwaysMalformedRecord;
+        let err = resolver
+            .encrypt_record(b"plaintext", &context, deadline)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EncryptionError::Malformed));
     }
 }
