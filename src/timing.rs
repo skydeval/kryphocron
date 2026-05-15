@@ -18,7 +18,7 @@
 //! `await`-until-deadline implementation lands in Phase 4 once
 //! the substrate has a chosen `Future`/`Sleep` discipline.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::authority::UserCapability;
 use crate::ingress::OracleSet;
@@ -31,21 +31,37 @@ pub const BASE_AUTHORIZATION_OVERHEAD: Duration = Duration::from_millis(5);
 /// (§4.6).
 pub const SAFETY_MARGIN: Duration = Duration::from_millis(2);
 
-/// Run `fut` and wait until at least `target` has elapsed before
-/// returning its result. Used to absorb per-query latency
-/// variance across the §4.3 pipeline.
+/// Equalize externally-observable latency to a `target` floor
+/// (§4.6 timing-channel discipline).
 ///
-/// **Phase 1 stub.** The signature is committed; the
-/// implementation calls [`unimplemented!`]. Phase 4 wires the
-/// actual sleep-until-deadline once the substrate's chosen
-/// `Future` discipline is in place (§4.6, §4.10).
-pub async fn equalize_timing<F, T>(_target: Duration, _fut: F) -> T
-where
-    F: core::future::Future<Output = T>,
-{
-    unimplemented!(
-        "§4.6 equalize_timing: Phase 4 wires the sleep-until-deadline implementation"
-    );
+/// Awaits until `start.elapsed() >= target`. If the operation
+/// preceding the call already took ≥ `target`, returns
+/// immediately (no negative-sleep, no spurious delay). If it
+/// took less, sleeps for the remaining `target - elapsed`.
+///
+/// Callers compute `target` from
+/// [`equalize_timing_target_for`] (sums per-oracle worst-case
+/// latencies plus base + safety margin) and pass `start` as
+/// the [`Instant`] captured at the beginning of the
+/// security-relevant operation.
+///
+/// The contract is "wait until target elapsed," not "wait until
+/// target elapsed OR deadline." Deadline interactions are the
+/// caller's concern — wrap the equalization in a `tokio::select!`
+/// against the deadline if the operation has one.
+///
+/// Sleep is implemented via [`tokio::time::sleep`]; operators
+/// running on a non-tokio async runtime must supply a
+/// tokio-compatible reactor or shim. §4.6 explicitly defers full
+/// constant-time discipline (e.g., randomized jitter, hardened
+/// timing primitives) to v2+; this is the equalization primitive
+/// only.
+pub async fn equalize_timing(start: Instant, target: Duration) {
+    let elapsed = start.elapsed();
+    if elapsed < target {
+        tokio::time::sleep(target - elapsed).await;
+    }
+    // else: already past the target, return immediately.
 }
 
 /// Compute the equalization target for capability `C` against

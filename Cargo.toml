@@ -95,6 +95,13 @@ getrandom = "0.2"
 # pin matching the lexicon-set semver (§5.5).
 kryphocron-lexicons = { path = "../kryphocron-lexicons", version = "0.1" }
 
+# §4.6 timing-channel equalization sleep primitive
+# (`tokio::time::sleep` consumed by `crate::timing::equalize_timing`).
+# Phase 7a wired the function body; tokio is now a production dep
+# rather than dev-only. Operators running on a non-tokio async
+# runtime must supply a tokio-compatible reactor or shim.
+tokio = { version = "1", features = ["time"] }
+
 [dev-dependencies]
 # `trybuild` for Phase B's "this should not compile" assertions.
 trybuild = "1"
