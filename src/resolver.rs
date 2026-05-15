@@ -1167,4 +1167,125 @@ mod tests {
         assert_eq!(doc.did, did);
         assert_eq!(doc.verification_methods.len(), 1);
     }
+
+    // ============================================================
+    // §6.4 / chainlink #47 — trace_id propagation behavioral test.
+    //
+    // Phase 4d Commit 2 threaded trace_id through DidResolver but
+    // did not include a behavioral test pinning the audit-emit
+    // side. Phase 4e C7 closes that gap.
+    // ============================================================
+
+    use crate::audit::{AuditError, SubstrateAuditEvent, SubstrateAuditSink};
+    use std::sync::Mutex as StdMutex;
+
+    struct CapturingSink {
+        events: StdMutex<Vec<SubstrateAuditEvent>>,
+    }
+
+    impl CapturingSink {
+        fn new() -> Self {
+            CapturingSink {
+                events: StdMutex::new(Vec::new()),
+            }
+        }
+        fn captured(&self) -> Vec<SubstrateAuditEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl SubstrateAuditSink for CapturingSink {
+        fn record(&self, event: SubstrateAuditEvent) -> Result<(), AuditError> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    /// `DidResolver::resolve`'s rotation-detection path emits
+    /// `DidDocumentRotated` carrying the caller's trace_id (NOT
+    /// the placeholder zero-id used before #41 closed). Symmetric
+    /// for `invalidate`'s `DidDocumentInvalidated`.
+    #[tokio::test]
+    async fn did_resolver_audit_emit_carries_caller_trace_id_not_zero() {
+        let fetcher = MockFetcher::new();
+        let did = sample_did();
+        // First-fetch document with key A.
+        let key_a = [0x11u8; 32];
+        fetcher.set(
+            &did,
+            Ok(RawDidDoc {
+                bytes: build_did_plc_json(&did, &key_a),
+                content_type: ContentType::ApplicationJson,
+            }),
+        );
+
+        let sink = Arc::new(CapturingSink::new());
+        let resolver = DefaultDidResolver::with_config(
+            fetcher,
+            ResolverConfig {
+                // Tighten the cache TTL so the second resolve
+                // forces a refetch.
+                max_document_cache_age: Duration::from_millis(0),
+                ..ResolverConfig::default()
+            },
+            Some(sink.clone() as Arc<dyn SubstrateAuditSink>),
+        );
+
+        let trace_id_x = TraceId::from_bytes([0x77; 16]);
+        let trace_id_y = TraceId::from_bytes([0x88; 16]);
+
+        // First resolve: cold cache, single fetch, no rotation
+        // signal yet.
+        resolver
+            .resolve(&did, deadline(), trace_id_x)
+            .await
+            .unwrap();
+
+        // Swap the document to a different key for the second
+        // resolve (cache TTL = 0 forces refetch).
+        let key_b = [0x22u8; 32];
+        resolver.fetcher.set(
+            &did,
+            Ok(RawDidDoc {
+                bytes: build_did_plc_json(&did, &key_b),
+                content_type: ContentType::ApplicationJson,
+            }),
+        );
+
+        // Second resolve: rotation detected; emit_rotation_audit
+        // fires with trace_id_x.
+        resolver
+            .resolve(&did, deadline(), trace_id_x)
+            .await
+            .unwrap();
+
+        // Operator-initiated invalidation: emit_invalidation_audit
+        // fires with trace_id_y.
+        resolver.invalidate(&did, trace_id_y).await;
+
+        let events = sink.captured();
+        assert!(
+            events.len() >= 2,
+            "expected at least DidDocumentRotated + DidDocumentInvalidated, got {}",
+            events.len()
+        );
+
+        let mut saw_rotated_with_x = false;
+        let mut saw_invalidated_with_y = false;
+        for ev in &events {
+            match ev {
+                SubstrateAuditEvent::DidDocumentRotated { trace_id, .. } => {
+                    assert_eq!(*trace_id, trace_id_x, "rotated must carry caller's trace_id");
+                    saw_rotated_with_x = true;
+                }
+                SubstrateAuditEvent::DidDocumentInvalidated { trace_id, .. } => {
+                    assert_eq!(*trace_id, trace_id_y, "invalidated must carry caller's trace_id");
+                    saw_invalidated_with_y = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_rotated_with_x, "expected DidDocumentRotated with trace_id_x");
+        assert!(saw_invalidated_with_y, "expected DidDocumentInvalidated with trace_id_y");
+    }
 }
