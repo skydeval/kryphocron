@@ -190,23 +190,54 @@ where
 
 /// Issue a moderation-class capability proof (§4.3).
 ///
-/// `ModeratorRead` bind emits two audit events per §4.9 (one to
-/// the moderation sink, one to the owner's inspection-notification
-/// queue). Phase 4 wires the dual-emit.
+/// Moderation-class issuance accepts only service principals
+/// per §4.3 moderation-as-service discipline (moderators dispatch
+/// through a service-identity-bearing operator surface, never
+/// directly as user-class requesters).
 ///
-/// **Phase 1 stub.**
+/// Pipeline (Phase 7c v0.1):
+///
+/// - **Stage 1 — requester authority.** Moderation-class accepts
+///   [`Requester::Service`] only. [`Requester::Did`] and
+///   [`Requester::Anonymous`] both fail closed.
+/// - **Stage 3 — proof construction.** Builds a
+///   [`ModerationProof<C>`] with `issued_at = Instant::now()` and
+///   a process-static [`AuthorityId`].
+///
+/// Stage 0 deferred to bind for moderation subjects that carry
+/// an NSID via their inner [`crate::ResourceId`] (Phase 7d).
+/// Stage 2 (jurisdiction check — does this moderator's
+/// service-identity carry authority over the moderation target?)
+/// is also bind-time. The v0.1 jurisdiction model is "any
+/// Service requester is admissible at the chokepoint"; the
+/// bind-time predicate refines it once the operator-managed
+/// moderator-role surface lands. See chainlink for v0.2
+/// jurisdiction model.
+///
+/// `ModeratorRead` bind separately emits two audit events per
+/// §4.9 (one to the moderation sink, one to the owner's
+/// inspection-notification queue) — issuance does not emit;
+/// audit fires at bind only.
 ///
 /// # Errors
 ///
-/// Returns [`AuthDenial`] on denial.
+/// Returns [`AuthDenial::RequesterLacksAuthority`] for any
+/// non-Service requester.
 pub fn issue_moderation<C>(
-    _ctx: &AuthContext<'_>,
-    _target: <C as ModerationCapability>::Subject,
+    ctx: &AuthContext<'_>,
+    subject: <C as ModerationCapability>::Subject,
 ) -> Result<ModerationProof<C>, AuthDenial>
 where
     C: ModerationCapability,
 {
-    unimplemented!("§4.3 authority::issue_moderation: Phase 4 wires the pipeline");
+    let requester = stage1_extract_requester_did(ctx, CapabilityClass::Moderation, false)?;
+    Ok(ModerationProof::new_internal(
+        requester,
+        subject,
+        Instant::now(),
+        process_authority_id(),
+        ctx.trace_id(),
+    ))
 }
 
 // ============================================================
