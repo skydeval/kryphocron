@@ -30,7 +30,7 @@ async-trait = "0.1"
 # attribution chains, scope vectors, JWT scope vectors. Phase 1
 # uses it for §4.2 AttributionChain entries (replacing the spec's
 # ArrayVec reference; bounded depth is runtime-enforced by the
-# crate's constructors). See CHAINLINKS #2.
+# crate's constructors).
 smallvec = "1.13"
 
 # §9.5 structured error derivation. Used across §4 error enums.
@@ -40,7 +40,7 @@ thiserror = "2"
 # for the JWT verification chain; the v1 algorithm allowlist
 # defaults to Ed25519-only per §7.2's conservative-default
 # discipline. ECDSA variants (ES256/ES256K) are operator opt-in
-# and currently stub with `UnsupportedAlgorithm` — see chainlinks.
+# and currently stub with `UnsupportedAlgorithm`.
 ed25519-dalek = "2"
 
 # §7.2 / §9.5 base64url decoding for JWT segment parsing. Pinned
@@ -53,8 +53,7 @@ base64 = "0.22"
 # verification path needs JSON parsing on every authenticated
 # request. The `audit-serde-json` feature retains its `dep:serde`
 # activation for the optional `Serialize`/`Deserialize` derives on
-# audit events (chainlink #22 tracks the full transitive coverage
-# rollout for Phase 6).
+# audit events.
 serde_json = "1"
 
 # §4.8 / §7.6 / §9.5 deterministic CBOR encoding for the
@@ -118,9 +117,8 @@ default = []
 # `BindOutcomeRepr::Expired`), `kryphocron-lexicons` (SemVer,
 # Nsid, Did currently lack derives), and the `proto-blue` family.
 # Both `cargo build --features audit-serde-json` and `cargo build`
-# succeed in Phase 3 — the feature flag remains structurally
-# wired and the `serde` / `serde_json` dependencies are correctly
-# optional. See chainlink for full-coverage rollout plan.
+# succeed — the feature flag is structurally wired and the
+# `serde` / `serde_json` dependencies are correctly optional.
 audit-serde-json = ["dep:serde"]
 
 [dependencies.serde]
