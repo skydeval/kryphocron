@@ -3,16 +3,17 @@ name = "kryphocron"
 version = "0.1.0-phase1"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "MPL-2.0"
 description = "Primitives crate for the kryphocron substrate: capability proofs, tier-aware envelopes, authorization context, audit pipeline, and inter-service auth vocabulary."
 keywords = ["atproto", "authorization", "capability", "audit"]
 categories = ["authentication", "cryptography", "data-structures"]
 publish = false
 
-# Phase 1 manifest. Phase 6 (§9 polish) will swap `license` to
-# AGPL-3.0-or-later (§9.8) once the on-disk LICENSE files are
-# replaced in lockstep. The current MIT/Apache LICENSE files are
-# pre-existing crates.io-reservation artifacts. See CHAINLINKS #1.
+# License: MPL-2.0 (file-level copyleft) per §9.8. Per-file
+# headers point at the LICENSE file at the crate root.
+# Downstream crates (PDS, AppView, etc.) are encouraged to ship
+# permissive (MIT OR Apache-2.0); see TRADEMARK.md for marks
+# discipline.
 
 [lib]
 name = "kryphocron"

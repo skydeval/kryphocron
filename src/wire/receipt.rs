@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! §4.8 attribution-chain wire format + per-entry delegation
 //! receipts (round-4 + round-5 patches).
 //!
