@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "kryphocron"
-version = "0.1.0-phase1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "kryphocron-lexicons"
-version = "0.1.0-phase2"
+version = "0.1.0"
 dependencies = [
  "proto-blue-lex-data",
  "proto-blue-lexicon",
