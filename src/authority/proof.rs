@@ -44,6 +44,7 @@ use crate::authority::capability::{
     CapabilityKind, Endpoint, ModerationCapability, SubstrateScope, UserCapability,
 };
 use crate::authority::predicate::{BindError, BindFailureReason, DenialReason, PipelineStage};
+use crate::authority::subjects::HasResourceLocation;
 use crate::identity::TraceId;
 use crate::ingress::{AuthContext, Requester};
 use crate::proto::Did;
@@ -199,23 +200,199 @@ impl<C: UserCapability> UserProof<C> {
     /// Bind the proof against a target.
     ///
     /// Consumes `self`. Emits exactly one terminal audit event
-    /// per §4.3 / §4.9 A1 invariant. On success returns
-    /// `BoundUserProof`; on any non-success outcome the audit
-    /// emit fires first and `Err(BindError)` is returned.
+    /// per §4.3 / §4.9 A1 invariant via [`crate::composite_audit`].
+    /// On success returns [`BoundUserProof`]; on any non-success
+    /// outcome the audit emit fires first and `Err(BindError)` is
+    /// returned.
     ///
-    /// **Phase 1 stub.** Phase 4 wires `compute_bind_outcome`
-    /// against the §4.3 pipeline.
-    pub fn bind<'p>(
+    /// Pipeline (Phase 7d v0.1):
+    /// - **Pre-checks** (no audit): target match, context match,
+    ///   expiry. Caller errors fail fast.
+    /// - **Stage 0 — DeprecationGate** (write-semantics only): the
+    ///   subject's NSID is consulted against
+    ///   [`crate::KRYPHOCRON_LEXICON_REGISTRY`] (§5.6).
+    /// - **Stage 2 — BlockConsultation**: consults
+    ///   [`crate::oracle::BlockOracle`] for
+    ///   [`crate::oracle::BlockOracleQuery::RequesterVsResourceOwner`]
+    ///   (the universal query across v1 user-class capabilities).
+    ///   Multi-query consultations (RequesterVsParentPostOwner,
+    ///   audience queries, mute queries) defer to a v0.2 per-
+    ///   capability oracle-results-builder trait — currently
+    ///   stubbed via `<C::OracleResults as Default>::default()`.
+    /// - **Stage 5 — Predicate**: invokes
+    ///   [`crate::IssuancePolicy::capability_predicate`] with
+    ///   default-initialized oracle results (see stage 2 note).
+    /// - **Stage 6 — Timing equalization**: post-emit, sleeps
+    ///   until `equalize_timing_target_for::<C>` elapses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::TargetMismatch`] /
+    /// [`BindError::ContextMismatch`] / [`BindError::Expired`]
+    /// for precondition failures (no audit emit). Returns
+    /// [`BindError::DeniedAtPipeline`] for stage failures (audit
+    /// emit fires first). Returns
+    /// [`BindError::AuditUnavailable`] /
+    /// [`BindError::AuditPanicked`] when the audit machinery
+    /// itself fails.
+    pub async fn bind<'p>(
         self,
-        _ctx: &AuthContext<'_>,
-        _target: &<C as UserCapability>::Subject,
+        ctx: &AuthContext<'_>,
+        target: &<C as UserCapability>::Subject,
     ) -> Result<BoundUserProof<'p, C>, BindError>
     where
         Self: 'p,
+        <C as UserCapability>::Subject:
+            PartialEq + crate::authority::HasResourceLocation,
+        <C as UserCapability>::OracleResults: Default,
+        C: crate::authority::IssuancePolicy,
     {
-        unimplemented!(
-            "§4.3 UserProof::bind: Phase 4 wires the pipeline + audit emit"
+        let start = Instant::now();
+
+        // Pre-checks (no audit emit; caller errors)
+        precheck_target_match(&self.subject, target)?;
+        precheck_context_match(&self.requester, ctx)?;
+        precheck_expired(self.issued_at, C::MAX_AGE)?;
+
+        // Build event-construction inputs from self before
+        // entering the closure (composite_audit's op closure
+        // captures by reference so we don't move self).
+        let trace_id = self.trace_id;
+        let proof_requester_did = self.requester.clone();
+        let attribution = ctx.attribution_chain().clone();
+        let now = std::time::SystemTime::now();
+        let target_did = target.resource_did().clone();
+        let target_nsid = target.resource_nsid().clone();
+        let subject_repr = crate::target::TargetRepresentation::structural_only(
+            crate::target::StructuralRepresentation::Resource {
+                did: target_did.clone(),
+                nsid: target_nsid.clone(),
+            },
         );
+
+        // Capture the AuthContext bits the closure needs (it can't
+        // hold a borrow of `ctx` across the await point cleanly
+        // for non-Sync trait objects, but the oracles are Send +
+        // Sync trait objects, so a copy of the OracleSet is
+        // allowed via its Copy derive).
+        let oracles_block = ctx.oracles().block;
+        let trace_id_for_predicate = trace_id;
+        let attribution_ref_for_predicate = ctx.attribution_chain();
+        let requester_ref_for_predicate = ctx.requester();
+
+        let pipeline_result: Result<BindFlow, BindError> =
+            crate::audit::composite_audit(trace_id, ctx.audit(), async |scope| {
+                // Stage 0: deprecation gate (Write only)
+                if matches!(
+                    C::SEMANTICS,
+                    crate::authority::CapabilitySemantics::Write
+                ) {
+                    if let Err(reason) = crate::authority::check_stage_0_deprecation(
+                        &target_nsid,
+                        now_unix_seconds(),
+                    ) {
+                        let event = crate::audit::UserAuditEvent::CapabilityIssuanceDenied {
+                            trace_id,
+                            requester: Requester::Did(proof_requester_did.clone()),
+                            capability: C::KIND,
+                            target_repr: subject_repr.clone(),
+                            reason: reason.clone(),
+                            attribution: attribution.clone(),
+                            at: now,
+                        };
+                        scope.emit_user(event);
+                        return Ok(BindFlow::DeniedAtPipeline {
+                            stage: PipelineStage::DeprecationGate,
+                            reason,
+                        });
+                    }
+                }
+
+                // Stage 2: BlockConsultation (universal query)
+                let block_state =
+                    oracles_block.block_state(&proof_requester_did, &target_did);
+                if !matches!(block_state, crate::oracle::BlockState::None) {
+                    let reason = DenialReason::Blocked {
+                        query: crate::oracle::BlockOracleQuery::RequesterVsResourceOwner,
+                        state: block_state,
+                    };
+                    let event = crate::audit::UserAuditEvent::CapabilityIssuanceDenied {
+                        trace_id,
+                        requester: Requester::Did(proof_requester_did.clone()),
+                        capability: C::KIND,
+                        target_repr: subject_repr.clone(),
+                        reason: reason.clone(),
+                        attribution: attribution.clone(),
+                        at: now,
+                    };
+                    scope.emit_user(event);
+                    return Ok(BindFlow::DeniedAtPipeline {
+                        stage: PipelineStage::BlockConsultation,
+                        reason,
+                    });
+                }
+
+                // Stage 5: Predicate
+                let oracle_results =
+                    <<C as UserCapability>::OracleResults as Default>::default();
+                let predicate_ctx = crate::authority::PredicateContext::new(
+                    requester_ref_for_predicate,
+                    trace_id_for_predicate,
+                    attribution_ref_for_predicate,
+                );
+                if let Err(reason) =
+                    <C as crate::authority::IssuancePolicy>::capability_predicate(
+                        &predicate_ctx,
+                        target,
+                        &oracle_results,
+                    )
+                {
+                    let event = crate::audit::UserAuditEvent::CapabilityIssuanceDenied {
+                        trace_id,
+                        requester: Requester::Did(proof_requester_did.clone()),
+                        capability: C::KIND,
+                        target_repr: subject_repr.clone(),
+                        reason: reason.clone(),
+                        attribution: attribution.clone(),
+                        at: now,
+                    };
+                    scope.emit_user(event);
+                    return Ok(BindFlow::DeniedAtPipeline {
+                        stage: PipelineStage::Predicate,
+                        reason,
+                    });
+                }
+
+                // All stages passed — emit success
+                let event = crate::audit::UserAuditEvent::CapabilityBound {
+                    trace_id,
+                    requester: proof_requester_did,
+                    subject_repr,
+                    capability: C::KIND,
+                    outcome: crate::authority::BindOutcomeRepr::Success,
+                    attribution,
+                    at: now,
+                };
+                scope.emit_user(event);
+                Ok(BindFlow::Success)
+            })
+            .await;
+
+        // Stage 6: timing equalization (§4.6)
+        let timing_target = crate::timing::equalize_timing_target_for::<C>(ctx.oracles());
+        crate::timing::equalize_timing(start, timing_target).await;
+
+        // Return
+        match pipeline_result {
+            Ok(BindFlow::Success) => Ok(BoundUserProof {
+                proof: self,
+                _life: PhantomData,
+            }),
+            Ok(BindFlow::DeniedAtPipeline { stage, reason }) => {
+                Err(BindError::DeniedAtPipeline { stage, reason })
+            }
+            Err(bind_err) => Err(bind_err),
+        }
     }
 }
 
@@ -245,17 +422,71 @@ impl<'p, C: UserCapability> BoundUserProof<'p, C> {
 
     /// Re-derive a non-`Copy` borrowed handle.
     ///
-    /// Re-checks expiry against
-    /// `min(C::MAX_AGE, deployment_config.max_age_for::<C>())`.
-    /// Success is silent. Failure emits a `ReborrowFailed` audit
-    /// event and returns an error.
+    /// Re-checks expiry against [`UserCapability::MAX_AGE`]. Per
+    /// §4.3 reborrow does NOT re-run oracle consultations or the
+    /// capability predicate — operators wanting fresh policy
+    /// checks call `bind` again on a fresh proof. Success is
+    /// silent (the original bind already emitted the terminal
+    /// event); failure emits a
+    /// [`crate::audit::UserAuditEvent::ReborrowFailed`] and
+    /// returns [`BindFailureReason::Expired`].
     ///
-    /// Phase 1 stub.
-    pub fn reborrow<'r>(
+    /// # Errors
+    ///
+    /// Returns [`BindFailureReason::Expired`] when the proof has
+    /// aged past `C::MAX_AGE`. Returns
+    /// [`BindFailureReason::AuditUnavailable`] when the audit
+    /// machinery itself fails on the `ReborrowFailed` emit.
+    pub async fn reborrow<'r>(
         &'r self,
-        _ctx: &AuthContext<'_>,
-    ) -> Result<UserProofRef<'r, C>, BindFailureReason> {
-        unimplemented!("§4.3 BoundUserProof::reborrow: Phase 4 wires re-check + audit emit");
+        ctx: &AuthContext<'_>,
+    ) -> Result<UserProofRef<'r, C>, BindFailureReason>
+    where
+        <C as UserCapability>::Subject: crate::authority::HasResourceLocation,
+    {
+        if self.proof.issued_at.elapsed() <= C::MAX_AGE {
+            // Inside window: silent success.
+            return Ok(UserProofRef { proof: &self.proof });
+        }
+
+        // Past window: emit ReborrowFailed via composite_audit.
+        let trace_id = self.proof.trace_id;
+        let requester = self.proof.requester.clone();
+        let now = std::time::SystemTime::now();
+        let target_did = self.proof.subject.resource_did().clone();
+        let target_nsid = self.proof.subject.resource_nsid().clone();
+        let subject_repr = crate::target::TargetRepresentation::structural_only(
+            crate::target::StructuralRepresentation::Resource {
+                did: target_did,
+                nsid: target_nsid,
+            },
+        );
+
+        let audit_result: Result<(), BindError> = crate::audit::composite_audit(
+            trace_id,
+            ctx.audit(),
+            async |scope| {
+                let event = crate::audit::UserAuditEvent::ReborrowFailed {
+                    trace_id,
+                    requester,
+                    subject_repr,
+                    capability: C::KIND,
+                    reason: BindFailureReason::Expired,
+                    at: now,
+                };
+                scope.emit_user(event);
+                Ok::<(), BindError>(())
+            },
+        )
+        .await;
+
+        match audit_result {
+            Ok(()) => Err(BindFailureReason::Expired),
+            // Reborrow's BindFailureReason vocabulary is narrower
+            // than BindError's; collapse audit infrastructure
+            // failures to AuditUnavailable.
+            Err(_) => Err(BindFailureReason::AuditUnavailable),
+        }
     }
 }
 
@@ -862,5 +1093,558 @@ mod tests {
 
         let cae_unrec = CompositeAuditError::InconsistencyUnrecoverable;
         assert!(matches!(BindError::from(cae_unrec), BindError::AuditPanicked));
+    }
+}
+
+// ============================================================
+// Phase 7d C4-C7 — bind/reborrow test infrastructure + tests.
+// ============================================================
+//
+// Shared mock sinks/oracles + ContextFixture used by the per-
+// class bind/reborrow tests. Lives at module scope so all four
+// classes' test modules can reuse it.
+
+#[cfg(test)]
+mod bind_test_fixtures {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime};
+
+    use super::*;
+    use crate::audit::{
+        AuditError, ChannelAuditEvent, ChannelAuditSink, CompositeOpId, FallbackAuditEvent,
+        FallbackAuditSink, ModerationAuditEvent, ModerationAuditSink, SinkKind,
+        SubstrateAuditEvent, SubstrateAuditSink, UserAuditEvent, UserAuditSink,
+    };
+    use crate::authority::moderation::{
+        InspectionNotification, InspectionNotificationQueueImpl,
+    };
+    use crate::ingress::{AttributionChain, AuditSinks, OracleSet};
+    use crate::oracle::{
+        AudienceOracle, AudienceOracleQuery, AudienceState, BlockOracle, BlockOracleQuery,
+        BlockState, MuteOracle, MuteOracleQuery, MuteState,
+    };
+
+    // ---- Capturing audit sinks ----
+
+    pub struct CapturingUserSink {
+        captured: Mutex<Vec<UserAuditEvent>>,
+    }
+    impl CapturingUserSink {
+        pub fn new() -> Self {
+            CapturingUserSink {
+                captured: Mutex::new(Vec::new()),
+            }
+        }
+        pub fn captured(&self) -> Vec<UserAuditEvent> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+    impl UserAuditSink for CapturingUserSink {
+        fn record(&self, event: UserAuditEvent) -> Result<(), AuditError> {
+            self.captured.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    pub struct CapturingChannelSink {
+        captured: Mutex<Vec<ChannelAuditEvent>>,
+    }
+    impl CapturingChannelSink {
+        pub fn new() -> Self {
+            CapturingChannelSink {
+                captured: Mutex::new(Vec::new()),
+            }
+        }
+        pub fn captured(&self) -> Vec<ChannelAuditEvent> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+    impl ChannelAuditSink for CapturingChannelSink {
+        fn record(&self, event: ChannelAuditEvent) -> Result<(), AuditError> {
+            self.captured.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    pub struct CapturingSubstrateSink {
+        captured: Mutex<Vec<SubstrateAuditEvent>>,
+    }
+    impl CapturingSubstrateSink {
+        pub fn new() -> Self {
+            CapturingSubstrateSink {
+                captured: Mutex::new(Vec::new()),
+            }
+        }
+        pub fn captured(&self) -> Vec<SubstrateAuditEvent> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+    impl SubstrateAuditSink for CapturingSubstrateSink {
+        fn record(&self, event: SubstrateAuditEvent) -> Result<(), AuditError> {
+            self.captured.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    pub struct CapturingModerationSink {
+        captured: Mutex<Vec<ModerationAuditEvent>>,
+    }
+    impl CapturingModerationSink {
+        pub fn new() -> Self {
+            CapturingModerationSink {
+                captured: Mutex::new(Vec::new()),
+            }
+        }
+        pub fn captured(&self) -> Vec<ModerationAuditEvent> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+    impl ModerationAuditSink for CapturingModerationSink {
+        fn record(&self, event: ModerationAuditEvent) -> Result<(), AuditError> {
+            self.captured.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    pub struct NoopFallback;
+    impl FallbackAuditSink for NoopFallback {
+        fn record_panic(
+            &self,
+            _: SinkKind,
+            _: TraceId,
+            _: CapabilityKind,
+            _: SystemTime,
+        ) {
+        }
+        fn record_composite_failure(
+            &self,
+            _: TraceId,
+            _: CompositeOpId,
+            _: &[SinkKind],
+            _: &[SinkKind],
+            _: SystemTime,
+        ) {
+        }
+        fn record_event(&self, _: FallbackAuditEvent) {}
+    }
+
+    // ---- Capturing inspection-notification queue (for C7
+    //      moderation tests) ----
+
+    pub struct CapturingInspection {
+        captured: Mutex<Vec<(Did, InspectionNotification)>>,
+    }
+    impl CapturingInspection {
+        pub fn new() -> Self {
+            CapturingInspection {
+                captured: Mutex::new(Vec::new()),
+            }
+        }
+        pub fn captured(&self) -> Vec<(Did, InspectionNotification)> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+    impl InspectionNotificationQueueImpl for CapturingInspection {
+        fn enqueue(&self, owner: &Did, event: InspectionNotification) {
+            self.captured
+                .lock()
+                .unwrap()
+                .push((owner.clone(), event));
+        }
+    }
+
+    // ---- Configurable block oracle ----
+
+    pub struct ConfigurableBlockOracle {
+        pub state: BlockState,
+    }
+    impl BlockOracle for ConfigurableBlockOracle {
+        fn block_state(&self, _: &Did, _: &Did) -> BlockState {
+            self.state.clone()
+        }
+        fn last_synced_at(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+        fn data_freshness_bound(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn worst_case_latency_for(&self, _: BlockOracleQuery) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    pub struct NoopAudienceOracle;
+    impl AudienceOracle for NoopAudienceOracle {
+        fn audience_state(
+            &self,
+            _: &Did,
+            _: &crate::authority::ResourceId,
+        ) -> AudienceState {
+            AudienceState::NoAudienceConfigured
+        }
+        fn last_synced_at(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+        fn data_freshness_bound(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn worst_case_latency_for(&self, _: AudienceOracleQuery) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    pub struct NoopMuteOracle;
+    impl MuteOracle for NoopMuteOracle {
+        fn mute_state(&self, _: &Did, _: &Did) -> MuteState {
+            MuteState::None
+        }
+        fn last_synced_at(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+        fn data_freshness_bound(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn worst_case_latency_for(&self, _: MuteOracleQuery) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    /// Owned bundle holding all sink/oracle/inspection state.
+    /// Hands out borrowed [`AuthContext`] values per requester
+    /// variant + per block-state.
+    pub struct BindFixture {
+        pub user: Arc<CapturingUserSink>,
+        pub channel: Arc<CapturingChannelSink>,
+        pub substrate: Arc<CapturingSubstrateSink>,
+        pub moderation: Arc<CapturingModerationSink>,
+        pub fallback: Arc<NoopFallback>,
+        pub inspection: Arc<CapturingInspection>,
+        pub block: Arc<ConfigurableBlockOracle>,
+        pub audience: Arc<NoopAudienceOracle>,
+        pub mute: Arc<NoopMuteOracle>,
+    }
+
+    impl BindFixture {
+        pub fn new() -> Self {
+            BindFixture {
+                user: Arc::new(CapturingUserSink::new()),
+                channel: Arc::new(CapturingChannelSink::new()),
+                substrate: Arc::new(CapturingSubstrateSink::new()),
+                moderation: Arc::new(CapturingModerationSink::new()),
+                fallback: Arc::new(NoopFallback),
+                inspection: Arc::new(CapturingInspection::new()),
+                block: Arc::new(ConfigurableBlockOracle {
+                    state: BlockState::None,
+                }),
+                audience: Arc::new(NoopAudienceOracle),
+                mute: Arc::new(NoopMuteOracle),
+            }
+        }
+
+        pub fn with_block_state(state: BlockState) -> Self {
+            let mut f = Self::new();
+            f.block = Arc::new(ConfigurableBlockOracle { state });
+            f
+        }
+
+        pub fn build_ctx(&self, requester: Requester) -> AuthContext<'_> {
+            AuthContext::new_internal(
+                requester,
+                TraceId::from_bytes([0xCD; 16]),
+                AuditSinks {
+                    user: &*self.user,
+                    channel: &*self.channel,
+                    substrate: &*self.substrate,
+                    moderation: &*self.moderation,
+                    fallback: &*self.fallback,
+                    inspection_queue: &*self.inspection,
+                },
+                OracleSet {
+                    block: &*self.block,
+                    audience: &*self.audience,
+                    mute: &*self.mute,
+                },
+                AttributionChain::empty(),
+            )
+        }
+    }
+
+    pub fn sample_did() -> Did {
+        Did::new("did:plc:phase7dbind").unwrap()
+    }
+
+    pub fn sample_did_other() -> Did {
+        Did::new("did:plc:phase7dother").unwrap()
+    }
+
+    pub fn sample_resource_id() -> crate::authority::ResourceId {
+        crate::authority::ResourceId::new(
+            sample_did(),
+            crate::Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+            crate::proto::Rkey::new("3jzfcijpj2z2a").unwrap(),
+        )
+    }
+}
+
+// ========================================================
+// Phase 7d C4 — UserProof::bind + BoundUserProof::reborrow tests.
+// ========================================================
+
+#[cfg(test)]
+mod user_bind_tests {
+    use super::bind_test_fixtures::*;
+    use super::*;
+    use crate::audit::UserAuditEvent;
+    use crate::authority::v1::{ParticipatePrivate, ViewPrivate};
+    use crate::authority::{issue_user, BindOutcomeRepr, CapabilityClass, CapabilityKind};
+    use crate::oracle::{BlockOracleQuery, BlockState};
+    use std::time::Duration;
+
+    /// Helper: issue a UserProof<ViewPrivate> via the Phase 7c
+    /// chokepoint so the resulting proof carries the same
+    /// trace_id/requester/issuer the bind path expects.
+    fn issue_view_private_for(
+        ctx: &AuthContext<'_>,
+        subject: crate::authority::ResourceId,
+    ) -> UserProof<ViewPrivate> {
+        match issue_user::<ViewPrivate>(ctx, subject) {
+            Ok(p) => p,
+            Err(_) => panic!("issuance prerequisite failed"),
+        }
+    }
+
+    /// §4.3 happy path: Did requester + clean oracle state → bind
+    /// returns Ok(BoundUserProof). One CapabilityBound event
+    /// captured with outcome Success.
+    #[tokio::test]
+    async fn bind_succeeds_with_did_requester_and_clean_state() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+
+        let r = proof.bind(&ctx, &sample_resource_id()).await;
+        assert!(r.is_ok(), "happy path bind should succeed");
+
+        let captured = fixture.user.captured();
+        assert_eq!(captured.len(), 1, "exactly one terminal audit event");
+        match &captured[0] {
+            UserAuditEvent::CapabilityBound {
+                capability,
+                outcome,
+                ..
+            } => {
+                assert_eq!(*capability, CapabilityKind::ViewPrivate);
+                assert!(matches!(outcome, BindOutcomeRepr::Success));
+            }
+            other => panic!("expected CapabilityBound, got {other:?}"),
+        }
+    }
+
+    /// §4.3 precondition: target ≠ proof.subject → TargetMismatch
+    /// (no audit emit, no stages run).
+    #[tokio::test]
+    async fn bind_rejects_target_mismatch_at_precondition() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+
+        // Different subject than what the proof was issued for
+        let different_target = crate::authority::ResourceId::new(
+            sample_did_other(),
+            crate::Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+            crate::proto::Rkey::new("3jzfcijpj2z2a").unwrap(),
+        );
+        let r = proof.bind(&ctx, &different_target).await;
+        match r {
+            Err(BindError::TargetMismatch) => {}
+            Err(other) => panic!("expected TargetMismatch, got {other:?}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+        assert_eq!(
+            fixture.user.captured().len(),
+            0,
+            "precondition failure does not emit audit"
+        );
+    }
+
+    /// §4.3 precondition: AuthContext requester ≠ proof.requester
+    /// → ContextMismatch (no audit emit).
+    #[tokio::test]
+    async fn bind_rejects_context_mismatch_at_precondition() {
+        let fixture = BindFixture::new();
+        let ctx_a = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx_a, sample_resource_id());
+
+        // Bind with a different AuthContext (different Did)
+        let ctx_b = fixture.build_ctx(Requester::Did(sample_did_other()));
+        let r = proof.bind(&ctx_b, &sample_resource_id()).await;
+        assert!(matches!(r, Err(BindError::ContextMismatch)));
+        assert_eq!(fixture.user.captured().len(), 0);
+    }
+
+    /// §4.3 / §4.7 precondition: a backdated proof past MAX_AGE
+    /// fails closed at precheck_expired (no audit emit). Uses
+    /// ParticipatePrivate (MAX_AGE = 60s) and shifts issued_at
+    /// 200s into the past via direct UserProof::new_internal —
+    /// the issue_user chokepoint always returns a fresh Instant
+    /// so we bypass it here.
+    #[tokio::test]
+    async fn bind_rejects_expired_at_precondition() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+
+        // Construct a backdated proof directly (test-only path).
+        let backdated_proof = UserProof::<ParticipatePrivate>::new_internal(
+            sample_did(),
+            sample_resource_id(),
+            Instant::now() - Duration::from_secs(200),
+            AuthorityId::from_bytes([0u8; 16]),
+            TraceId::from_bytes([0xCD; 16]),
+        );
+        let r = backdated_proof.bind(&ctx, &sample_resource_id()).await;
+        assert!(matches!(r, Err(BindError::Expired)));
+        assert_eq!(fixture.user.captured().len(), 0);
+    }
+
+    /// §4.3 stage 2 — BlockConsultation: bind against a blocked
+    /// requester→owner pair returns DeniedAtPipeline at the
+    /// BlockConsultation stage with a Blocked DenialReason.
+    /// Forensic-ordering: failure surfaces at BlockConsultation,
+    /// not at Predicate.
+    #[tokio::test]
+    async fn bind_denied_at_block_consultation_when_oracle_returns_blocked() {
+        let fixture = BindFixture::with_block_state(BlockState::Mutual);
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+
+        let r = proof.bind(&ctx, &sample_resource_id()).await;
+        let Err(err) = r else {
+            panic!("expected Err, got Ok");
+        };
+        match err {
+            BindError::DeniedAtPipeline { stage, reason } => {
+                assert_eq!(stage, PipelineStage::BlockConsultation);
+                match reason {
+                    DenialReason::Blocked { query, state } => {
+                        assert_eq!(query, BlockOracleQuery::RequesterVsResourceOwner);
+                        assert!(matches!(state, BlockState::Mutual));
+                    }
+                    other => panic!("expected Blocked, got {other:?}"),
+                }
+            }
+            other => panic!("expected DeniedAtPipeline(BlockConsultation), got {other:?}"),
+        }
+
+        // Audit emit fires the denial event (CapabilityIssuanceDenied),
+        // not the success event.
+        let captured = fixture.user.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            UserAuditEvent::CapabilityIssuanceDenied { reason, .. } => {
+                assert!(matches!(reason, DenialReason::Blocked { .. }));
+            }
+            other => panic!("expected CapabilityIssuanceDenied, got {other:?}"),
+        }
+    }
+
+    /// §4.3 reborrow: a BoundUserProof inside MAX_AGE re-derives a
+    /// silent ProofRef. No audit emit on success (the original bind
+    /// already emitted the terminal event).
+    #[tokio::test]
+    async fn reborrow_succeeds_within_max_age() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+
+        let bound = match proof.bind(&ctx, &sample_resource_id()).await {
+            Ok(b) => b,
+            Err(_) => panic!("bind prerequisite failed"),
+        };
+        let captured_after_bind = fixture.user.captured().len();
+
+        let r = bound.reborrow(&ctx).await;
+        assert!(r.is_ok(), "reborrow within MAX_AGE should succeed");
+        assert_eq!(
+            fixture.user.captured().len(),
+            captured_after_bind,
+            "successful reborrow is silent (no audit emit)"
+        );
+    }
+
+    /// §4.3 reborrow: a BoundUserProof past MAX_AGE returns
+    /// Expired and emits a ReborrowFailed audit event (composite-
+    /// audit single-emit).
+    #[tokio::test]
+    async fn reborrow_returns_expired_past_max_age_and_emits_event() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+
+        // Construct a backdated bound proof directly (test-only).
+        // ParticipatePrivate has MAX_AGE = 60s; backdate 100s.
+        let backdated = UserProof::<ParticipatePrivate>::new_internal(
+            sample_did(),
+            sample_resource_id(),
+            Instant::now() - Duration::from_secs(100),
+            AuthorityId::from_bytes([0u8; 16]),
+            TraceId::from_bytes([0xCD; 16]),
+        );
+        let bound = BoundUserProof {
+            proof: backdated,
+            _life: PhantomData,
+        };
+
+        let r = bound.reborrow(&ctx).await;
+        assert!(matches!(r, Err(BindFailureReason::Expired)));
+
+        let captured = fixture.user.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            UserAuditEvent::ReborrowFailed { reason, .. } => {
+                assert!(matches!(reason, BindFailureReason::Expired));
+            }
+            other => panic!("expected ReborrowFailed, got {other:?}"),
+        }
+    }
+
+    /// §4.3 reborrow discipline: reborrow does NOT re-consult
+    /// oracles. Block the subject AFTER bind succeeds — reborrow
+    /// within MAX_AGE still succeeds because oracles aren't
+    /// re-consulted. This pins that operators wanting fresh policy
+    /// checks must call bind again on a fresh proof.
+    #[tokio::test]
+    async fn reborrow_does_not_re_consult_oracles() {
+        // Bind under clean state
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+        let bound = match proof.bind(&ctx, &sample_resource_id()).await {
+            Ok(b) => b,
+            Err(_) => panic!("bind prerequisite failed"),
+        };
+
+        // After bind, operator "blocks" the subject by swapping the
+        // oracle. Build a fresh fixture with a Mutual block state.
+        let blocked_fixture = BindFixture::with_block_state(BlockState::Mutual);
+        let blocked_ctx = blocked_fixture.build_ctx(Requester::Did(sample_did()));
+
+        // Reborrow with the now-blocked context — should still
+        // succeed because reborrow doesn't re-check oracles.
+        let r = bound.reborrow(&blocked_ctx).await;
+        assert!(
+            r.is_ok(),
+            "reborrow within MAX_AGE succeeds even with blocked oracle (oracles not re-consulted)"
+        );
+    }
+
+    // Pin a class-discriminator constant so 7e/7f code that
+    // dispatches on CapabilityClass for user-class bind has a
+    // compile-time anchor. (Cheap, prevents a future variant
+    // rename from silently breaking the bind dispatch.)
+    #[test]
+    fn user_class_discriminator_pinned() {
+        assert_eq!(
+            CapabilityKind::ViewPrivate.class(),
+            CapabilityClass::User
+        );
     }
 }
