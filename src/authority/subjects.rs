@@ -21,6 +21,40 @@ use crate::identity::SessionId;
 use crate::proto::{AtUri, Did, Nsid, Rkey};
 use crate::sealed;
 
+// ============================================================
+// HasResourceLocation — sealed trait for subjects carrying an
+// (owner DID, lexicon NSID) pair (§4.3 / §4.4).
+// ============================================================
+
+/// Subjects whose representation includes a resource location
+/// (owner [`Did`] + lexicon [`Nsid`]). Implemented by user-class
+/// subjects and the inner [`ResourceId`]-bearing moderation
+/// subject; not implemented for channel- / substrate-class
+/// subjects (which carry no NSID at all).
+///
+/// Sealed: only crate-ship subject types implement it. The trait
+/// powers two §4.3 bind-time concerns:
+///
+/// 1. **Stage 0 — lexicon-deprecation gate.** The bind path
+///    extracts the NSID via [`Self::resource_nsid`] and consults
+///    [`crate::KRYPHOCRON_LEXICON_REGISTRY`] (§5.6).
+/// 2. **Audit-event construction.** Bind emits
+///    [`crate::audit::UserAuditEvent::CapabilityBound`] /
+///    [`crate::audit::ModerationAuditEvent::ModeratorInspected`]
+///    et al. with `subject_repr` /
+///    `target_repr: TargetRepresentation::structural_only(StructuralRepresentation::Resource { did, nsid })`,
+///    which needs both pieces.
+///
+/// **Sealed** via the crate-private [`crate::sealed::Sealed`]
+/// supertrait — external types cannot impl this trait.
+pub trait HasResourceLocation: sealed::Sealed {
+    /// Borrow the owner DID of the resource this subject names.
+    fn resource_did(&self) -> &Did;
+    /// Borrow the lexicon NSID of the resource this subject
+    /// names.
+    fn resource_nsid(&self) -> &Nsid;
+}
+
 /// Parsed, canonicalized record reference (§4.4).
 ///
 /// Fields are private; construction validates per-component
@@ -80,6 +114,16 @@ impl ResourceId {
     #[must_use]
     pub fn rkey(&self) -> &Rkey {
         &self.rkey
+    }
+}
+
+impl sealed::Sealed for ResourceId {}
+impl HasResourceLocation for ResourceId {
+    fn resource_did(&self) -> &Did {
+        &self.did
+    }
+    fn resource_nsid(&self) -> &Nsid {
+        &self.nsid
     }
 }
 
@@ -274,6 +318,16 @@ pub struct ManageAudienceSubject {
     pub audience_list: AudienceListId,
 }
 
+impl sealed::Sealed for ManageAudienceSubject {}
+impl HasResourceLocation for ManageAudienceSubject {
+    fn resource_did(&self) -> &Did {
+        self.resource.did()
+    }
+    fn resource_nsid(&self) -> &Nsid {
+        self.resource.nsid()
+    }
+}
+
 /// Composite moderation-class subject (§4.3).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModerationSubject {
@@ -282,6 +336,16 @@ pub struct ModerationSubject {
     pub resource: ResourceId,
     /// Moderation case id.
     pub case: ModerationCaseId,
+}
+
+impl sealed::Sealed for ModerationSubject {}
+impl HasResourceLocation for ModerationSubject {
+    fn resource_did(&self) -> &Did {
+        self.resource.did()
+    }
+    fn resource_nsid(&self) -> &Nsid {
+        self.resource.nsid()
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +370,41 @@ mod tests {
             ShardRange::new(hi, lo),
             Err(ScopeError::EmptyOrInvertedRange)
         ));
+    }
+
+    /// §4.3 / §4.4 (Phase 7d): subjects with a resource location
+    /// expose `did + nsid` via the sealed `HasResourceLocation`
+    /// trait. ResourceId returns its own fields; ManageAudienceSubject
+    /// and ModerationSubject forward to their inner ResourceId.
+    #[test]
+    fn has_resource_location_returns_did_and_nsid_for_all_three_impls() {
+        let did = Did::new("did:plc:phase7dtest").unwrap();
+        let nsid = Nsid::new("tools.kryphocron.feed.postPrivate").unwrap();
+        let rkey = Rkey::new("3jzfcijpj2z2a").unwrap();
+        let resource = ResourceId::new(did.clone(), nsid.clone(), rkey);
+
+        // ResourceId: direct
+        assert_eq!(resource.resource_did(), &did);
+        assert_eq!(resource.resource_nsid(), &nsid);
+
+        // ManageAudienceSubject: forwards to inner resource
+        let mas = ManageAudienceSubject {
+            resource: resource.clone(),
+            audience_list: AudienceListId::new(
+                AtUri::new("at://did:plc:x/tools.kryphocron.policy.audience/3jzfcijpj2z2a")
+                    .unwrap(),
+            ),
+        };
+        assert_eq!(mas.resource_did(), &did);
+        assert_eq!(mas.resource_nsid(), &nsid);
+
+        // ModerationSubject: forwards to inner resource
+        let mod_subj = ModerationSubject {
+            resource: resource.clone(),
+            case: ModerationCaseId::from_bytes([0u8; 16]),
+        };
+        assert_eq!(mod_subj.resource_did(), &did);
+        assert_eq!(mod_subj.resource_nsid(), &nsid);
     }
 
     #[test]

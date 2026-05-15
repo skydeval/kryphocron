@@ -43,9 +43,9 @@ pub use self::proof::{
     SubstrateProof, SubstrateProofRef, UserProof, UserProofRef,
 };
 pub use self::subjects::{
-    AudienceListId, ChannelBinding, ManageAudienceSubject, ModerationCaseId,
-    ModerationSubject, RecordStateFilter, ResourceId, ScopeError, ScopeSelector, ShardId,
-    ShardRange, TimeWindow,
+    AudienceListId, ChannelBinding, HasResourceLocation, ManageAudienceSubject,
+    ModerationCaseId, ModerationSubject, RecordStateFilter, ResourceId, ScopeError,
+    ScopeSelector, ShardId, ShardRange, TimeWindow,
 };
 pub use self::v1::{
     AppViewSync, DeletePrivatePost, DeletePrivatePostOracleResults, EditPrivatePost,
@@ -324,6 +324,80 @@ fn stage1_extract_requester_did(
             found: other.kind(),
         }),
     }
+}
+
+/// §4.3 stage 0 / §5.6: consult the
+/// [`crate::KRYPHOCRON_LEXICON_REGISTRY`] for `nsid`'s
+/// deprecation status, returning the matching
+/// [`DenialReason::CapabilityDeprecated`] when the lexicon is
+/// outright deprecated, `Ok(())` when active or inside an
+/// operator-configured grace window.
+///
+/// `now_unix_seconds` is supplied by the caller (typically
+/// `SystemTime::now()`'s seconds-since-epoch); pulling it out of
+/// the helper keeps the function deterministic for tests.
+///
+/// NSIDs not present in the registry pass — the closed-namespace
+/// registry is authoritative for v1 lexicons; non-v1 NSIDs aren't
+/// gated by §5.6 and surface as predicate-stage failures via the
+/// capability's own logic.
+//
+// Phase 7d C1 ships the gate; consumers (UserProof::bind,
+// ModerationProof::bind) land in C4 / C7 and remove this allow.
+#[allow(dead_code)]
+pub(crate) fn check_stage_0_deprecation(
+    nsid: &crate::proto::Nsid,
+    now_unix_seconds: i64,
+) -> Result<(), DenialReason> {
+    use kryphocron_lexicons::DeprecationState;
+    for entry in crate::KRYPHOCRON_LEXICON_REGISTRY {
+        if entry.nsid == nsid.as_str() {
+            return match entry.deprecation {
+                DeprecationState::Active => Ok(()),
+                DeprecationState::Deprecated {
+                    since_version,
+                    successor,
+                } => Err(DenialReason::CapabilityDeprecated {
+                    nsid: entry.nsid,
+                    since_version,
+                    successor,
+                }),
+                DeprecationState::DeprecatedWithGrace {
+                    since_version,
+                    grace_until_unix_seconds,
+                    successor,
+                } => {
+                    if now_unix_seconds > grace_until_unix_seconds {
+                        Err(DenialReason::CapabilityDeprecated {
+                            nsid: entry.nsid,
+                            since_version,
+                            successor,
+                        })
+                    } else {
+                        // Inside the grace window: bind proceeds.
+                        // Operators wanting an audit signal during
+                        // grace install a `DeprecatedWriteDuringGrace`
+                        // emission on top of bind's own audit emit
+                        // (Phase 7d ships the gate; the grace-window
+                        // audit shim is a v0.2 chainlink).
+                        Ok(())
+                    }
+                }
+                // DeprecationState is #[non_exhaustive] from the
+                // lexicon crate. Future variants fail closed at
+                // bind: an unknown deprecation state shouldn't be
+                // bypassed silently. Reachable only after a
+                // lexicon-crate version bump that adds a variant
+                // without bumping the kryphocron-side handling.
+                _ => Err(DenialReason::CapabilityDeprecated {
+                    nsid: entry.nsid,
+                    since_version: kryphocron_lexicons::SemVer::new(0, 0, 0),
+                    successor: None,
+                }),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Process-static [`AuthorityId`] (§4.3).
@@ -867,5 +941,30 @@ mod tests {
         let a = process_authority_id();
         let b = process_authority_id();
         assert_eq!(a, b, "process_authority_id must be process-static");
+    }
+
+    // ========================================================
+    // Phase 7d §4.3 stage 0 deprecation-gate tests.
+    // ========================================================
+
+    /// §4.3 stage 0 (§5.6): an Active lexicon NSID passes the
+    /// gate. `tools.kryphocron.feed.postPrivate` is in the v1
+    /// registry as Active.
+    #[test]
+    fn stage_0_active_lexicon_passes() {
+        let nsid = Nsid::new("tools.kryphocron.feed.postPrivate").unwrap();
+        let r = check_stage_0_deprecation(&nsid, 0);
+        assert!(matches!(r, Ok(())));
+    }
+
+    /// §4.3 stage 0: an NSID outside the closed-namespace registry
+    /// passes — the registry is authoritative for v1 lexicons; non-
+    /// v1 NSIDs aren't gated by §5.6 (they're caught earlier in
+    /// the type system or surface as predicate-stage failures).
+    #[test]
+    fn stage_0_unknown_nsid_passes() {
+        let nsid = Nsid::new("com.example.unknown").unwrap();
+        let r = check_stage_0_deprecation(&nsid, 0);
+        assert!(matches!(r, Ok(())));
     }
 }

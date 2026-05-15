@@ -67,6 +67,21 @@ pub enum DenialReason {
         /// The specific verification failure.
         reason: ReceiptVerificationFailure,
     },
+    /// §4.3 stage 0 / §5.6: bind attempted against a deprecated
+    /// lexicon. Mirrors the issuance-side
+    /// [`AuthDenial::WriteToDeprecatedLexicon`] payload — the
+    /// bind path surfaces the same forensic detail (deprecated
+    /// NSID, deprecation version, successor if committed) via
+    /// the [`BindError::DeniedAtPipeline`] /
+    /// [`BindOutcomeRepr::DeniedAtPipeline`] envelope.
+    CapabilityDeprecated {
+        /// The deprecated NSID the bind targeted.
+        nsid: &'static str,
+        /// Lexicon-set version the deprecation landed in.
+        since_version: SemVer,
+        /// Successor NSID, if one is committed.
+        successor: Option<&'static str>,
+    },
 }
 
 /// Pipeline stage where a binding was denied (§4.3).
@@ -163,6 +178,20 @@ pub enum BindError {
         failing_hop: u8,
         /// Specific verification failure.
         reason: ReceiptVerificationFailure,
+    },
+    /// §4.3 stage failure: a §4.3 bind pipeline stage produced a
+    /// structured denial.
+    ///
+    /// `stage` names which stage denied (DeprecationGate,
+    /// BlockConsultation, AudienceConsultation, Predicate, etc.)
+    /// and `reason` carries the per-stage diagnostic. Mirrors the
+    /// audit-side rendering [`BindOutcomeRepr::DeniedAtPipeline`].
+    #[error("bind denied at {stage:?}: {reason:?}")]
+    DeniedAtPipeline {
+        /// Stage that denied.
+        stage: PipelineStage,
+        /// Reason carried by the stage.
+        reason: DenialReason,
     },
 }
 
@@ -388,6 +417,54 @@ mod tests {
                 assert_eq!(found, RequesterKind::Anonymous);
             }
             other => panic!("expected RequesterLacksAuthority, got {other:?}"),
+        }
+    }
+
+    /// §4.3 stage 0 (Phase 7d): `DenialReason::CapabilityDeprecated`
+    /// carries nsid + since_version + successor. Pin the variant
+    /// shape so future refactors don't silently drop forensic
+    /// detail.
+    #[test]
+    fn capability_deprecated_carries_nsid_version_and_successor() {
+        let r = DenialReason::CapabilityDeprecated {
+            nsid: "tools.kryphocron.feed.postOld",
+            since_version: SemVer::new(1, 0, 0),
+            successor: Some("tools.kryphocron.feed.postPrivate"),
+        };
+        match r {
+            DenialReason::CapabilityDeprecated {
+                nsid,
+                since_version,
+                successor,
+            } => {
+                assert_eq!(nsid, "tools.kryphocron.feed.postOld");
+                assert_eq!(since_version, SemVer::new(1, 0, 0));
+                assert_eq!(successor, Some("tools.kryphocron.feed.postPrivate"));
+            }
+            other => panic!("expected CapabilityDeprecated, got {other:?}"),
+        }
+    }
+
+    /// §4.3 (Phase 7d): `BindError::DeniedAtPipeline { stage,
+    /// reason }` mirrors `BindOutcomeRepr::DeniedAtPipeline`. Pin
+    /// constructibility so the bind path's primary denial channel
+    /// is part of Phase 7d's surface.
+    #[test]
+    fn bind_error_denied_at_pipeline_constructible() {
+        let e = BindError::DeniedAtPipeline {
+            stage: PipelineStage::DeprecationGate,
+            reason: DenialReason::CapabilityDeprecated {
+                nsid: "tools.kryphocron.feed.postOld",
+                since_version: SemVer::new(1, 0, 0),
+                successor: None,
+            },
+        };
+        match e {
+            BindError::DeniedAtPipeline { stage, reason } => {
+                assert_eq!(stage, PipelineStage::DeprecationGate);
+                assert!(matches!(reason, DenialReason::CapabilityDeprecated { .. }));
+            }
+            other => panic!("expected DeniedAtPipeline, got {other:?}"),
         }
     }
 }
