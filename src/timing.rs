@@ -4,19 +4,27 @@
 
 //! §4.6 timing equalization.
 //!
-//! [`equalize_timing`] wraps an async future and ensures the
-//! outer observed latency is at least `target` regardless of the
-//! future's actual duration. The companion helper
-//! [`equalize_timing_target_for`] computes the target from a
-//! capability's declared oracle consultations.
+//! [`equalize_timing`] absorbs per-query latency variance across
+//! the §4.3 bind pipeline by sleeping until at least a deployment-
+//! configured `target` Duration has elapsed since the operation's
+//! `start`. The companion helper [`equalize_timing_target_for`]
+//! computes the target from a capability's declared oracle
+//! consultations (sums per-oracle worst-case latencies plus
+//! [`BASE_AUTHORIZATION_OVERHEAD`] and [`SAFETY_MARGIN`]).
 //!
-//! ## Phase 1 status
+//! Together the two functions implement the §4.6 timing-channel
+//! defense: an attacker observing the latency of a substrate
+//! operation can sometimes infer secrets about the data or the
+//! bind decision. Equalizing observed latency to a fixed floor
+//! makes those inferences harder — attackers can still tell that
+//! an operation took ≥ target, but can't distinguish fast-path
+//! from slow-path decisions within the target window.
 //!
-//! [`equalize_timing`] is a **stub** in Phase 1. The shape is
-//! committed (signature, constants, calibration helper) so
-//! downstream code can wire against it; the actual `pin`-and-
-//! `await`-until-deadline implementation lands in Phase 4 once
-//! the substrate has a chosen `Future`/`Sleep` discipline.
+//! §4.6 explicitly defers full constant-time discipline
+//! (randomized jitter, hardened timing primitives) to v2+; v0.1
+//! ships the equalization primitive and the calibration helper,
+//! and assumes operators provide a target that fits their
+//! deployment's threat model.
 
 use std::time::{Duration, Instant};
 
