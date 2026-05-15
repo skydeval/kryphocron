@@ -11,6 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Phase 4d: behavioral test for trace_id propagation through DidResolver audit emit (#47)
+- Phase 4d: 8 of 12 SyncHandshakeVerificationError variants lack dedicated tests (#46)
+- federation time-window narrowing: verifier vs caller responsibility (#45)
+- ingress §4.2 chain-rehydration discipline: from_xrpc_request + from_service_request + AttributionChain rebuild (#43)
+- `CapabilityClaim::new_delegated` for `ClaimOrigin::DelegatedFromUpstream` lands in Phase 4e (#33)
+- Crate-level `#![allow(dead_code)]` (#11)
 - `DefaultDidResolver` audit-emit uses placeholder `TraceId::from_bytes([0u8; 16])` for `DidDocumentRotated` / `DidDocumentInvalidated` (#41)
 - Capability-claim signing-key resolution: exact-match-only in 4b; rotation-history walking lands in Phase 4c (#35)
 - Phase 4 orientation document referenced in 4a kickoff is missing from the repo (#30)
