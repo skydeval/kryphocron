@@ -599,4 +599,482 @@ mod tests {
     fn tracker_shards_pinned_at_16() {
         assert_eq!(TRACKER_SHARDS, 16);
     }
+
+    // ============================================================
+    // §4.9 composite_audit / emit_rollback_marker tests.
+    // ============================================================
+
+    use crate::audit::bounded_string::BoundedString;
+    use crate::audit::events::{
+        ChannelAuditEvent, FallbackAuditEvent, ModerationAuditEvent, ModeratorRationale,
+        SubstrateAuditEvent, UserAuditEvent, MAX_RATIONALE_LEN,
+    };
+    use crate::audit::sinks::{
+        ChannelAuditSink, FallbackAuditSink, ModerationAuditSink, SubstrateAuditSink,
+        UserAuditSink,
+    };
+    use crate::authority::predicate::BindOutcomeRepr;
+    use crate::authority::ModerationCaseId;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex as StdMutex;
+
+    /// Mock per-class sink that captures every event recorded
+    /// and optionally fails on the Nth call.
+    struct MockSink<E: Clone + Send + Sync + 'static> {
+        captured: StdMutex<Vec<E>>,
+        call_count: AtomicUsize,
+        /// 1-indexed: Some(N) → fail on the Nth call. None → never fail.
+        fail_on_call: Option<usize>,
+    }
+
+    impl<E: Clone + Send + Sync + 'static> MockSink<E> {
+        fn new(fail_on_call: Option<usize>) -> Self {
+            MockSink {
+                captured: StdMutex::new(Vec::new()),
+                call_count: AtomicUsize::new(0),
+                fail_on_call,
+            }
+        }
+        fn captured(&self) -> Vec<E> {
+            self.captured.lock().unwrap().clone()
+        }
+        fn record_inner(&self, event: E) -> Result<(), AuditError> {
+            let n = self.call_count.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if Some(n) == self.fail_on_call {
+                return Err(AuditError::Unavailable);
+            }
+            self.captured.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    impl UserAuditSink for MockSink<UserAuditEvent> {
+        fn record(&self, event: UserAuditEvent) -> Result<(), AuditError> {
+            self.record_inner(event)
+        }
+    }
+    impl ChannelAuditSink for MockSink<ChannelAuditEvent> {
+        fn record(&self, event: ChannelAuditEvent) -> Result<(), AuditError> {
+            self.record_inner(event)
+        }
+    }
+    impl SubstrateAuditSink for MockSink<SubstrateAuditEvent> {
+        fn record(&self, event: SubstrateAuditEvent) -> Result<(), AuditError> {
+            self.record_inner(event)
+        }
+    }
+    impl ModerationAuditSink for MockSink<ModerationAuditEvent> {
+        fn record(&self, event: ModerationAuditEvent) -> Result<(), AuditError> {
+            self.record_inner(event)
+        }
+    }
+
+    /// Captured composite-failure-call shape.
+    type FallbackCapture = (TraceId, CompositeOpId, Vec<SinkKind>, Vec<SinkKind>);
+
+    /// Mock fallback sink. Captures `record_composite_failure`
+    /// calls; optionally panics on call (for the
+    /// InconsistencyUnrecoverable test).
+    struct MockFallback {
+        captured: StdMutex<Vec<FallbackCapture>>,
+        panic_on_call: bool,
+    }
+
+    impl MockFallback {
+        fn new(panic_on_call: bool) -> Self {
+            MockFallback {
+                captured: StdMutex::new(Vec::new()),
+                panic_on_call,
+            }
+        }
+        fn captured_count(&self) -> usize {
+            self.captured.lock().unwrap().len()
+        }
+    }
+
+    impl FallbackAuditSink for MockFallback {
+        fn record_panic(
+            &self,
+            _sink: SinkKind,
+            _trace_id: TraceId,
+            _capability: crate::authority::capability::CapabilityKind,
+            _at: std::time::SystemTime,
+        ) {
+        }
+        fn record_composite_failure(
+            &self,
+            trace_id: TraceId,
+            composite_op_id: CompositeOpId,
+            sinks_committed: &[SinkKind],
+            sinks_failed: &[SinkKind],
+            _at: std::time::SystemTime,
+        ) {
+            if self.panic_on_call {
+                panic!("MockFallback configured to panic on record_composite_failure");
+            }
+            self.captured.lock().unwrap().push((
+                trace_id,
+                composite_op_id,
+                sinks_committed.to_vec(),
+                sinks_failed.to_vec(),
+            ));
+        }
+        fn record_event(&self, _event: FallbackAuditEvent) {}
+    }
+
+    fn sample_did() -> crate::proto::Did {
+        crate::proto::Did::new("did:plc:phase7btest").unwrap()
+    }
+
+    fn sample_target_repr() -> crate::target::TargetRepresentation {
+        crate::target::TargetRepresentation::structural_only(
+            crate::target::StructuralRepresentation::Resource {
+                did: sample_did(),
+                nsid: crate::Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+            },
+        )
+    }
+
+    fn sample_service_identity() -> crate::identity::ServiceIdentity {
+        crate::identity::ServiceIdentity::new_internal(
+            sample_did(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    fn sample_user_event() -> UserAuditEvent {
+        UserAuditEvent::CapabilityBound {
+            trace_id: TraceId::from_bytes([0xA1; 16]),
+            requester: sample_did(),
+            subject_repr: sample_target_repr(),
+            capability: crate::authority::capability::CapabilityKind::ViewPrivate,
+            outcome: BindOutcomeRepr::Success,
+            attribution: crate::ingress::AttributionChain::empty(),
+            at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn sample_channel_event() -> ChannelAuditEvent {
+        ChannelAuditEvent::ChannelClosed {
+            trace_id: TraceId::from_bytes([0xC1; 16]),
+            peer: sample_service_identity(),
+            session_digest: crate::identity::SessionDigest::from_bytes([0u8; 32]),
+            cause: crate::audit::events::ChannelCloseCause::CleanClose,
+            at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn sample_substrate_event() -> SubstrateAuditEvent {
+        SubstrateAuditEvent::ScopeBound {
+            trace_id: TraceId::from_bytes([0x51; 16]),
+            service: sample_service_identity(),
+            scope_repr: sample_target_repr(),
+            capability: crate::authority::capability::CapabilityKind::ScanShard,
+            outcome: BindOutcomeRepr::Success,
+            at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn sample_moderation_event() -> ModerationAuditEvent {
+        ModerationAuditEvent::ModeratorInspected {
+            trace_id: TraceId::from_bytes([0xD1; 16]),
+            moderator: sample_did(),
+            case: ModerationCaseId::from_bytes([0u8; 16]),
+            target_repr: sample_target_repr(),
+            rationale: ModeratorRationale::Declared(
+                BoundedString::<MAX_RATIONALE_LEN>::new("test").unwrap(),
+            ),
+            at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// Operator-side error type that embeds CompositeAuditError
+    /// via #[from]. Mirrors the rustdoc'd pattern.
+    #[derive(Debug)]
+    enum TestError {
+        Composite(CompositeAuditError),
+        OpSpecific(&'static str),
+    }
+    impl From<CompositeAuditError> for TestError {
+        fn from(e: CompositeAuditError) -> Self {
+            TestError::Composite(e)
+        }
+    }
+
+    fn build_sinks<'a>(
+        user: &'a MockSink<UserAuditEvent>,
+        channel: &'a MockSink<ChannelAuditEvent>,
+        substrate: &'a MockSink<SubstrateAuditEvent>,
+        moderation: &'a MockSink<ModerationAuditEvent>,
+        fallback: &'a MockFallback,
+    ) -> crate::ingress::AuditSinks<'a> {
+        crate::ingress::AuditSinks {
+            user,
+            channel,
+            substrate,
+            moderation,
+            fallback,
+        }
+    }
+
+    /// Scenario 1 — happy path: op returns Ok, all sinks
+    /// commit cleanly, no rollback marker fires.
+    #[tokio::test]
+    async fn happy_path_commits_all_queued_events() {
+        let user = MockSink::<UserAuditEvent>::new(None);
+        let channel = MockSink::<ChannelAuditEvent>::new(None);
+        let substrate = MockSink::<SubstrateAuditEvent>::new(None);
+        let moderation = MockSink::<ModerationAuditEvent>::new(None);
+        let fallback = MockFallback::new(false);
+        let sinks = build_sinks(&user, &channel, &substrate, &moderation, &fallback);
+
+        let result: Result<u32, TestError> = composite_audit(
+            TraceId::from_bytes([0xFF; 16]),
+            &sinks,
+            async |scope| {
+                scope.emit_user(sample_user_event());
+                scope.emit_channel(sample_channel_event());
+                scope.emit_substrate(sample_substrate_event());
+                scope.emit_moderation(sample_moderation_event());
+                Ok(42)
+            },
+        )
+        .await;
+        assert!(matches!(result, Ok(42)));
+        assert_eq!(user.captured().len(), 1);
+        assert_eq!(channel.captured().len(), 1);
+        assert_eq!(substrate.captured().len(), 1);
+        assert_eq!(moderation.captured().len(), 1);
+        assert_eq!(fallback.captured_count(), 0);
+    }
+
+    /// Scenario 2 — op returns Err before any emit: queued
+    /// events dropped, no sink touched, error returned
+    /// unchanged.
+    #[tokio::test]
+    async fn op_failure_returns_op_error_unchanged_no_emit() {
+        let user = MockSink::<UserAuditEvent>::new(None);
+        let channel = MockSink::<ChannelAuditEvent>::new(None);
+        let substrate = MockSink::<SubstrateAuditEvent>::new(None);
+        let moderation = MockSink::<ModerationAuditEvent>::new(None);
+        let fallback = MockFallback::new(false);
+        let sinks = build_sinks(&user, &channel, &substrate, &moderation, &fallback);
+
+        let result: Result<u32, TestError> = composite_audit(
+            TraceId::from_bytes([0; 16]),
+            &sinks,
+            async |scope| {
+                scope.emit_user(sample_user_event());
+                Err(TestError::OpSpecific("op rejected"))
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(TestError::OpSpecific("op rejected"))));
+        assert!(user.captured().is_empty());
+        assert!(channel.captured().is_empty());
+        assert_eq!(fallback.captured_count(), 0);
+    }
+
+    /// Scenario 3 — single-class commit then sibling failure:
+    /// op queues user + channel. After op returns Ok, user
+    /// commits cleanly; channel commit fails. Rollback marker
+    /// fires to user sink.
+    #[tokio::test]
+    async fn channel_commit_failure_rolls_back_user() {
+        let user = MockSink::<UserAuditEvent>::new(None);
+        // Channel fails on its first call (the operator's event,
+        // before any rollback marker would have a chance to fire).
+        let channel = MockSink::<ChannelAuditEvent>::new(Some(1));
+        let substrate = MockSink::<SubstrateAuditEvent>::new(None);
+        let moderation = MockSink::<ModerationAuditEvent>::new(None);
+        let fallback = MockFallback::new(false);
+        let sinks = build_sinks(&user, &channel, &substrate, &moderation, &fallback);
+
+        let result: Result<(), TestError> = composite_audit(
+            TraceId::from_bytes([0x33; 16]),
+            &sinks,
+            async |scope| {
+                scope.emit_user(sample_user_event());
+                scope.emit_channel(sample_channel_event());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(TestError::Composite(CompositeAuditError::SinkCommitFailed {
+                class: SinkKind::Channel,
+                ..
+            }))
+        ));
+        // User sink received the operator's event AND the
+        // rollback marker.
+        let user_events = user.captured();
+        assert_eq!(user_events.len(), 2, "user sink should have op event + rollback marker");
+        assert!(matches!(
+            user_events[1],
+            UserAuditEvent::CompositeRollbackMarker { failing_sink: SinkKind::Channel, .. }
+        ));
+        assert_eq!(fallback.captured_count(), 0);
+    }
+
+    /// Scenario 4 — multi-class success then last-class
+    /// failure. Per COMMIT_PRIORITY_ORDER the channel sink
+    /// commits LAST; making it fail leaves substrate +
+    /// moderation + user already committed. All three get
+    /// rollback markers in reverse order (user → moderation →
+    /// substrate).
+    #[tokio::test]
+    async fn channel_failure_after_three_commits_rolls_back_three() {
+        let user = MockSink::<UserAuditEvent>::new(None);
+        let channel = MockSink::<ChannelAuditEvent>::new(Some(1));
+        let substrate = MockSink::<SubstrateAuditEvent>::new(None);
+        let moderation = MockSink::<ModerationAuditEvent>::new(None);
+        let fallback = MockFallback::new(false);
+        let sinks = build_sinks(&user, &channel, &substrate, &moderation, &fallback);
+
+        let result: Result<(), TestError> = composite_audit(
+            TraceId::from_bytes([0x44; 16]),
+            &sinks,
+            async |scope| {
+                scope.emit_user(sample_user_event());
+                scope.emit_channel(sample_channel_event());
+                scope.emit_substrate(sample_substrate_event());
+                scope.emit_moderation(sample_moderation_event());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(TestError::Composite(CompositeAuditError::SinkCommitFailed {
+                class: SinkKind::Channel,
+                ..
+            }))
+        ));
+        // Each pre-channel sink got the op event + a rollback
+        // marker.
+        assert_eq!(user.captured().len(), 2);
+        assert_eq!(substrate.captured().len(), 2);
+        assert_eq!(moderation.captured().len(), 2);
+        // Channel only saw its one (failing) op-event call.
+        assert_eq!(channel.captured().len(), 0); // failed, not captured
+        assert_eq!(fallback.captured_count(), 0);
+    }
+
+    /// Scenario 5 — rollback dispatch itself fails.
+    /// Channel commit fails AND the user-sink's rollback
+    /// marker dispatch fails. Escalation to fallback sink
+    /// fires (record_composite_failure called).
+    #[tokio::test]
+    async fn rollback_dispatch_failure_escalates_to_fallback() {
+        // User: succeeds on the op event (call 1) but fails on
+        // the rollback marker (call 2).
+        let user = MockSink::<UserAuditEvent>::new(Some(2));
+        // Channel: fails on its op event (call 1) → triggers rollback.
+        let channel = MockSink::<ChannelAuditEvent>::new(Some(1));
+        let substrate = MockSink::<SubstrateAuditEvent>::new(None);
+        let moderation = MockSink::<ModerationAuditEvent>::new(None);
+        let fallback = MockFallback::new(false);
+        let sinks = build_sinks(&user, &channel, &substrate, &moderation, &fallback);
+
+        let result: Result<(), TestError> = composite_audit(
+            TraceId::from_bytes([0x55; 16]),
+            &sinks,
+            async |scope| {
+                scope.emit_user(sample_user_event());
+                scope.emit_channel(sample_channel_event());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(TestError::Composite(CompositeAuditError::RollbackDispatchFailed {
+                class: SinkKind::User,
+                ..
+            }))
+        ));
+        // Fallback fired exactly once.
+        assert_eq!(fallback.captured_count(), 1);
+    }
+
+    /// Scenario 6 — both rollback AND escalation fail. Channel
+    /// commit fails → user rollback fails → fallback panics.
+    /// Returns InconsistencyUnrecoverable; no panic propagates.
+    #[tokio::test]
+    async fn fallback_panic_returns_inconsistency_unrecoverable() {
+        let user = MockSink::<UserAuditEvent>::new(Some(2));
+        let channel = MockSink::<ChannelAuditEvent>::new(Some(1));
+        let substrate = MockSink::<SubstrateAuditEvent>::new(None);
+        let moderation = MockSink::<ModerationAuditEvent>::new(None);
+        let fallback = MockFallback::new(true); // panic on call
+        let sinks = build_sinks(&user, &channel, &substrate, &moderation, &fallback);
+
+        let result: Result<(), TestError> = composite_audit(
+            TraceId::from_bytes([0x66; 16]),
+            &sinks,
+            async |scope| {
+                scope.emit_user(sample_user_event());
+                scope.emit_channel(sample_channel_event());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(TestError::Composite(CompositeAuditError::InconsistencyUnrecoverable))
+        ));
+    }
+
+    /// Scenario 7 — class-priority commit ordering.
+    /// Op queues channel + user + substrate + moderation in
+    /// that order. After commit, examining capture timestamps
+    /// (or just commit-call order via fail_on_call placement)
+    /// confirms substrate → moderation → user → channel order.
+    /// Approach: make user sink fail on call 1; expect
+    /// substrate + moderation already captured (committed before
+    /// user) but channel NOT captured (queued after user in
+    /// priority).
+    #[tokio::test]
+    async fn class_priority_ordering_substrate_first_channel_last() {
+        let user = MockSink::<UserAuditEvent>::new(Some(1));
+        let channel = MockSink::<ChannelAuditEvent>::new(None);
+        let substrate = MockSink::<SubstrateAuditEvent>::new(None);
+        let moderation = MockSink::<ModerationAuditEvent>::new(None);
+        let fallback = MockFallback::new(false);
+        let sinks = build_sinks(&user, &channel, &substrate, &moderation, &fallback);
+
+        let _result: Result<(), TestError> = composite_audit(
+            TraceId::from_bytes([0x77; 16]),
+            &sinks,
+            async |scope| {
+                // Emit in NON-priority order.
+                scope.emit_channel(sample_channel_event());
+                scope.emit_user(sample_user_event());
+                scope.emit_substrate(sample_substrate_event());
+                scope.emit_moderation(sample_moderation_event());
+                Ok(())
+            },
+        )
+        .await;
+        // User was 3rd in priority order (substrate=1,
+        // moderation=2, user=3, channel=4). Failing on user's
+        // call means substrate + moderation already committed,
+        // channel never reached.
+        assert_eq!(substrate.captured().len(), 2, "substrate: op event + rollback marker");
+        assert_eq!(moderation.captured().len(), 2, "moderation: op event + rollback marker");
+        // User failed on call 1 — captured nothing. Rollback
+        // markers do NOT fire to the failing sink (only to
+        // sinks that successfully committed before the failure).
+        assert_eq!(user.captured().len(), 0, "user: failed on op event; not in committed-set; no rollback marker");
+        // Channel never reached commit (queued last in priority
+        // and the loop short-circuits after the user failure).
+        assert_eq!(channel.captured().len(), 0, "channel queued last in priority order; not reached");
+    }
 }
