@@ -147,23 +147,45 @@ where
 
 /// Issue a substrate-class capability proof (§4.3).
 ///
-/// `SubstrateProof` issuance accepts only non-interactive
-/// service principals (§4.6 read-everything-authority
-/// discipline). Phase 4 enforces this; Phase 1 stubs.
+/// Substrate-class issuance accepts only non-interactive service
+/// principals (§4.6 read-everything-authority discipline).
 ///
-/// **Phase 1 stub.**
+/// Pipeline (Phase 7c v0.1):
+///
+/// - **Stage 1 — requester authority.** Substrate-class accepts
+///   [`Requester::Service`] only. [`Requester::Did`] and
+///   [`Requester::Anonymous`] both fail closed with
+///   [`AuthDenial::RequesterLacksAuthority`] — users cannot issue
+///   substrate capabilities under any circumstance.
+/// - **Stage 3 — proof construction.** Builds a
+///   [`SubstrateProof<S>`] with `issued_at = Instant::now()` and a
+///   process-static [`AuthorityId`].
+///
+/// Stage 0 does not apply (substrate subjects [`crate::ScopeSelector`]
+/// carry no NSID). Stage 2 (scope-vs-trust-declaration check)
+/// is the bind-time predicate's domain; the
+/// [`crate::ServiceTrustDeclaration`] surface that powers it
+/// lands as part of Phase 7d.
 ///
 /// # Errors
 ///
-/// Returns [`AuthDenial`] on denial.
+/// Returns [`AuthDenial::RequesterLacksAuthority`] for any
+/// non-Service requester.
 pub fn issue_substrate<S>(
-    _ctx: &AuthContext<'_>,
-    _target: <S as SubstrateScope>::Subject,
+    ctx: &AuthContext<'_>,
+    subject: <S as SubstrateScope>::Subject,
 ) -> Result<SubstrateProof<S>, AuthDenial>
 where
     S: SubstrateScope,
 {
-    unimplemented!("§4.3 authority::issue_substrate: Phase 4 wires the pipeline");
+    let requester = stage1_extract_requester_did(ctx, CapabilityClass::Substrate, false)?;
+    Ok(SubstrateProof::new_internal(
+        requester,
+        subject,
+        Instant::now(),
+        process_authority_id(),
+        ctx.trace_id(),
+    ))
 }
 
 /// Issue a moderation-class capability proof (§4.3).
