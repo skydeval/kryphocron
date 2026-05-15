@@ -69,6 +69,30 @@ pub struct AuthContext<'a> {
 // single bind path. See CHAINLINKS #7.
 
 impl<'a> AuthContext<'a> {
+    /// Crate-internal constructor. Reserved for the
+    /// [`crate::ingress`] entry-point functions
+    /// (`from_xrpc_request`, `from_service_request`,
+    /// `from_sync_channel_message`, `from_sync_channel_handshake`,
+    /// `anonymous_for_public_read`) that turn a verified-evidence
+    /// type into an [`AuthContext`].
+    #[must_use]
+    pub(crate) fn new_internal(
+        requester: Requester,
+        trace_id: TraceId,
+        audit: AuditSinks<'a>,
+        oracles: OracleSet<'a>,
+        attribution_chain: AttributionChain,
+    ) -> Self {
+        AuthContext {
+            requester,
+            trace_id,
+            audit,
+            oracles,
+            attribution_chain,
+            _no_clone: PhantomData,
+        }
+    }
+
     /// Borrow the requester identity.
     #[must_use]
     pub fn requester(&self) -> &Requester {
@@ -492,20 +516,40 @@ pub fn from_sync_channel_handshake<'a>(
 /// Construct [`AuthContext`] from a verified post-handshake
 /// sync-channel message (§7.5 / §7.6).
 ///
-/// **Phase 4b stub.** The signature ships with the
-/// [`crate::verification::VerifiedSyncMessage`] type from §7.6
-/// wired; construction requires the sync handshake
-/// implementation that lands in Phase 4d.
+/// The resulting context's [`Requester`] is
+/// [`Requester::Service`] carrying the session-bound peer
+/// identity from the originating handshake. The attribution chain
+/// starts empty; Phase 4e adds upstream-delegation rehydration
+/// from the inner claim's `ClaimOrigin::DelegatedFromUpstream`
+/// variant (chainlink tracked).
+///
+/// The substrate dispatcher is responsible for the §7.5
+/// `UnknownSessionMessage` audit emit when a sync-channel message
+/// arrives with a session id not in the local session table — this
+/// function operates on already-verified evidence, after the
+/// session lookup succeeded and
+/// [`crate::verification::verify_sync_message`] returned a
+/// [`crate::verification::VerifiedSyncMessage`].
+///
+/// **Sibling-stub status.** Phase 4d wires this entry point.
+/// [`from_xrpc_request`] and [`from_service_request`] still stub
+/// (Phase 4e wires both alongside the broader §4.2
+/// chain-rehydration discipline; chainlink tracks).
 #[must_use]
 pub fn from_sync_channel_message<'a>(
-    _evidence: crate::verification::VerifiedSyncMessage,
-    _trace_id: TraceId,
-    _sinks: AuditSinks<'a>,
-    _oracles: OracleSet<'a>,
+    evidence: crate::verification::VerifiedSyncMessage,
+    trace_id: TraceId,
+    sinks: AuditSinks<'a>,
+    oracles: OracleSet<'a>,
 ) -> AuthContext<'a> {
-    unimplemented!(
-        "§7.5 ingress::from_sync_channel_message: Phase 4d wires the handshake-evidence path"
-    );
+    let session_identity = evidence.session_identity().clone();
+    AuthContext::new_internal(
+        Requester::Service(session_identity),
+        trace_id,
+        sinks,
+        oracles,
+        AttributionChain::empty(),
+    )
 }
 
 /// Construct an anonymous [`AuthContext`] for public-read paths
