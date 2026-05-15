@@ -344,13 +344,19 @@ impl SessionDigest {
     /// Compute a [`SessionDigest`] via keyed Blake3 over a session
     /// id under a deployment correlation key.
     ///
-    /// Phase 1 stub. Phase 4 wires the keyed-hash construction
-    /// against the Blake3 crate per §9.5's dependency posture.
+    /// Construction (§4.4 + §7.5):
+    /// `blake3::keyed_hash(correlation_key.as_bytes(), session_id.as_bytes())`.
+    ///
+    /// The 32-byte Blake3 keyed-hash output is the digest. Same
+    /// session within a deployment hashes to the same digest;
+    /// different deployments configured with different
+    /// [`CorrelationKey`] values produce non-correlatable digests
+    /// for the same session id, which is the deliberate cross-
+    /// deployment isolation property §4.4 commits to.
     #[must_use]
-    pub fn compute(_session_id: &SessionId, _correlation_key: &CorrelationKey) -> Self {
-        // Phase 4 implementation: keyed Blake3 with domain separation
-        // `b"kryphocron/v1/session-digest/"`.
-        unimplemented!("§4.4 SessionDigest::compute: Phase 4 wires keyed Blake3");
+    pub fn compute(session_id: &SessionId, correlation_key: &CorrelationKey) -> Self {
+        let hash = blake3::keyed_hash(correlation_key.as_bytes(), session_id.as_bytes());
+        SessionDigest(*hash.as_bytes())
     }
 }
 
@@ -383,6 +389,85 @@ impl fmt::Debug for CorrelationKey {
     }
 }
 
+/// Per-substrate-instance Blake3 keying material for session-id
+/// derivation (§7.5).
+///
+/// 256-bit. Generated at substrate startup, never persisted across
+/// restarts. Used to key the
+/// [`derive_session_id`](crate::wire::derive_session_id)
+/// construction:
+///
+/// ```text
+/// session_id = blake3::keyed(
+///     key   = SubstrateSessionDerivationKey,
+///     input = proposed_session_nonce || responder_entropy,
+/// )
+/// ```
+///
+/// **Properties §7.5 commits.** A keyed-hash construction with this
+/// per-instance key gives:
+///
+/// - Cross-substrate session-ID predictability is foreclosed: an
+///   attacker observing session ids from one substrate instance
+///   cannot predict session ids from another instance.
+/// - Within an instance, session-id uniqueness across distinct
+///   `(nonce, entropy)` pairs follows from the keyed Blake3 PRF
+///   property.
+///
+/// **Operator discipline §7.5 does not enforce in safe Rust.** The
+/// "never persisted" property is operator policy, not a type-system
+/// invariant. The constructor surface (`generate` plus
+/// `from_bytes`) supports both common shapes:
+///
+/// - `generate()` for the default startup pattern (uses the system
+///   RNG via the Blake3 crate's transitive dependency on
+///   `getrandom`).
+/// - `from_bytes()` for HSM-backed deployments where the key
+///   material is held in operator-controlled secure storage and
+///   passed in at startup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SubstrateSessionDerivationKey([u8; 32]);
+
+impl SubstrateSessionDerivationKey {
+    /// Construct a [`SubstrateSessionDerivationKey`] from raw
+    /// bytes. Operators with HSM-backed key storage supply key
+    /// material via this path.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        SubstrateSessionDerivationKey(bytes)
+    }
+
+    /// Generate fresh keying material from the operating-system
+    /// CSPRNG. Use at substrate startup unless operator policy
+    /// dictates HSM-supplied key material.
+    #[must_use]
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        // `getrandom` is in the dep tree transitively (via
+        // ed25519-dalek and blake3). Unwrap is acceptable: a system
+        // RNG failure at substrate startup is unrecoverable for any
+        // signature-based service.
+        getrandom::getrandom(&mut bytes)
+            .expect("OS CSPRNG must be available at substrate startup");
+        SubstrateSessionDerivationKey(bytes)
+    }
+
+    /// Borrow the underlying bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+// Custom Debug that does not leak key material.
+impl fmt::Debug for SubstrateSessionDerivationKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubstrateSessionDerivationKey")
+            .field("redacted", &true)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +490,63 @@ mod tests {
     #[test]
     fn max_rotation_depth_constant_is_16() {
         assert_eq!(MAX_ROTATION_DEPTH, 16);
+    }
+
+    /// `SubstrateSessionDerivationKey::generate` produces fresh,
+    /// non-zero key material each call. Sanity check on the OS
+    /// CSPRNG path: two consecutive generations should not collide
+    /// (Birthday bound on 256-bit output makes any collision a
+    /// hard-test failure to investigate).
+    #[test]
+    fn substrate_session_derivation_key_generate_produces_distinct_keys() {
+        let k1 = SubstrateSessionDerivationKey::generate();
+        let k2 = SubstrateSessionDerivationKey::generate();
+        assert_ne!(k1.as_bytes(), k2.as_bytes());
+    }
+
+    /// Debug must not leak key bytes for the session-derivation
+    /// key (mirrors [`CorrelationKey`]'s redaction discipline).
+    #[test]
+    fn substrate_session_derivation_key_debug_does_not_leak() {
+        let key = SubstrateSessionDerivationKey::from_bytes([0xCC; 32]);
+        let s = format!("{key:?}");
+        assert!(!s.contains("CC"), "Debug must not leak key bytes");
+        assert!(s.contains("redacted"));
+    }
+
+    /// `SessionDigest::compute` produces the same digest for the
+    /// same `(session_id, correlation_key)` and different digests
+    /// for different correlation keys (cross-deployment isolation
+    /// per §4.4).
+    #[test]
+    fn session_digest_compute_is_deterministic_and_key_separated() {
+        let session = SessionId::from_bytes([0xAB; 32]);
+        let key_a = CorrelationKey::from_bytes([0x11; 32]);
+        let key_b = CorrelationKey::from_bytes([0x22; 32]);
+
+        let d_a1 = SessionDigest::compute(&session, &key_a);
+        let d_a2 = SessionDigest::compute(&session, &key_a);
+        let d_b = SessionDigest::compute(&session, &key_b);
+
+        assert_eq!(d_a1, d_a2, "deterministic for the same key");
+        assert_ne!(
+            d_a1, d_b,
+            "different keys must produce non-correlatable digests"
+        );
+    }
+
+    /// `SessionDigest::compute` separates by session id: same key,
+    /// different sessions yield different digests (Blake3 PRF
+    /// property).
+    #[test]
+    fn session_digest_compute_separates_by_session() {
+        let key = CorrelationKey::from_bytes([0x33; 32]);
+        let s1 = SessionId::from_bytes([0x44; 32]);
+        let s2 = SessionId::from_bytes([0x45; 32]);
+
+        let d1 = SessionDigest::compute(&s1, &key);
+        let d2 = SessionDigest::compute(&s2, &key);
+
+        assert_ne!(d1, d2);
     }
 }

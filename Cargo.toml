@@ -63,6 +63,23 @@ serde_json = "1"
 # version proto-blue's lexicon parsing transitively pulls in.
 ciborium = "0.2"
 
+# §4.4 / §7.5 / §9.5 keyed Blake3 for session-id derivation
+# (`SubstrateSessionDerivationKey`-keyed over `nonce || entropy`)
+# and session-digest correlation (`CorrelationKey`-keyed over the
+# session id, §4.4). Phase 4d wires both call sites; Phase 1
+# shipped the type vocabulary with the keyed-hash construction
+# stubbed.
+blake3 = "1"
+
+# §7.5 / §9.5 OS CSPRNG access for
+# `SubstrateSessionDerivationKey::generate` and the responder-side
+# `responder_entropy` produced fresh per handshake. Already in the
+# transitive dep tree (via ed25519-dalek's rand_core); promoted to
+# a direct dep so the surface is explicit and pinned at the major
+# version we depend on. Pinned to 0.2 to align with the version
+# proto-blue's lexicon parsing transitively pulls in.
+getrandom = "0.2"
+
 # Phase 2 (§5 lexicon strategy) deliverable: the companion crate
 # ships the v1 lexicons, the codegen-produced Rust types, and the
 # build-time three-way-consistency-checked registry. The

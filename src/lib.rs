@@ -163,7 +163,7 @@ pub use encryption::{
 pub use identity::{
     CorrelationKey, KeyId, PublicKey, RotationChain, RotationEntry,
     ServiceIdentity, SessionDigest, SessionId, SignatureAlgorithm,
-    TraceId,
+    SubstrateSessionDerivationKey, TraceId,
 };
 pub use ingress::{
     AttributionChain, AttributionEntry, AuthContext, AuditSinks,
