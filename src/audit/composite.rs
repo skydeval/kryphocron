@@ -4,23 +4,62 @@
 
 //! §4.9 composite-audit rollback machinery.
 //!
-//! Phase 4e (resolves CHAINLINKS #11 partial): `dead_code` allowed
-//! at module level because composite-audit dispatch is the
-//! downstream substrate's wiring responsibility — Phase 4 ships
-//! the rollback vocabulary; Phase 5 / 6 may extend with concrete
-//! dispatch implementations the crate itself doesn't carry.
-#![allow(dead_code)]
-
+//! [`composite_audit`] wraps a multi-sink operation in commit-or-
+//! rollback semantics. The op closure receives a
+//! [`CompositeAuditScope`] and queues per-class events via
+//! [`CompositeAuditScope::emit_user`] /
+//! [`CompositeAuditScope::emit_channel`] /
+//! [`CompositeAuditScope::emit_substrate`] /
+//! [`CompositeAuditScope::emit_moderation`]. Events are NOT
+//! delivered to sinks during the op — they accumulate in the
+//! scope and `composite_audit` flushes them after the op returns.
 //!
-//! [`composite_audit`] wraps a multi-sink operation. On mid-flight
-//! failure, rollback markers fire on already-committed sinks; on
-//! marker-emission failure, the substrate calls
-//! [`crate::audit::FallbackAuditSink::record_composite_failure`].
-//! On fallback failure, the substrate aborts.
+//! ## Commit / rollback discipline
 //!
-//! Phase 1 ships the type vocabulary and the [`composite_audit`]
-//! function signature; Phase 4 wires the actual dispatch +
-//! tracker GC.
+//! - **Op returns Err**: queued events dropped; the op's error
+//!   is returned unchanged. No sink is touched.
+//! - **Op returns Ok**: queued events committed to the operator-
+//!   installed [`crate::ingress::AuditSinks`] in
+//!   `COMMIT_PRIORITY_ORDER` (substrate → moderation → user →
+//!   channel). Within each class, the op's emit-order is
+//!   preserved.
+//! - **A commit fails partway**: rollback markers fire to all
+//!   sinks that already committed (deduplicated by class), in
+//!   reverse priority order. The error returned is
+//!   [`CompositeAuditError::SinkCommitFailed`].
+//! - **A rollback marker dispatch itself fails**: escalates to
+//!   [`crate::audit::FallbackAuditSink::record_composite_failure`].
+//!   Returns [`CompositeAuditError::RollbackDispatchFailed`].
+//! - **The fallback escalation panics**: catch_unwind catches
+//!   the panic; returns
+//!   [`CompositeAuditError::InconsistencyUnrecoverable`].
+//!   Operators should treat this as substrate-fatal.
+//!
+//! ## Class-priority commit order (§4.9 interpretive moment)
+//!
+//! §4.9 doesn't pin the cross-class commit order verbatim. The
+//! crate's choice — substrate first, then moderation, user,
+//! channel — orders by privilege: substrate-class events are
+//! the most-privileged and most-diagnostic-on-failure, so
+//! committing them first surfaces failures earliest. Channel-
+//! class commits last because channel events are typically
+//! least security-sensitive (sync channel observability rather
+//! than capability decisions).
+//!
+//! The rollback path fires markers in reverse order — most-
+//! recently-committed first — so the sink whose commit completed
+//! closest to the failure gets its rollback marker first.
+//!
+//! ## Per-process tracker (reserved)
+//!
+//! [`TRACKER_SHARDS`], [`TRACKER_GRACE_WINDOW_DEFAULT`], and
+//! [`TRACKER_GRACE_WINDOW_MAX`] are reserved for a future
+//! per-process composite-op-id tracker that detects op_id
+//! collisions and GCs stale scopes. v0.1's [`composite_audit`]
+//! generates a fresh 16-byte op_id from the OS CSPRNG per
+//! scope; collision probability is negligible (2^-64 birthday
+//! bound at ~4 billion concurrent scopes). The tracker lands
+//! when operator deployments push that bound.
 
 use std::time::Duration;
 
@@ -87,7 +126,7 @@ pub struct CompositeAuditScope {
     /// the op returns Ok. Order of insertion is preserved so
     /// commit ordering matches the op's emit order within a
     /// class; cross-class commit ordering is governed by
-    /// [`COMMIT_PRIORITY_ORDER`].
+    /// `COMMIT_PRIORITY_ORDER`.
     queued_events: std::sync::Mutex<Vec<QueuedEvent>>,
     /// Sinks that have already received a committed event in
     /// this composite scope. Populated by [`composite_audit`]
@@ -193,7 +232,7 @@ impl CompositeAuditScope {
     }
 
     /// Crate-internal: drain the queued events, sorted by
-    /// [`COMMIT_PRIORITY_ORDER`] (stable within each class so
+    /// `COMMIT_PRIORITY_ORDER` (stable within each class so
     /// emit-order is preserved per class). Used by
     /// [`composite_audit`]'s commit phase.
     pub(in crate::audit::composite) fn drain_queued_events(&self) -> Vec<QueuedEvent> {
@@ -417,12 +456,12 @@ pub(in crate::audit::composite) fn emit_rollback_marker(
 ///    `Err(e)` is returned unchanged. No sink is touched. No
 ///    rollback markers fire (nothing committed).
 /// 3. If the op returns `Ok(r)`: queued events are committed
-///    to the operator-installed sinks in [`COMMIT_PRIORITY_ORDER`]
+///    to the operator-installed sinks in `COMMIT_PRIORITY_ORDER`
 ///    (substrate → moderation → user → channel). Within each
 ///    class, the op's emit-order is preserved.
 /// 4. If a commit fails partway: rollback markers fire to all
 ///    sinks that already committed (deduplicated by class), in
-///    reverse [`COMMIT_PRIORITY_ORDER`]. The error returned is
+///    reverse `COMMIT_PRIORITY_ORDER`. The error returned is
 ///    [`CompositeAuditError::SinkCommitFailed { class, source }`]
 ///    converted to `E` via `From<CompositeAuditError>`.
 /// 5. If a rollback marker dispatch itself fails: escalates to
@@ -522,7 +561,7 @@ fn generate_composite_op_id() -> CompositeOpId {
 /// Handle the rollback path after a commit failure. Fires
 /// rollback markers to every sink class that committed before
 /// the failure (deduplicated by class), in reverse
-/// [`COMMIT_PRIORITY_ORDER`]. Always returns an Err — the
+/// `COMMIT_PRIORITY_ORDER`. Always returns an Err — the
 /// originating commit failure is the meaningful error;
 /// rollback failures are escalated and reported via
 /// [`CompositeAuditError::RollbackDispatchFailed`] (which
