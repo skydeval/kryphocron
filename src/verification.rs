@@ -4378,4 +4378,334 @@ mod tests {
             }
         ));
     }
+
+    // ============================================================
+    // §7.5 / chainlink #46 — SyncHandshakeVerificationError
+    // variant test coverage round-out.
+    // ============================================================
+
+    /// Builds a valid signed Hello, returning the wire bytes plus
+    /// the initiator's identity / signing key for tests that
+    /// tweak fields after-the-fact.
+    fn build_valid_hello(
+        seed: u8,
+    ) -> (Vec<u8>, ServiceIdentity, SigningKey) {
+        let (initiator, sk) = make_initiator_identity(seed);
+        let nonce = SessionNonce::from_bytes([seed.wrapping_mul(3); 32]);
+        let scope = SyncRequestedScope {
+            nsids: smallvec::SmallVec::new(),
+            time_window: None,
+            direction: crate::wire::SyncDirection::Bidirectional,
+        };
+        let at = SystemTime::now();
+        let sign_input = crate::wire::hello_sign_input(
+            &initiator,
+            SemVer::new(1, 0, 0),
+            &nonce,
+            &scope,
+            at,
+        );
+        let sig = crate::wire::sign_handshake_payload(&sk, &sign_input);
+        let hello = SyncChannelHello {
+            initiator_identity: initiator.clone(),
+            initiator_lexicon_set_version: SemVer::new(1, 0, 0),
+            proposed_session_nonce: nonce,
+            requested_scope: scope,
+            initiator_signature: sig,
+            at,
+        };
+        let bytes = hello_to_wire_bytes(&hello);
+        (bytes, initiator, sk)
+    }
+
+    /// Malformed: garbage bytes that don't parse as canonical CBOR.
+    #[tokio::test]
+    async fn verify_sync_hello_returns_malformed_for_garbage_bytes() {
+        let bytes = vec![0xFF, 0xFE, 0xFD, 0xFC];
+        let resolver = Arc::new(MockResolver::new());
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig::default();
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SyncHandshakeVerificationError::Malformed));
+    }
+
+    /// TooLarge: payload exceeds MAX_HANDSHAKE_MESSAGE_SIZE.
+    #[tokio::test]
+    async fn verify_sync_hello_returns_too_large_above_size_ceiling() {
+        let bytes = vec![0u8; crate::wire::MAX_HANDSHAKE_MESSAGE_SIZE + 1];
+        let resolver = Arc::new(MockResolver::new());
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig::default();
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SyncHandshakeVerificationError::TooLarge));
+    }
+
+    /// CounterpartyResolutionFailed: resolver returns NotFound for
+    /// the initiator's DID.
+    #[tokio::test]
+    async fn verify_sync_hello_returns_counterparty_resolution_failed() {
+        let (bytes, initiator, _sk) = build_valid_hello(0x30);
+        let resolver = Arc::new(MockResolver::new());
+        resolver.insert_err(initiator.service_did(), DidResolutionError::NotFound);
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig::default();
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SyncHandshakeVerificationError::CounterpartyResolutionFailed(_)
+        ));
+    }
+
+    /// CounterpartyKeyNotInDocument: resolver returns a document
+    /// without the named key.
+    #[tokio::test]
+    async fn verify_sync_hello_returns_counterparty_key_not_in_document() {
+        let (bytes, initiator, _sk) = build_valid_hello(0x31);
+        let resolver = Arc::new(MockResolver::new());
+        // Insert a document with a DIFFERENT KeyId than the
+        // initiator's claimed identity references.
+        let other_kid = KeyId::from_bytes([0x99; 32]);
+        resolver.insert(initiator.service_did(), other_kid, *initiator.key_material());
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig::default();
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SyncHandshakeVerificationError::CounterpartyKeyNotInDocument
+        ));
+    }
+
+    /// UnsupportedAlgorithm: receipt's algorithm is outside the
+    /// allowlist (Ed25519 only by default).
+    #[tokio::test]
+    async fn verify_sync_hello_returns_unsupported_algorithm() {
+        let (bytes, initiator, _sk) = build_valid_hello(0x32);
+        let resolver = Arc::new(MockResolver::new());
+        resolver.insert(initiator.service_did(), initiator.key_id(), *initiator.key_material());
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig {
+            // Empty allowlist — every signed signature falls outside.
+            accepted_algorithms: &[],
+            ..SyncHandshakeVerificationConfig::default()
+        };
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SyncHandshakeVerificationError::UnsupportedAlgorithm(SignatureAlgorithm::Ed25519)
+        ));
+    }
+
+    /// NonceTrackerBackend: tracker returns BackendUnavailable.
+    /// The Mutex inside DefaultHandshakeNonceTracker is rarely
+    /// poisoned in normal use; we use a custom failing tracker.
+    #[tokio::test]
+    async fn verify_sync_hello_returns_nonce_tracker_backend() {
+        struct FailingTracker;
+        impl crate::wire::HandshakeNonceTracker for FailingTracker {
+            fn check_and_record(
+                &self,
+                _initiator: &ServiceIdentity,
+                _nonce: &SessionNonce,
+                _observed_at: SystemTime,
+            ) -> Result<crate::wire::NonceFreshness, NonceTrackerError> {
+                Err(NonceTrackerError::BackendUnavailable)
+            }
+            fn replay_window(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+        }
+        let (bytes, initiator, _sk) = build_valid_hello(0x33);
+        let resolver = Arc::new(MockResolver::new());
+        resolver.insert(initiator.service_did(), initiator.key_id(), *initiator.key_material());
+        let cfg = SyncHandshakeVerificationConfig::default();
+        let err = verify_sync_hello(
+            &bytes,
+            &FailingTracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SyncHandshakeVerificationError::NonceTrackerBackend(_)
+        ));
+    }
+
+    /// NotYetValid: `at` field is in the future beyond skew
+    /// tolerance. Constructed by stamping `at = now + 1 hour`.
+    #[tokio::test]
+    async fn verify_sync_hello_returns_not_yet_valid() {
+        let (initiator, sk) = make_initiator_identity(0x34);
+        let resolver = handshake_test_resolver(&initiator);
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig::default();
+        let nonce = SessionNonce::from_bytes([0xAA; 32]);
+        let scope = SyncRequestedScope {
+            nsids: smallvec::SmallVec::new(),
+            time_window: None,
+            direction: crate::wire::SyncDirection::Bidirectional,
+        };
+        let at = SystemTime::now() + Duration::from_secs(3600);
+        let sign_input = crate::wire::hello_sign_input(&initiator, SemVer::new(1, 0, 0), &nonce, &scope, at);
+        let sig = crate::wire::sign_handshake_payload(&sk, &sign_input);
+        let hello = SyncChannelHello {
+            initiator_identity: initiator,
+            initiator_lexicon_set_version: SemVer::new(1, 0, 0),
+            proposed_session_nonce: nonce,
+            requested_scope: scope,
+            initiator_signature: sig,
+            at,
+        };
+        let bytes = hello_to_wire_bytes(&hello);
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SyncHandshakeVerificationError::NotYetValid));
+    }
+
+    /// TooOld: `at` field is more than `max_clock_skew` in the
+    /// past.
+    #[tokio::test]
+    async fn verify_sync_hello_returns_too_old() {
+        let (initiator, sk) = make_initiator_identity(0x35);
+        let resolver = handshake_test_resolver(&initiator);
+        let tracker = crate::wire::DefaultHandshakeNonceTracker::new();
+        let cfg = SyncHandshakeVerificationConfig::default();
+        let nonce = SessionNonce::from_bytes([0xBB; 32]);
+        let scope = SyncRequestedScope {
+            nsids: smallvec::SmallVec::new(),
+            time_window: None,
+            direction: crate::wire::SyncDirection::Bidirectional,
+        };
+        // `at = now - 1 hour`, well past the default 30s skew.
+        let at = SystemTime::now() - Duration::from_secs(3600);
+        let sign_input = crate::wire::hello_sign_input(&initiator, SemVer::new(1, 0, 0), &nonce, &scope, at);
+        let sig = crate::wire::sign_handshake_payload(&sk, &sign_input);
+        let hello = SyncChannelHello {
+            initiator_identity: initiator,
+            initiator_lexicon_set_version: SemVer::new(1, 0, 0),
+            proposed_session_nonce: nonce,
+            requested_scope: scope,
+            initiator_signature: sig,
+            at,
+        };
+        let bytes = hello_to_wire_bytes(&hello);
+        let err = verify_sync_hello(
+            &bytes,
+            &tracker,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SyncHandshakeVerificationError::TooOld));
+    }
+
+    /// CounterpartyIdentityMismatch: verify_sync_response is
+    /// supplied an `expected_responder_did` that does not match
+    /// the responder's identity carried in the message.
+    #[tokio::test]
+    async fn verify_sync_response_returns_counterparty_identity_mismatch() {
+        // Build a valid Accept response signed by responder A,
+        // but verify against expected responder B.
+        let (responder_a, sk_a) = make_initiator_identity(0x40);
+        let resolver = handshake_test_resolver(&responder_a);
+        let cfg = SyncHandshakeVerificationConfig::default();
+        let session_id = SessionId::from_bytes([0x77; 32]);
+        let scope = SyncRequestedScope {
+            nsids: smallvec::SmallVec::new(),
+            time_window: None,
+            direction: crate::wire::SyncDirection::Bidirectional,
+        };
+        let at = SystemTime::now();
+        let sign_input = crate::wire::accept_sign_input(
+            &responder_a, SemVer::new(1, 0, 0), &session_id, &scope, at,
+        );
+        let sig = crate::wire::sign_handshake_payload(&sk_a, &sign_input);
+        let accept = SyncChannelAccept {
+            responder_identity: responder_a.clone(),
+            responder_lexicon_set_version: SemVer::new(1, 0, 0),
+            session_id,
+            negotiated_scope: scope,
+            responder_signature: sig,
+            at,
+        };
+        let mut bytes = vec![0x00];
+        bytes.extend(accept_to_wire_bytes(&accept));
+
+        // Expected responder B (different DID).
+        let did_b = Did::new("did:plc:differentresponder000").unwrap();
+
+        let err = verify_sync_response(
+            &bytes,
+            &did_b,
+            resolver.as_ref() as &dyn DidResolver,
+            &cfg,
+            deadline(),
+            TraceId::from_bytes([0; 16]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SyncHandshakeVerificationError::CounterpartyIdentityMismatch
+        ));
+    }
 }
