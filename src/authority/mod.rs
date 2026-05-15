@@ -108,19 +108,41 @@ where
 
 /// Issue a channel-class capability proof (§4.3).
 ///
-/// **Phase 1 stub.**
+/// Pipeline (Phase 7c v0.1):
+///
+/// - **Stage 1 — requester authority.** Channel-class accepts
+///   [`Requester::Did`] (a user dispatching a channel
+///   subscription) and [`Requester::Service`] (an operator
+///   dispatching channel events on the user's behalf).
+///   [`Requester::Anonymous`] fails closed.
+/// - **Stage 3 — proof construction.** Builds a
+///   [`ChannelProof<E>`] with `issued_at = Instant::now()` and a
+///   process-static [`AuthorityId`].
+///
+/// Stage 0 (lexicon deprecation) does not apply to channel-class
+/// — channel subjects ([`crate::ChannelBinding`]) carry no NSID.
+/// Stage 2 (endpoint validation) is the bind-time predicate's
+/// domain.
 ///
 /// # Errors
 ///
-/// Returns [`AuthDenial`] on any pipeline denial.
+/// Returns [`AuthDenial::RequesterLacksAuthority`] if the
+/// requester is anonymous.
 pub fn issue_channel<E>(
-    _ctx: &AuthContext<'_>,
-    _target: <E as Endpoint>::Subject,
+    ctx: &AuthContext<'_>,
+    subject: <E as Endpoint>::Subject,
 ) -> Result<ChannelProof<E>, AuthDenial>
 where
     E: Endpoint,
 {
-    unimplemented!("§4.3 authority::issue_channel: Phase 4 wires the pipeline");
+    let requester = stage1_extract_requester_did(ctx, CapabilityClass::Channel, true)?;
+    Ok(ChannelProof::new_internal(
+        requester,
+        subject,
+        Instant::now(),
+        process_authority_id(),
+        ctx.trace_id(),
+    ))
 }
 
 /// Issue a substrate-class capability proof (§4.3).
