@@ -1,19 +1,20 @@
 [package]
 name = "kryphocron"
-version = "0.1.0-phase1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MPL-2.0"
-description = "Primitives crate for the kryphocron substrate: capability proofs, tier-aware envelopes, authorization context, audit pipeline, and inter-service auth vocabulary."
-keywords = ["atproto", "authorization", "capability", "audit"]
+description = "Privacy-first ATProto substrate primitives: type architecture, audit vocabulary, inter-service auth, and encryption hook surfaces"
+keywords = ["atproto", "substrate", "privacy", "bluesky", "federation"]
 categories = ["authentication", "cryptography", "data-structures"]
-publish = false
+authors = ["skydeval <skydeval@mail.nearhorizon.app>"]
+repository = "https://github.com/skydeval/kryphocron"
+readme = "README.md"
 
 # License: MPL-2.0 (file-level copyleft) per §9.8. Per-file
 # headers point at the LICENSE file at the crate root.
 # Downstream crates (PDS, AppView, etc.) are encouraged to ship
-# permissive (MIT OR Apache-2.0); see TRADEMARK.md for marks
-# discipline.
+# permissive (MIT OR Apache-2.0).
 
 [lib]
 name = "kryphocron"
