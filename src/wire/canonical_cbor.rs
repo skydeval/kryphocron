@@ -17,7 +17,7 @@
 //! function: take a [`ciborium::Value`], get back the unique
 //! canonical byte sequence per RFC 8949 §4.2.
 //!
-//! Phase 4b's §7 round-4 patch motivation: a non-canonical map
+//! Motivation (per §7 round-4 patch): a non-canonical map
 //! ordering produces two valid CBOR encodings of the same logical
 //! payload, splitting signature inputs and creating an
 //! alg-confusion-adjacent verifier-vs-issuer ambiguity.

@@ -123,7 +123,8 @@ pub enum NonceTrackerError {
 /// [`crate::wire::CapabilityClaim`] nonces and
 /// [`crate::verification::VerifiedJwt`] nonces flow through the
 /// same tracker. Implementations are operator-supplied;
-/// the crate's default in-memory implementation lands in Phase 4.
+/// the crate ships an in-memory default implementation
+/// ([`crate::wire::DefaultNonceTracker`]).
 ///
 /// Retention window must be ≥
 /// `MAX_CLOCK_SKEW + max(MAX_CLAIM_VALIDITY, MAX_JWT_VALIDITY)`.

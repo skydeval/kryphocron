@@ -85,9 +85,9 @@ pub struct ResourceId {
 impl ResourceId {
     /// Construct a [`ResourceId`] from canonicalized parts.
     ///
-    /// Phase 1 ships the constructor shape; Phase 2 layers in the
-    /// proto-blue canonicalization step that rejects DIDs / NSIDs
-    /// / rkeys outside the lexicon-validated grammar.
+    /// v0.1 ships the constructor shape; a future release layers
+    /// in the proto-blue canonicalization step that rejects
+    /// DIDs / NSIDs / rkeys outside the lexicon-validated grammar.
     #[must_use]
     pub fn new(did: Did, nsid: Nsid, rkey: Rkey) -> Self {
         ResourceId {
@@ -129,8 +129,8 @@ impl HasResourceLocation for ResourceId {
 
 /// Audience-list reference (§4.3 ManageAudience subject side).
 ///
-/// Phase 1 stores an [`AtUri`]; Phase 2's lexicon work may
-/// constrain the URI shape further.
+/// v0.1 stores an [`AtUri`]; a future lexicon pass may constrain
+/// the URI shape further.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AudienceListId(AtUri);
 
@@ -373,9 +373,9 @@ mod tests {
         ));
     }
 
-    /// §4.3 / §4.4 (Phase 7d): subjects with a resource location
-    /// expose `did + nsid` via the sealed `HasResourceLocation`
-    /// trait. ResourceId returns its own fields; ManageAudienceSubject
+    /// §4.3 / §4.4: subjects with a resource location expose
+    /// `did + nsid` via the sealed `HasResourceLocation` trait.
+    /// ResourceId returns its own fields; ManageAudienceSubject
     /// and ModerationSubject forward to their inner ResourceId.
     #[test]
     fn has_resource_location_returns_did_and_nsid_for_all_three_impls() {

@@ -11,11 +11,10 @@
 //! the [`crate::authority`] module can enqueue events; the read
 //! side is `pub` so operator dashboards can drain them.
 //!
-//! Phase 3 reshapes [`InspectionNotification`] from Phase 1's
-//! capability-and-resource fields to §6.7's
-//! [`InspectionKind`]-and-[`crate::TargetRepresentation`] shape.
-//! The `id` / `inspected_at` fields are renamed to
-//! `notification_id` / `at` to match §6.7's committed identifiers.
+//! [`InspectionNotification`] ships in §6.7's
+//! [`InspectionKind`]-and-[`crate::TargetRepresentation`] shape,
+//! with `notification_id` / `at` fields per §6.7's committed
+//! identifiers.
 
 use std::time::{Duration, SystemTime};
 
@@ -134,7 +133,7 @@ pub enum InspectionKind {
 ///
 /// Implemented by operator-installed inspection-notification
 /// queues; consumed by the moderation-class bind path
-/// ([`crate::authority::ModerationProof::bind`], Phase 7d) to
+/// ([`crate::authority::ModerationProof::bind`]) to
 /// fan an [`InspectionNotification`] out to the resource owner's
 /// queue alongside the per-class moderation audit emission.
 ///
@@ -170,7 +169,7 @@ pub trait InspectionNotificationQueueImpl: Send + Sync {
 /// unconditionally without forcing every deployment to ship a
 /// queue implementation.
 ///
-/// Parallels the wire-side `NoEncryption` default and Phase 7c's
+/// Parallels the wire-side `NoEncryption` default and the
 /// process-static `AuthorityId` placeholder: ship the discipline,
 /// let operators upgrade to a real implementation when their
 /// deployment needs the feature.
@@ -241,7 +240,7 @@ mod tests {
         }
     }
 
-    /// Phase 7d C2: `NoInspectionNotifications` is the no-op
+    /// `NoInspectionNotifications` is the no-op
     /// default operators install when not running an inspection-
     /// notification queue. `enqueue` returns immediately and
     /// queues nothing. Trait-object dispatch via

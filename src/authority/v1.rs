@@ -49,10 +49,10 @@ use crate::sealed;
 // Empty `*OracleResults` placeholder helper.
 // ============================================================
 //
-// Phase 1's hand-written capabilities carry typed `OracleResults`
+// v0.1's hand-written capabilities carry typed `OracleResults`
 // structs that name the consulted queries. The fields are
-// populated by Phase 4's pipeline implementation; for Phase 1
-// they are construct-only with `Default` impls.
+// populated by the §4.3 pipeline implementation; outside the
+// pipeline they are construct-only with `Default` impls.
 
 macro_rules! capability_marker {
     (
@@ -93,7 +93,7 @@ macro_rules! capability_marker {
 
         /// Per-capability oracle-results struct (§4.3 macro
         /// expansion equivalent). Fields are populated by the
-        /// §4.3 pipeline implementation; in Phase 1 they are
+        /// §4.3 pipeline; outside the pipeline they are
         /// default-initialized.
         #[derive(Debug, Clone, Default)]
         #[non_exhaustive]
@@ -119,7 +119,7 @@ macro_rules! capability_marker {
 }
 
 // Default impls on the state enums power the macro-generated
-// `#[derive(Default)]` on the `*OracleResults` structs. Phase 1's
+// `#[derive(Default)]` on the `*OracleResults` structs. v0.1
 // stub defaults: no block, no audience configured, no mute. These
 // match the most-permissive starting state, which is the safe
 // choice for a struct that gets *overwritten* by the §4.3 pipeline

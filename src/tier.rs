@@ -10,7 +10,7 @@
 //! `Tiered<T, PrivateTier>` is a compile error, not a runtime
 //! check.
 //!
-//! Phase 2 split: the runtime [`Tier`] enum, [`Visibility`], and
+//! Crate split: the runtime [`Tier`] enum, [`Visibility`], and
 //! [`UnknownNsid`] live in `kryphocron-lexicons` because the
 //! build-script-generated `impl Tier { pub fn from_nsid }`
 //! (§5.3) must sit in the same crate as `Tier` (Rust orphan
@@ -74,9 +74,9 @@ pub use kryphocron_lexicons::{Tier, UnknownNsid, Visibility};
 /// neither the value nor its audience field, so audience-membership
 /// can't be consulted at this layer. Callers needing audience-aware
 /// visibility on a specific record should call the bind path
-/// directly (which consults the audience oracle at stage 3 per
-/// Phase 7d). The conservative-Hidden default fails closed for
-/// the read path; bind succeeds for in-audience viewers.
+/// directly (which consults the audience oracle at stage 3).
+/// The conservative-Hidden default fails closed for the read
+/// path; bind succeeds for in-audience viewers.
 ///
 /// **Private + Service returns Visible** per §4.6
 /// read-everything-authority — substrate-internal machinery
@@ -136,8 +136,8 @@ impl TierWitness for PrivateTier {
 /// Trait connecting record types to their NSID and tier.
 ///
 /// Sealed: only crate-generated record types (from the §5
-/// codegen pipeline, Phase 2) implement [`HasNsid`]. Consumers
-/// cannot declare arbitrary types as kryphocron records.
+/// codegen pipeline) implement [`HasNsid`]. Consumers cannot
+/// declare arbitrary types as kryphocron records.
 pub trait HasNsid: sealed::Sealed + 'static {
     /// The NSID identifying this record type.
     const NSID: &'static str;
@@ -251,8 +251,8 @@ mod tests {
 
     #[test]
     fn from_nsid_resolves_v1_lexicons() {
-        // Phase 2 wires the registry. The eight v1 NSIDs resolve
-        // to the tiers committed by §5.7 / §5.4.
+        // The eight v1 NSIDs resolve to the tiers committed by
+        // §5.7 / §5.4.
         let cases: &[(&str, Tier)] = &[
             ("tools.kryphocron.feed.postPublic", Tier::Public),
             ("tools.kryphocron.feed.postPrivate", Tier::Private),
@@ -282,7 +282,7 @@ mod tests {
     }
 
     // ====================================================
-    // Phase 7e C1 — visible_to tests.
+    // visible_to tests.
     // ====================================================
 
     /// Minimal AuthContext fixture for the visible_to matrix tests.

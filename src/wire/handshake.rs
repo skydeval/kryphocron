@@ -12,7 +12,7 @@
 //! deterministic CBOR encoding for the sign-input of each message
 //! and the wire-envelope encoding for transmission. Receive-side
 //! decoding and the orchestrating `verify_sync_handshake` live in
-//! [`crate::verification`] (Phase 4d follow-up commit).
+//! [`crate::verification`].
 //!
 //! # Domain separation discipline
 //!
@@ -30,9 +30,9 @@
 //! family-prefix that §7.5's signing-canonicalization paragraph
 //! describes ambiguously ("`b\"kryphocron/v1/sync-handshake/\"`
 //! for Hello / Response, plus the established-specific prefix
-//! above"). Phase 4d takes the conservative reading — per-message
+//! above"). v0.1 takes the conservative reading — per-message
 //! suffixes — to mirror the explicitly-distinct `reject/` and
-//! `established/` tags. A Phase 6 spec patch will pin this
+//! `established/` tags. A future spec patch will pin this
 //! decision in the design doc directly.
 //!
 //! # W6 receive-side capability-class discipline
@@ -41,8 +41,8 @@
 //! exchange is post-handshake (`KryphocronClaim`-scheme messages
 //! over the established session). The receiver-side §7.6 verifier
 //! still applies the W6 belt-and-suspenders rejection of substrate-
-//! and moderation-class capabilities — Phase 4d does not change
-//! that path.
+//! and moderation-class capabilities — the handshake itself does
+//! not change that path.
 
 use std::time::{Duration, SystemTime};
 
@@ -108,8 +108,8 @@ pub const DEFAULT_FEDERATION_TIME_WINDOW: Duration =
 /// OS CSPRNG. The nonce is the per-handshake input the responder
 /// mixes with `responder_entropy` to derive the session id (see
 /// [`derive_session_id`]). Replays of the same nonce by the same
-/// initiator are detected by the handshake nonce tracker (Phase
-/// 4d follow-up commit) and rejected with
+/// initiator are detected by the handshake nonce tracker and
+/// rejected with
 /// [`crate::audit::BatchRejectionReason::HandshakeNonceReplay`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionNonce([u8; 32]);
@@ -518,7 +518,7 @@ pub fn verify_handshake_signature(
 //
 // These mirror the helpers in `wire/claim.rs` deliberately — the
 // duplication is cheap and keeps each wire-format module self-
-// contained. A Phase 6 refactor may consolidate them into a shared
+// contained. A future refactor may consolidate them into a shared
 // `wire::serde_helpers` module if the duplication grows.
 // ============================================================
 
@@ -639,10 +639,11 @@ fn system_time_value(t: SystemTime) -> Value {
 // ============================================================
 // Receive-side: full-wire decoders.
 //
-// Phase 4d's `verify_sync_handshake` (in `verification.rs`) calls
-// these to round-trip on-wire bytes through canonical CBOR before
+// `verify_sync_handshake` (in `verification.rs`) calls these to
+// round-trip on-wire bytes through canonical CBOR before
 // signature verification. The non-canonical-input rejection
-// pattern from Phase 4b applies symmetrically here.
+// pattern from `verify_capability_claim` applies symmetrically
+// here.
 // ============================================================
 
 /// Decode the on-wire CBOR bytes of a `SyncChannelHello` into the
@@ -1205,10 +1206,7 @@ mod tests {
     /// W8 separation across §7 contexts: handshake tags are
     /// distinct from the §7.6 capability-claim tag and the §7.4
     /// trust-declaration tag. The §4.8 attribution-receipt tag
-    /// has no constant in Phase 4d (Phase 1 ships receipts as
-    /// type-shape only; the constant lands when receipts are
-    /// wired); the literal is checked against the documented
-    /// value here directly.
+    /// is checked against the documented literal here directly.
     #[test]
     fn handshake_domain_tags_are_distinct_from_other_section_tags() {
         let handshake_tags: [&[u8]; 4] = [

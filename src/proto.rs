@@ -22,15 +22,15 @@
 //!
 //! ## Name compatibility
 //!
-//! Phase 1's [`Rkey`] type is re-exported as
-//! [`kryphocron_lexicons::RecordKey`]. The Phase 1 public surface
-//! used the shorter spelling; this module ships a `pub use ... as`
-//! alias so existing call sites continue to resolve.
+//! The [`Rkey`] type is re-exported as
+//! [`kryphocron_lexicons::RecordKey`]. Earlier internal drafts of
+//! the public surface used the shorter spelling; this module ships
+//! a `pub use ... as` alias so existing call sites continue to
+//! resolve.
 //!
 //! ## Validation behavior
 //!
-//! Unlike the Phase 1 placeholders (which accepted any non-empty
-//! UTF-8), the real validators enforce the ATProto-spec grammar:
+//! The validators enforce the ATProto-spec grammar:
 //!
 //! - [`Did`] requires the `did:<method>:<id>` format.
 //! - [`Nsid`] requires the dotted-segment grammar (minimum 3
@@ -47,9 +47,9 @@ pub use kryphocron_lexicons::{
     Tid, UnknownNsid,
 };
 
-/// Phase 1 compatibility alias for [`RecordKey`].
+/// Compatibility alias for [`RecordKey`].
 ///
-/// The Phase 1 public surface exported `Rkey`; the upstream name
-/// is `RecordKey`. The alias keeps the kryphocron crate's
-/// re-export shape stable across the Phase 2 swap.
+/// Earlier internal drafts of the public surface exported `Rkey`;
+/// the upstream name is `RecordKey`. The alias keeps the kryphocron
+/// crate's re-export shape stable across the lexicon-crate swap.
 pub use kryphocron_lexicons::RecordKey as Rkey;

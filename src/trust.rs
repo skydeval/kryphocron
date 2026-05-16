@@ -127,9 +127,9 @@ pub enum TrustDeclarationError {
     },
     /// `expires_at - issued_at` exceeds
     /// [`MAX_TRUST_DECLARATION_VALIDITY`]. Implementation-derived
-    /// addition for Phase 6 spec patch — §7.4's prose enumerates
-    /// five variants but commits the 30-day ceiling, so the
-    /// explicit error variant follows from enforcement.
+    /// addition pending a future §7.4 spec patch — the §7.4 prose
+    /// enumerates five variants but commits the 30-day ceiling,
+    /// so the explicit error variant follows from enforcement.
     #[error("trust declaration validity window {window:?} exceeds max {max:?}")]
     ValidityWindowTooLong {
         /// Requested validity window.
@@ -807,10 +807,10 @@ fn verify_signature(
                 .map_err(|_| TrustDeclarationError::SignatureInvalid)
         }
         SignatureAlgorithm::Es256 | SignatureAlgorithm::Es256K => {
-            // Phase 4a note: ECDSA primitives stub here
-            // too. Trust declarations with ES256/ES256K signatures
-            // surface as SignatureInvalid until the broader
-            // ECDSA roll-out lands.
+            // ECDSA primitives stub here too. Trust declarations
+            // with ES256/ES256K signatures surface as
+            // SignatureInvalid until the broader ECDSA roll-out
+            // lands.
             Err(TrustDeclarationError::SignatureInvalid)
         }
     }

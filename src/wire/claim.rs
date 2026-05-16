@@ -44,8 +44,8 @@ pub const MAX_CAPABILITY_CLAIM_SIZE: usize = 4096;
 /// Signing input is `DOMAIN_TAG || canonical_cbor(payload)`.
 /// Other §7 contexts use distinct tags
 /// (`b"kryphocron/v1/attribution-receipt/"` for delegation
-/// receipts in Phase 4e; service trust declarations in Phase 4c
-/// and the sync handshake in Phase 4d will land their own).
+/// receipts; service trust declarations and the sync handshake
+/// each carry their own tag).
 /// Cross-domain signature reuse is foreclosed by tag distinctness.
 pub(crate) const CLAIM_DOMAIN_TAG: &[u8] = b"kryphocron/v1/capability-claim/";
 
@@ -57,9 +57,8 @@ pub(crate) const CLAIM_DOMAIN_TAG: &[u8] = b"kryphocron/v1/capability-claim/";
 /// scope, validity bounds, and signs. Deserialization runs the
 /// same validation (defense in depth).
 ///
-/// **Phase 1 ships the type shape.** The deterministic-CBOR
-/// canonicalization and Ed25519 signing implementation fires in
-/// Phase 4.
+/// v0.1 ships the type plus the deterministic-CBOR
+/// canonicalization and Ed25519 signing implementation.
 #[derive(Debug, Clone)]
 pub struct CapabilityClaim {
     issuer: ServiceIdentity,
@@ -81,7 +80,7 @@ impl CapabilityClaim {
     /// constructor).
     ///
     /// `signing_key` is the Ed25519 private key whose public half
-    /// matches `issuer.key_material()`. Phase 4b enforces a
+    /// matches `issuer.key_material()`. `new` enforces a
     /// defensive equality check between the derived public bytes
     /// and the issuer's declared key material; mismatch returns
     /// [`ClaimConstructionError::SigningFailed`]. Operators
@@ -217,8 +216,8 @@ impl CapabilityClaim {
     /// Parallel to [`Self::new`] but for the
     /// [`ClaimOrigin::DelegatedFromUpstream`] case: the issuer is
     /// acting on behalf of an upstream principal, with the full
-    /// delegation chain attached as `chain`. Every Phase 4b
-    /// validation stage runs identically; the only structural
+    /// delegation chain attached as `chain`. Every validation
+    /// stage runs identically to `new`; the only structural
     /// difference is the `origin` field.
     ///
     /// **Pre-construction discipline.** The chain's per-hop
@@ -678,9 +677,8 @@ fn system_time_value(t: SystemTime) -> Value {
 }
 
 // ============================================================
-// Helpers used at receive-time decoding (Phase 4b's
-// `verify_capability_claim` reaches in here through the
-// `verification` submodule).
+// Helpers used at receive-time decoding (`verify_capability_claim`
+// in the `verification` submodule reaches in here).
 // ============================================================
 
 /// Decode a canonical-CBOR byte stream into the constituent
@@ -967,8 +965,8 @@ fn decode_claim_origin(v: &Value) -> Result<ClaimOrigin, ()> {
     match kind {
         "self_originated" => Ok(ClaimOrigin::SelfOriginated),
         "delegated_from_upstream" => {
-            // Phase 4e wires full chain decode. The §4.8 W11 wire
-            // chain decodes structurally; per-hop signature
+            // The §4.8 W11 wire chain decodes structurally here;
+            // per-hop signature
             // verification (W12) and capability monotonicity
             // (W13) are the verifier's responsibility via
             // verify_attribution_chain. Empty chains are
@@ -1259,8 +1257,7 @@ pub enum ClaimConstructionError {
         max: usize,
     },
     /// Claim serialization exceeded the per-§7.6 size ceiling
-    /// (`MAX_CAPABILITY_CLAIM_SIZE`, committed in §7.6 and wired
-    /// in Phase 4).
+    /// (`MAX_CAPABILITY_CLAIM_SIZE`, committed in §7.6).
     #[error("claim size {size} exceeds max {max}")]
     ClaimTooLarge {
         /// Actual size.
@@ -1518,10 +1515,9 @@ mod tests {
 
     #[test]
     fn canonical_payload_round_trips_through_decode() {
-        // Encode → decode → re-encode → byte-equals. The receive-
-        // side defensive check Phase 4b's verify_capability_claim
-        // will use lands in C4; this test pins the round-trip
-        // contract at the encoder boundary.
+        // Encode → decode → re-encode → byte-equals. This pins
+        // the round-trip contract at the encoder boundary used
+        // by the receive-side `verify_capability_claim` check.
         let signing = fixed_signing_key();
         let issuer = fixed_service_identity("did:web:issuer.example");
         let audience = fixed_service_identity("did:web:audience.example");
@@ -1568,7 +1564,7 @@ mod tests {
     }
 
     // ============================================================
-    // Phase 4e — new_delegated + chain decoder tests.
+    // new_delegated + chain decoder tests.
     // ============================================================
 
     use crate::wire::{sign_delegation_receipt, DelegationReceiptPayload};

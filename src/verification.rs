@@ -4,22 +4,20 @@
 
 //! §7.2 / §7.5 verification submodule.
 //!
-//! Phase 4a wires §7.2 — the JWT verification chain — through
-//! [`crate::verification::verify_jwt`]. Phase 4b wires §7.6 —
-//! the capability-claim verification chain — through
-//! [`crate::verification::verify_capability_claim`]. Phase 1
-//! shipped the [`crate::verification::VerifiedJwt`] type with
-//! private fields and a crate-internal constructor; Phase 4a
-//! wired the constructor body. Phase 4b ships the parallel
-//! [`crate::verification::VerifiedCapabilityClaim`] type and
-//! constructor.
+//! [`crate::verification::verify_jwt`] wires §7.2 — the JWT
+//! verification chain. [`crate::verification::verify_capability_claim`]
+//! wires §7.6 — the capability-claim verification chain.
+//! [`crate::verification::VerifiedJwt`] and
+//! [`crate::verification::VerifiedCapabilityClaim`] are the
+//! corresponding evidence types, each with private fields and
+//! a crate-internal constructor.
 //!
 //! [`crate::verification::VerifiedSyncMessage`] (§7.5) carries
 //! a verified post-handshake sync-channel message; the
 //! three-message handshake establishment evidence ships as
 //! [`crate::verification::VerifiedSyncHello`],
 //! [`crate::verification::VerifiedSyncAccept`], and
-//! [`crate::verification::VerifiedSyncEstablished`] (Phase 4d).
+//! [`crate::verification::VerifiedSyncEstablished`].
 //!
 //! See §7.2 for the JWT verification flow, §7.5 for the
 //! sync-handshake protocol.
@@ -279,9 +277,8 @@ pub enum JwtVerificationError {
 /// verification ran without trusting the caller.
 ///
 /// Replay protection (the [`crate::wire::NonceTracker`] check) is
-/// **not** wired in Phase 4a; nonce extraction succeeds, replay
-/// rejection is opt-in via a separately-supplied tracker (Phase 4b
-/// integration point).
+/// **not** invoked inside `verify_jwt`; nonce extraction succeeds,
+/// replay rejection is opt-in via a separately-supplied tracker.
 ///
 /// Audit-emit is the caller's responsibility — the `authority`
 /// module emits
@@ -563,7 +560,7 @@ impl<'a> ParsedJwt<'a> {
         // Nonce extraction. v1 expects the nonce as a base64url-
         // encoded 16-byte value. If `require_nonce` is true and
         // missing, fail. Replay rejection is opt-in via a separate
-        // `NonceTracker` integration (Phase 4b).
+        // `NonceTracker` integration.
         let nonce = parse_nonce_field(p, config.require_nonce)?;
 
         Ok(VerifiedJwt::new_internal(
@@ -691,8 +688,8 @@ fn kid_to_hex(kid: &KeyId) -> String {
 
 /// Verify a JWT signature for the given algorithm.
 ///
-/// Ed25519 is fully implemented in Phase 4a. ES256 / ES256K stub
-/// with `UnsupportedAlgorithm` until a later sub-phase commits
+/// Ed25519 is fully implemented in v0.1. ES256 / ES256K stub
+/// with `UnsupportedAlgorithm` until a future release commits
 /// the `p256` / `k256` crate dependencies; tracked alongside
 /// work.
 fn verify_signature(
@@ -715,10 +712,10 @@ fn verify_signature(
                 .map_err(|_| JwtVerificationError::SignatureInvalid)
         }
         SignatureAlgorithm::Es256 | SignatureAlgorithm::Es256K => {
-            // Chainlinked: Phase 4a recognizes the variants but
-            // does not ship the `p256` / `k256` crate dependencies
-            // yet. Operators configuring these in
-            // `accepted_algorithms` will see this error.
+            // v0.1 recognizes the variants but does not ship the
+            // `p256` / `k256` crate dependencies. Operators
+            // configuring these in `accepted_algorithms` will see
+            // this error; ECDSA support is a v0.2+ feature gate.
             Err(JwtVerificationError::UnsupportedAlgorithm(algorithm))
         }
     }
@@ -762,8 +759,8 @@ fn parse_scope_field(payload: &serde_json::Value) -> JwtScope {
 /// `require_nonce: false` returns `Ok(None)`.
 ///
 /// Replay rejection is opt-in via a separately-supplied
-/// [`crate::wire::NonceTracker`] (Phase 4b integration point);
-/// Phase 4a only extracts the nonce.
+/// [`crate::wire::NonceTracker`]; `verify_jwt` only extracts
+/// the nonce.
 fn parse_nonce_field(
     payload: &serde_json::Value,
     require_nonce: bool,
@@ -817,7 +814,7 @@ pub struct VerifiedCapabilityClaim {
     trace_id: TraceId,
     issued_at: SystemTime,
     expires_at: SystemTime,
-    /// Verified upstream attribution chain (Phase 4e). `None` for
+    /// Verified upstream attribution chain. `None` for
     /// [`crate::wire::ClaimOrigin::SelfOriginated`]; `Some(chain)`
     /// for `DelegatedFromUpstream`. The chain has been
     /// signature- and monotonicity-verified by
@@ -890,9 +887,9 @@ impl VerifiedCapabilityClaim {
     pub fn expires_at(&self) -> SystemTime {
         self.expires_at
     }
-    /// Borrow the verified upstream attribution chain. Phase 4e:
-    /// returns `None` for `SelfOriginated` claims; `Some(chain)`
-    /// for `DelegatedFromUpstream` claims whose chain passed
+    /// Borrow the verified upstream attribution chain. Returns
+    /// `None` for `SelfOriginated` claims; `Some(chain)` for
+    /// `DelegatedFromUpstream` claims whose chain passed
     /// [`verify_attribution_chain`].
     #[must_use]
     pub fn chain(&self) -> Option<&crate::AttributionChain> {
@@ -903,10 +900,9 @@ impl VerifiedCapabilityClaim {
 /// Sync-channel message that has passed handshake-aware
 /// verification (§7.5 + §7.6).
 ///
-/// Phase 4b ships the type *shape*; the actual verification path
-/// requires the sync handshake which lands in Phase 4d. The
-/// crate-internal constructor remains unreachable until 4d
-/// connects the handshake-evidence wiring.
+/// The crate-internal constructor is reachable only via the
+/// sync-handshake wiring; `VerifiedSyncMessage` is constructed
+/// downstream of a verified sync handshake.
 #[derive(Debug, Clone)]
 pub struct VerifiedSyncMessage {
     session_identity: ServiceIdentity,
@@ -1001,9 +997,9 @@ pub enum ClaimVerificationError {
         /// Clock skew tolerated.
         skew: Duration,
     },
-    /// Audience mismatch. Per Phase 4a note, the `got`
-    /// field carries the claimed-audience DID directly (no
-    /// synthetic `ServiceIdentity` placeholder).
+    /// Audience mismatch. The `got` field carries the
+    /// claimed-audience DID directly (no synthetic
+    /// `ServiceIdentity` placeholder).
     #[error("claim wrong audience")]
     WrongAudience {
         /// Expected (local) audience.
@@ -1055,13 +1051,13 @@ pub enum ClaimVerificationError {
     /// checks.
     #[error("scope variant not permitted for class")]
     NonexhaustiveScopeForClass,
-    /// §4.8 W11 / W12 / W13 (Phase 4e): claim is
-    /// `DelegatedFromUpstream` but the wire chain failed
-    /// receipt-verification. Carries the per-hop failure detail
-    /// produced by [`verify_attribution_chain`].
+    /// §4.8 W11 / W12 / W13: claim is `DelegatedFromUpstream`
+    /// but the wire chain failed receipt-verification. Carries
+    /// the per-hop failure detail produced by
+    /// [`verify_attribution_chain`].
     #[error("attribution chain invalid")]
     AttributionChainInvalid(BindError),
-    /// §4.8 W13 (Phase 4e): claim's `capabilities` exceeds the
+    /// §4.8 W13: claim's `capabilities` exceeds the
     /// last chain hop's `granted_capabilities`. The chain itself
     /// passed receipt verification (every hop's signature valid
     /// and inter-hop monotonicity held); the final claim attempted
@@ -1106,9 +1102,10 @@ pub enum ClaimVerificationError {
 /// token that ingress paths accept as evidence that §7.6
 /// verification ran without trusting the caller.
 ///
-/// `ClaimOrigin::DelegatedFromUpstream` payloads are rejected as
-/// `Malformed` in Phase 4b: receipt-chain verification (W11/W12/W13)
-/// lands in Phase 4e. SelfOriginated claims succeed.
+/// Both `ClaimOrigin::SelfOriginated` and
+/// `ClaimOrigin::DelegatedFromUpstream` payloads are supported;
+/// the delegated path walks the receipt chain (W11/W12/W13)
+/// before returning success.
 ///
 /// # Errors
 ///
@@ -1165,9 +1162,8 @@ pub async fn verify_capability_claim(
         return Err(ClaimVerificationError::UnsupportedAlgorithm(signature.algorithm));
     }
 
-    // 6. Audience equality. Per Phase 4a note, the `got`
-    //    field carries the claimed DID directly (not a synthetic
-    //    placeholder ServiceIdentity).
+    // 6. Audience equality. The `got` field carries the claimed
+    //    DID directly (not a synthetic placeholder ServiceIdentity).
     if audience.service_did() != local_audience.service_did() {
         return Err(ClaimVerificationError::WrongAudience {
             expected: local_audience.clone(),
@@ -1233,8 +1229,8 @@ pub async fn verify_capability_claim(
 
     // 11. Re-encode the canonical payload (no signature field) and
     //     verify the signature with domain separation.
-    //     Note: `decode_claim_origin` rejects DelegatedFromUpstream
-    //     in Phase 4b. SelfOriginated payloads round-trip here.
+    //     SelfOriginated and DelegatedFromUpstream payloads both
+    //     round-trip here.
     let received_claim = CapabilityClaim::new_internal_received(
         issuer.clone(),
         audience,
@@ -1279,7 +1275,7 @@ pub async fn verify_capability_claim(
         NonceFreshness::Replay { .. } => return Err(ClaimVerificationError::NonceReplay),
     }
 
-    // 14. §4.8 W11 / W12 / W13 chain verification (Phase 4e).
+    // 14. §4.8 W11 / W12 / W13 chain verification.
     //     If the claim is DelegatedFromUpstream, walk the chain
     //     under origin_authorized_capabilities. The verifier's
     //     request `trace_id` (not the claim's `trace_id_field`)
@@ -1371,16 +1367,16 @@ fn class_permits_scope(
 ///
 /// §7.6 dispatch: the issuer carries an explicit `KeyId`, so
 /// resolution looks for an exact `KeyId` match in the DID
-/// document's verification methods (or, in Phase 4c, the
-/// rotation history). Algorithm must also match. No match →
+/// document's verification methods or the rotation history.
+/// Algorithm must also match. No match →
 /// `IssuerKeyNotInDocument`.
 fn select_signing_key_for_claim(
     document: &crate::resolver::DidDocument,
     expected_key_id: KeyId,
     algorithm: SignatureAlgorithm,
 ) -> Result<PublicKey, ClaimVerificationError> {
-    // Phase 4c: walk both the current
-    // verification_methods AND the document's rotation_history.
+    // Walk both the current verification_methods AND the
+    // document's rotation_history.
     // §4.8 W12 commits rotation-tolerant verification — a claim
     // signed under a previously-active key still verifies if the
     // key is present in the resolved DID document's rotation
@@ -1421,9 +1417,9 @@ fn verify_claim_signature(
                 .map_err(|_| ClaimVerificationError::SignatureInvalid)
         }
         SignatureAlgorithm::Es256 | SignatureAlgorithm::Es256K => {
-            // Phase 4a note: ES256/ES256K primitives
-            // ship in a later sub-phase. Phase 4b keeps the same
-            // stub posture for capability-claim verification.
+            // ES256/ES256K primitives ship in a future release;
+            // v0.1 stubs them with `UnsupportedAlgorithm` for both
+            // JWT and capability-claim verification.
             Err(ClaimVerificationError::UnsupportedAlgorithm(algorithm))
         }
     }
@@ -1619,8 +1615,8 @@ impl VerifiedSyncHello {
     ///   { start: now - DEFAULT_FEDERATION_TIME_WINDOW, end: now })`
     ///   per §7.5 line 6616-6626.
     /// - `PeerKind::Federation` + operator-supplied
-    ///   `PeerTrustConstraints` (Phase 4 placeholder; constraint-
-    ///   shape-extension lands in §7.7 Phase 4f or later) →
+    ///   `PeerTrustConstraints` (v0.1 placeholder; constraint-
+    ///   shape-extension lands in a §7.7 spec patch) →
     ///   honors the operator constraint over the default. The
     ///   current `PeerTrustConstraints` is an empty struct (§7.7
     ///   commitment with no field shape yet); when fields land,
@@ -1649,7 +1645,7 @@ impl VerifiedSyncHello {
                     // → 7-day window ending now. Operator
                     // constraint override would activate here once
                     // PeerTrustConstraints carries
-                    // `max_sync_scope` (Phase 4f or later); current
+                    // `max_sync_scope` (a future release); current
                     // `_constraints` parameter is reserved.
                     let mut narrowed = self.requested_scope.clone();
                     let start = now
@@ -1804,9 +1800,8 @@ impl VerifiedSyncEstablished {
     }
 }
 
-// Phase 4d wires VerifiedSyncMessage's previously-unreachable
-// constructor path. Kept `pub(crate)` so only the verifier in this
-// module can produce one.
+// VerifiedSyncMessage's constructor is `pub(crate)` so only the
+// verifier in this module can produce one.
 impl VerifiedSyncMessage {
     pub(crate) fn new_internal(
         session_identity: ServiceIdentity,
@@ -1826,8 +1821,8 @@ impl VerifiedSyncMessage {
 ///
 /// Walks the §7.5 verification chain in fail-closed order:
 ///
-/// 1. Size + canonical-CBOR round-trip canonicality (Phase 4b's
-///    §7 round-4 hazard discipline applied symmetrically).
+/// 1. Size + canonical-CBOR round-trip canonicality (per §7
+///    round-4 hazard discipline applied symmetrically).
 /// 2. CBOR decode into structured fields plus the carried
 ///    signature.
 /// 3. Algorithm allowlist enforcement (default `[Ed25519]`).
@@ -2323,7 +2318,7 @@ fn handshake_wire_is_canonical_established(bytes: &[u8]) -> bool {
 /// originating JWT scope or service-claim authority). The
 /// alternative ("Pattern A": chain root carries the authority via
 /// extended `DerivationReason` variants) was considered and
-/// declined for Phase 4e — see the Phase 4e completion report.
+/// declined.
 ///
 /// # Errors
 ///
@@ -3042,10 +3037,10 @@ mod tests {
         assert_eq!(v.nonce().unwrap().as_bytes(), &nonce_bytes);
     }
 
-    /// §7.2 commits `NonceReplay` as a variant. Phase 4a does not
-    /// wire replay protection (the `NonceTracker` integration
-    /// lands in Phase 4b); this test simply pins the variant
-    /// exists and is constructible.
+    /// §7.2 commits `NonceReplay` as a variant. `verify_jwt`
+    /// itself does not wire replay protection (the `NonceTracker`
+    /// integration is a separate opt-in); this test simply pins
+    /// the variant exists and is constructible.
     #[test]
     fn nonce_replay_variant_is_reachable() {
         let _e = JwtVerificationError::NonceReplay;
@@ -3325,8 +3320,8 @@ mod tests {
         .unwrap_err();
         match err {
             ClaimVerificationError::WrongAudience { got, .. } => {
-                // Phase 4a note: `got` is a Did, not a
-                // synthetic ServiceIdentity placeholder.
+                // `got` is a Did, not a synthetic
+                // ServiceIdentity placeholder.
                 assert_eq!(got.as_str(), "did:web:audience.example");
             }
             other => panic!("expected WrongAudience, got {other:?}"),
@@ -3616,11 +3611,11 @@ mod tests {
         ));
     }
 
-    /// §4.8 W12 (Phase 4c): a claim signed by a
-    /// key that has been rotated out — present in the resolver's
-    /// `rotation_history`, absent from `verification_methods` —
-    /// still verifies. Phase 4b's exact-match-only logic would
-    /// have rejected with `IssuerKeyNotInDocument` here.
+    /// §4.8 W12: a claim signed by a key that has been rotated
+    /// out — present in the resolver's `rotation_history`, absent
+    /// from `verification_methods` — still verifies. An
+    /// exact-match-only walk would have rejected with
+    /// `IssuerKeyNotInDocument` here.
     #[tokio::test]
     async fn claim_signed_by_rotated_out_key_still_verifies_via_rotation_history() {
         let claim = build_claim();

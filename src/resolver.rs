@@ -5,9 +5,9 @@
 //! §7.3 DID resolution + §7.7 federation-peer-trust trait
 //! surfaces.
 //!
-//! Phase 1 shipped trait shapes; Phase 4c lands the §7.3 default
-//! resolver with two caches (per-request + trust-root), key-
-//! rotation detection, and operator-initiated invalidation.
+//! v0.1 ships trait shapes plus the §7.3 default resolver with
+//! two caches (per-request + trust-root), key-rotation detection,
+//! and operator-initiated invalidation.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,15 +38,16 @@ pub const MAX_TRUST_ROOT_CACHE_AGE: Duration = Duration::from_secs(60);
 
 /// DID document subset the substrate consumes (§7.3).
 ///
-/// Phase 1 shipped a minimal shape; Phase 4c lands the §7.3
-/// fields the cache discipline requires (`resolved_at`,
-/// `resolver_cache_max_age`) plus the §7.3-prose service /
-/// also-known-as additions. The `verification_methods` /
-/// `rotation_history` shape is preserved from Phase 1 for
-/// continuity with Phase 4a/4b's signing-key-selection helpers.
-/// Chainlink for Phase 6: §7.3's prose uses
-/// `Vec<VerificationMethod>` for `verification_methods`; the
-/// in-crate shape carries `Vec<(KeyId, PublicKey)>` instead.
+/// The `verification_methods` field carries the currently-active
+/// signing keys; `rotation_history` carries previous keys whose
+/// rotation evidence is still in scope for §4.8 W12
+/// rotation-tolerant claim verification. The `services` /
+/// `also_known_as` fields are §7.3 prose additions consumed by
+/// the resolver and downstream identity checks.
+///
+/// The §7.3 prose uses `Vec<VerificationMethod>` for
+/// `verification_methods`; the in-crate shape carries
+/// `Vec<(KeyId, PublicKey)>` for ergonomic key lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DidDocument {
@@ -105,7 +106,7 @@ pub enum DidResolutionError {
     /// Once tombstoned, the resolver caches the tombstone and
     /// rejects future resolutions with the same error until
     /// operator-initiated invalidation explicitly removes the
-    /// cached entry. Phase 4c addition.
+    /// cached entry.
     #[error("DID tombstoned")]
     Tombstoned,
 }
@@ -124,13 +125,11 @@ pub enum DidResolutionError {
 /// [`crate::audit::SubstrateAuditEvent::DidDocumentRotated`] /
 /// `DidDocumentInvalidated`, and the audit event must be
 /// attributable to the request that triggered the cache miss
-/// (or, for invalidation, the operator action). Phase 4d adds
-/// the parameter; the resolver-internal audit-emit sites
-/// previously used a placeholder zero-id (operator-pluggable).
+/// (or, for invalidation, the operator action).
 ///
-/// Phase 4c lands [`DefaultDidResolver`] as a substrate-side
-/// default; operators can substitute their own implementations
-/// when they want different cache or transport behavior.
+/// [`DefaultDidResolver`] ships as the substrate-side default;
+/// operators can substitute their own implementations when they
+/// want different cache or transport behavior.
 #[async_trait]
 pub trait DidResolver: Send + Sync {
     /// Resolve `did` to a [`DidDocument`]. The `trace_id` is used
@@ -521,9 +520,9 @@ fn did_method(did: &Did) -> &str {
 }
 
 /// Parse a [`RawDidDoc`] into a [`DidDocument`]. The W3C DID spec
-/// commits a JSON shape; Phase 4c implements the common-subset
-/// parser that handles `did:plc` and `did:web` documents in
-/// ATProto convention.
+/// commits a JSON shape; this is the common-subset parser that
+/// handles `did:plc` and `did:web` documents in ATProto
+/// convention.
 fn parse_did_document(
     did: &Did,
     raw: &RawDidDoc,
@@ -537,11 +536,10 @@ fn parse_did_document(
         for entry in arr {
             // ATProto convention: verificationMethod entries carry
             // an `id` URI fragment, a `controller` DID, and either
-            // `publicKeyMultibase` or `publicKeyJwk`. For Phase 4c
-            // we accept the multibase form (proto-blue's existing
-            // shape) and synthesize a KeyId by hashing the public-
-            // key bytes — note for spec polish on the
-            // KeyId-derivation rule.
+            // `publicKeyMultibase` or `publicKeyJwk`. v0.1 accepts
+            // the multibase form (proto-blue's existing shape) and
+            // synthesizes a KeyId by hashing the public-key bytes —
+            // note for spec polish on the KeyId-derivation rule.
             let id = entry
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -549,10 +547,10 @@ fn parse_did_document(
             let key_bytes = decode_multibase_key(entry).ok_or(DidResolutionError::Malformed)?;
             // Synthesize a KeyId from the id-fragment suffix where
             // possible; otherwise from a Blake3-equivalent stand-
-            // in. For Phase 4c we use the first 32 bytes of a
-            // SHA-2-style mixing of the key bytes by zero-padding
-            // — this is a placeholder until §7.3's KeyId derivation
-            // rule is committed in spec polish.
+            // in. v0.1 uses the first 32 bytes of a SHA-2-style
+            // mixing of the key bytes by zero-padding — this is a
+            // placeholder until §7.3's KeyId derivation rule is
+            // committed in spec polish.
             let key_id = synthesize_key_id(id, &key_bytes);
             verification_methods.push((
                 key_id,
@@ -615,9 +613,9 @@ fn parse_did_document(
 }
 
 /// Decode the `publicKeyMultibase` value from a verification-
-/// method entry. Phase 4c handles the `z`-prefixed base58btc
-/// form ATProto uses; other multibase variants surface as `None`
-/// → `Malformed`.
+/// method entry. v0.1 handles the `z`-prefixed base58btc form
+/// ATProto uses; other multibase variants surface as `None` →
+/// `Malformed`.
 fn decode_multibase_key(entry: &serde_json::Value) -> Option<[u8; 32]> {
     let mb = entry.get("publicKeyMultibase").and_then(|v| v.as_str())?;
     if !mb.starts_with('z') {
@@ -625,8 +623,8 @@ fn decode_multibase_key(entry: &serde_json::Value) -> Option<[u8; 32]> {
     }
     // Strip the `z` prefix; the remainder is base58btc.
     let payload = &mb[1..];
-    // Phase 4c uses a minimal base58btc decoder rather than
-    // pulling in another crypto crate. The payload encodes the
+    // v0.1 uses a minimal base58btc decoder rather than pulling
+    // in another crypto crate. The payload encodes the
     // public-key bytes with a 2-byte multicodec prefix
     // (0xed 0x01 for Ed25519). Strip the prefix and accept the
     // 32 bytes that follow.
@@ -667,11 +665,12 @@ fn base58btc_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Synthesize a [`KeyId`] for a verification method. ATProto
-/// convention for the `KeyId` derivation rule isn't fully
-/// committed in §7.3; Phase 4c uses the suffix of the
+/// convention for the `KeyId` derivation rule is not fully
+/// committed in §7.3; v0.1 uses the suffix of the
 /// verification-method id (the part after `#`) padded/hashed to
-/// 32 bytes via a deterministic mixing scheme. Chainlink for
-/// Phase 6 polish.
+/// 32 bytes via a deterministic mixing scheme. The derivation
+/// rule is stable across the v0.1.x line and may be revisited
+/// alongside a §7.3 derivation-rule clarification.
 fn synthesize_key_id(id_uri: &str, key_bytes: &[u8; 32]) -> KeyId {
     // Take the suffix after '#' (e.g., `#atproto`).
     let suffix = id_uri.rsplit('#').next().unwrap_or(id_uri);
@@ -710,7 +709,7 @@ pub struct PeerHealth {
     /// When the resolver last observed activity from this peer.
     pub last_observed_at: std::time::SystemTime,
     /// Operator-visible health notes. Bounded length (§7.5
-    /// round-5 patch bound `PeerHealth.operator_notes`); Phase 4
+    /// round-5 patch bound `PeerHealth.operator_notes`); v0.1
     /// enforces the cap.
     pub operator_notes: String,
 }
@@ -1178,9 +1177,8 @@ mod tests {
     // ============================================================
     // §6.4 — trace_id propagation behavioral test.
     //
-    // Phase 4d Commit 2 threaded trace_id through DidResolver but
-    // did not include a behavioral test pinning the audit-emit
-    // side. Phase 4e C7 closes that gap.
+    // Behavioral test pinning trace_id propagation through
+    // DidResolver into the audit-emit side.
     // ============================================================
 
     use crate::audit::{AuditError, SubstrateAuditEvent, SubstrateAuditSink};

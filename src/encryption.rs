@@ -4,7 +4,7 @@
 
 //! §8 encryption-hook surfaces — **type vocabulary only**.
 //!
-//! Phase 1 ships the opaque key-id types
+//! v0.1 ships the opaque key-id types
 //! ([`AuditEncryptionKeyId`], [`RecordEncryptionKeyId`]) and the
 //! empty algorithm enums ([`AuditEncryptionAlgorithm`],
 //! [`RecordEncryptionAlgorithm`]) per §8.5's commitment.
@@ -13,8 +13,9 @@
 //! `RecordEncryptionResolver`, `EncryptionResolverSet`) and the
 //! context structs are committed as **surface-only** placeholders
 //! here so the §4.4 [`SensitiveRepresentation`] type and the §4.9
-//! audit pipeline can refer to them. Phase 5 implements the trait
-//! surfaces in full; v1 ships no concrete resolver implementations.
+//! audit pipeline can refer to them. A future release implements
+//! the trait surfaces in full; v1 ships no concrete resolver
+//! implementations.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -172,7 +173,7 @@ pub enum EncryptionError {
 /// performs encrypt/decrypt on audit-event sensitive layers
 /// (§8.2).
 ///
-/// **Phase 1 ships the trait surface only.** v1 has no default
+/// **v0.1 ships the trait surface only.** v1 has no default
 /// implementation; substrates configured without a resolver emit
 /// audit events with [`crate::target::TargetRepresentation::sensitive`]
 /// = `None`.

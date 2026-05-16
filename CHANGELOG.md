@@ -86,8 +86,8 @@ authority discipline end-to-end.
 ### Removed
 
 - `from_sync_channel_handshake` placeholder constructor and
-  `VerifiedHandshake` placeholder type. Both were Phase 1
-  surfaces never wired; superseded by the three-message
+  `VerifiedHandshake` placeholder type. Both were unwired
+  pre-v0.1 surfaces; superseded by the three-message
   sync-handshake protocol (`VerifiedSyncHello`,
   `VerifiedSyncAccept`, `VerifiedSyncEstablished`) +
   post-handshake `VerifiedSyncMessage` shipped with the

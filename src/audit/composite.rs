@@ -500,14 +500,14 @@ where
     F: AsyncFnOnce(&CompositeAuditScope) -> Result<R, E>,
     E: From<CompositeAuditError>,
 {
-    // Phase 7b: composite_op_id is generated fresh per scope.
-    // The per-process tracker for op_id collisions / GC lands
-    // in a future cycle (TRACKER_SHARDS / TRACKER_GRACE_WINDOW
+    // composite_op_id is generated fresh per scope. The
+    // per-process tracker for op_id collisions / GC lands in a
+    // future cycle (TRACKER_SHARDS / TRACKER_GRACE_WINDOW
     // constants are reserved).
     let composite_op_id = generate_composite_op_id();
     let scope = CompositeAuditScope::new_internal(trace_id, composite_op_id);
 
-    // Phase 1: run the op.
+    // Step 1: run the op.
     let op_result = op(&scope).await;
     let returned = match op_result {
         Ok(r) => r,
@@ -518,7 +518,7 @@ where
         }
     };
 
-    // Phase 2: commit queued events in priority order.
+    // Step 2: commit queued events in priority order.
     let queued = scope.drain_queued_events();
     let dispatcher = AuditSinksDispatcher { sinks };
 
@@ -533,7 +533,7 @@ where
         match commit_result {
             Ok(()) => scope.record_committed(class),
             Err(commit_err) => {
-                // Phase 3: rollback. Fire markers to sinks that
+                // Step 3: rollback. Fire markers to sinks that
                 // already committed (in reverse priority order).
                 handle_rollback(&scope, &dispatcher, sinks, class, commit_err).await
                     .map_err(E::from)?;

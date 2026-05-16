@@ -9,7 +9,7 @@
 //! crate's unit tests; this suite verifies what consumers *can*
 //! depend on.
 //!
-//! Phase B verification points (Chrys-run) that this suite covers:
+//! Verification points this suite covers:
 //!
 //! - The closed-namespace capability vocabulary is visible and
 //!   stable.
@@ -136,8 +136,9 @@ fn v1_max_age_table_matches_spec() {
         <ModeratorTakedown as ModerationCapability>::MAX_AGE,
         Duration::from_secs(10)
     );
-    // ModeratorRestore is a Phase-1 interpretation (§4.7 spec
-    // table didn't list it). See CHAINLINKS #6.
+    // ModeratorRestore is a v0.1 interpretation (§4.7 spec
+    // table did not list it; the substrate ships a conservative
+    // 30s window matched to the takedown window).
     assert_eq!(
         <ModeratorRestore as ModerationCapability>::MAX_AGE,
         Duration::from_secs(30)

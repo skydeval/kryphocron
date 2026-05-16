@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! §4.3 capability proof types — four parallel families with
-//! wired bind + reborrow pipelines (Phase 7d).
+//! wired bind + reborrow pipelines.
 //!
 //! Each capability class has a triple:
 //!
@@ -104,14 +104,11 @@
 //! doesn't expose its fields generically; need a sealed
 //! per-class extraction trait") and enrichment in v0.2.
 //!
-//! ## Module-level `#![allow(dead_code)]` (Phase 7d C9)
+//! ## Module-level `#![allow(dead_code)]`
 //!
-//! Phase 4e CHAINLINKS #11 added the module-level allow because
-//! the proof types' fields were unconsumed (Phase 1 only shipped
-//! the type architecture). 7d wires bind+reborrow but the
-//! `issuer: AuthorityId` and `capability_kind: CapabilityKind`
-//! fields on each `*Proof` remain unread inside the crate —
-//! they're forensic-correlation data stored for future
+//! The `issuer: AuthorityId` and `capability_kind: CapabilityKind`
+//! fields on each `*Proof` are unread inside the crate today —
+//! they carry forensic-correlation data stored for the
 //! `Bound*Proof::issuer()` and `Bound*Proof::capability_kind()`
 //! accessor methods that v0.2 will ship for substrate code that
 //! holds bound proofs across operations. The allow stays until
@@ -132,7 +129,7 @@ use crate::proto::Did;
 use crate::sealed;
 
 // ============================================================
-// Phase 7d §4.3 bind/reborrow shared helpers + BindFlow.
+// §4.3 bind/reborrow shared helpers + BindFlow.
 // ============================================================
 
 /// §4.3 bind-pipeline outcome carried via [`crate::audit::composite_audit`]'s
@@ -286,7 +283,7 @@ impl<C: UserCapability> UserProof<C> {
     /// outcome the audit emit fires first and `Err(BindError)` is
     /// returned.
     ///
-    /// Pipeline (Phase 7d v0.1):
+    /// Pipeline (v0.1):
     /// - **Pre-checks** (no audit): target match, context match,
     ///   expiry. Caller errors fail fast.
     /// - **Stage 0 — DeprecationGate** (write-semantics only): the
@@ -634,7 +631,7 @@ impl<E: Endpoint> ChannelProof<E> {
 
     /// Bind the channel proof against a target.
     ///
-    /// Consumes `self`. Pipeline (Phase 7d v0.1):
+    /// Consumes `self`. Pipeline (v0.1):
     /// - **Pre-checks** (no audit): target match, context match,
     ///   expiry.
     /// - **Stage 5 — Audit emit**: emits
@@ -909,12 +906,12 @@ impl<S: SubstrateScope> SubstrateProof<S> {
 
     /// Bind the substrate proof against a scope target.
     ///
-    /// Consumes `self`. Pipeline (Phase 7d v0.1):
+    /// Consumes `self`. Pipeline (v0.1):
     /// - **Pre-checks** (no audit): target match, context match,
     ///   expiry.
     /// - **Service-only enforcement**: substrate bind requires
     ///   the AuthContext requester be [`Requester::Service`] (per
-    ///   §4.6 read-everything-authority discipline + Phase 7c
+    ///   §4.6 read-everything-authority discipline + the §4.3
     ///   issuance gate). If somehow precheck_context_match passed
     ///   but the requester is a Did, returns
     ///   [`BindError::ContextMismatch`] (defense in depth).
@@ -947,8 +944,8 @@ impl<S: SubstrateScope> SubstrateProof<S> {
         precheck_context_match(&self.requester, ctx)?;
         precheck_expired(self.issued_at, S::MAX_AGE)?;
 
-        // Substrate-class is Service-only (§4.6 +
-        // Phase 7c gate). Extract ServiceIdentity from
+        // Substrate-class is Service-only (§4.6 + the §4.3
+        // issuance gate). Extract ServiceIdentity from
         // AuthContext for the audit event's `service` field.
         let service = match ctx.requester() {
             Requester::Service(svc) => svc.clone(),
@@ -1143,7 +1140,7 @@ impl<C: ModerationCapability> ModerationProof<C> {
 
     /// Bind the moderation proof against a target.
     ///
-    /// Consumes `self`. Pipeline (Phase 7d v0.1):
+    /// Consumes `self`. Pipeline (v0.1):
     /// - **Pre-checks** (no audit): target match, context match,
     ///   expiry.
     /// - **Stage 0 — DeprecationGate**: consults
@@ -1446,7 +1443,7 @@ mod tests {
     }
 
     // ========================================================
-    // Phase 7d C3 — bind/reborrow shared-helper tests.
+    // bind/reborrow shared-helper tests.
     // ========================================================
 
     /// §4.3 precheck: equal subject vs target → Ok; unequal → TargetMismatch.
@@ -1662,8 +1659,8 @@ mod tests {
         ));
     }
 
-    /// Phase 7d C3: `From<CompositeAuditError> for BindError`
-    /// maps audit-machinery failures to AuditUnavailable, with
+    /// `From<CompositeAuditError> for BindError` maps audit-
+    /// machinery failures to AuditUnavailable, with
     /// InconsistencyUnrecoverable mapping to AuditPanicked.
     #[test]
     fn bind_error_from_composite_audit_error_pins_mapping() {
@@ -1692,7 +1689,7 @@ mod tests {
 }
 
 // ============================================================
-// Phase 7d C4-C7 — bind/reborrow test infrastructure + tests.
+// bind/reborrow test infrastructure + tests.
 // ============================================================
 //
 // Shared mock sinks/oracles + ContextFixture used by the per-
@@ -1986,7 +1983,7 @@ mod bind_test_fixtures {
 }
 
 // ========================================================
-// Phase 7d C4 — UserProof::bind + BoundUserProof::reborrow tests.
+// UserProof::bind + BoundUserProof::reborrow tests.
 // ========================================================
 
 #[cfg(test)]
@@ -1999,7 +1996,7 @@ mod user_bind_tests {
     use crate::oracle::{BlockOracleQuery, BlockState};
     use std::time::Duration;
 
-    /// Helper: issue a UserProof<ViewPrivate> via the Phase 7c
+    /// Helper: issue a UserProof<ViewPrivate> via the §4.3
     /// chokepoint so the resulting proof carries the same
     /// trace_id/requester/issuer the bind path expects.
     fn issue_view_private_for(
@@ -2249,7 +2246,7 @@ mod user_bind_tests {
 }
 
 // ========================================================
-// Phase 7d C5 — ChannelProof::bind + BoundChannelProof::reborrow tests.
+// ChannelProof::bind + BoundChannelProof::reborrow tests.
 // ========================================================
 
 #[cfg(test)]
@@ -2417,7 +2414,7 @@ mod channel_bind_tests {
 }
 
 // ========================================================
-// Phase 7d C6 — SubstrateProof::bind + BoundSubstrateProof::reborrow tests.
+// SubstrateProof::bind + BoundSubstrateProof::reborrow tests.
 // ========================================================
 
 #[cfg(test)]
@@ -2602,7 +2599,7 @@ mod substrate_bind_tests {
 }
 
 // ========================================================
-// Phase 7d C7 — ModerationProof::bind + BoundModerationProof::reborrow tests.
+// ModerationProof::bind + BoundModerationProof::reborrow tests.
 // ========================================================
 
 #[cfg(test)]

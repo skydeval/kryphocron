@@ -128,11 +128,11 @@ pub use self::sinks::{
 ///
 /// `1.0.0` is the v1 contract: §6.2's user-class set, §6.3's
 /// channel-class set, §6.4's substrate-class set (including the
-/// §7-shaped variants whose emission paths land in Phase 4),
-/// §6.5's moderation-class set, §6.6's fallback set, §6.7's
-/// inspection-notification set, §6.1's cross-cutting `trace_id`
-/// / `at` / [`crate::TargetRepresentation`] rules, §6.8's
-/// ordering guarantees, and §6.9's evolution discipline.
+/// §7-shaped variants whose emission paths land in a future
+/// release), §6.5's moderation-class set, §6.6's fallback set,
+/// §6.7's inspection-notification set, §6.1's cross-cutting
+/// `trace_id` / `at` / [`crate::TargetRepresentation`] rules,
+/// §6.8's ordering guarantees, and §6.9's evolution discipline.
 pub const EVENT_SCHEMA_VERSION: SemVer = SemVer::new(1, 0, 0);
 
 #[cfg(test)]
@@ -140,7 +140,7 @@ mod tests {
     use super::*;
 
     /// §6.9 commits `EVENT_SCHEMA_VERSION = SemVer::new(1, 0, 0)`
-    /// for the v1 audit contract. Phase 3 ships v1; bumping this
+    /// for the v1 audit contract. v0.1 ships v1; bumping this
     /// requires a coordinated crate-major bump per §6.9's
     /// schema-major-coincides-with-crate-major rule.
     #[test]

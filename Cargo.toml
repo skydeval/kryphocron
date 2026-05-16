@@ -22,25 +22,26 @@ path = "src/lib.rs"
 
 [dependencies]
 # §9.5 trait-async dependency. Used by the §7 resolver and §8
-# encryption-hook trait surfaces. Phase 1 ships only the trait
-# shapes; concrete impls fire in Phase 4/5.
+# encryption-hook trait surfaces. v0.1 ships trait shapes only;
+# concrete resolver / encryption impls are operator-supplied.
 async-trait = "0.1"
 
 # §9.5 small-vector optimization. Used in capability sets,
-# attribution chains, scope vectors, JWT scope vectors. Phase 1
-# uses it for §4.2 AttributionChain entries (replacing the spec's
-# ArrayVec reference; bounded depth is runtime-enforced by the
-# crate's constructors).
+# attribution chains, scope vectors, JWT scope vectors, and the
+# §4.2 AttributionChain entries (replacing the spec's ArrayVec
+# reference; bounded depth is runtime-enforced by the crate's
+# constructors).
 smallvec = "1.13"
 
 # §9.5 structured error derivation. Used across §4 error enums.
 thiserror = "2"
 
-# §9.5 / §7.2 Ed25519 signature verification. Phase 4a wires this
-# for the JWT verification chain; the v1 algorithm allowlist
-# defaults to Ed25519-only per §7.2's conservative-default
-# discipline. ECDSA variants (ES256/ES256K) are operator opt-in
-# and currently stub with `UnsupportedAlgorithm`.
+# §9.5 / §7.2 Ed25519 signature verification. Wired into the
+# JWT verification chain; the v1 algorithm allowlist defaults
+# to Ed25519-only per §7.2's conservative-default discipline.
+# ECDSA variants (ES256/ES256K) are operator opt-in and
+# currently stub with `UnsupportedAlgorithm` (v0.2+ feature
+# gate).
 #
 # v0.1 polish: tilde-pinned at the current resolved minor
 # (`~2.2`, patch-updates-only). Signature-verification correctness
@@ -59,17 +60,17 @@ ed25519-dalek = "~2.2"
 # breaking), but the tilde marks the pin as discipline-managed.
 base64 = "~0.22"
 
-# §7.2 / §9.5 JSON parsing for JWT headers and payloads. Phase 4a
-# moves this from `optional` to unconditional because the
-# verification path needs JSON parsing on every authenticated
-# request. The `audit-serde-json` feature retains its `dep:serde`
-# activation for the optional `Serialize`/`Deserialize` derives on
-# audit events.
+# §7.2 / §9.5 JSON parsing for JWT headers and payloads.
+# Unconditional dependency because the verification path needs
+# JSON parsing on every authenticated request. The
+# `audit-serde-json` feature retains its `dep:serde` activation
+# for the optional `Serialize`/`Deserialize` derives on audit
+# events.
 serde_json = "1"
 
 # §4.8 / §7.6 / §9.5 deterministic CBOR encoding for the
-# capability-claim wire format. Phase 4b uses ciborium's `Value`
-# tree as the building block and a project-internal canonicalizer
+# capability-claim wire format. Uses ciborium's `Value` tree
+# as the building block and a project-internal canonicalizer
 # (RFC 8949 §4.2.1 length-then-bytewise map-key sort) to produce
 # round-trip-stable signatures. Originally pinned to 0.2 to align
 # with proto-blue's lexicon parsing transitive tree. v0.1 polish:
@@ -82,10 +83,8 @@ ciborium = "~0.2"
 
 # §4.4 / §7.5 / §9.5 keyed Blake3 for session-id derivation
 # (`SubstrateSessionDerivationKey`-keyed over `nonce || entropy`)
-# and session-digest correlation (`CorrelationKey`-keyed over the
-# session id, §4.4). Phase 4d wires both call sites; Phase 1
-# shipped the type vocabulary with the keyed-hash construction
-# stubbed.
+# and session-digest correlation (`CorrelationKey`-keyed over
+# the session id, §4.4). Both call sites are wired in v0.1.
 #
 # v0.1 polish: tilde-pinned at the current resolved minor
 # (`~1.8`, patch-updates-only). Session-digest correlation depends
@@ -106,51 +105,49 @@ blake3 = "~1.8"
 # foundational primitives crate must not silently inherit.
 getrandom = "~0.2"
 
-# Phase 2 (§5 lexicon strategy) deliverable: the companion crate
-# ships the v1 lexicons, the codegen-produced Rust types, and the
-# build-time three-way-consistency-checked registry. The
-# kryphocron crate consumes it for `Tier`, `Visibility`,
-# `UnknownNsid`, `SemVer`, `DeprecationState`,
-# `LexiconRegistryEntry`, `KRYPHOCRON_LEXICON_REGISTRY`, and the
-# validated AT-Protocol identifier types (`Did`, `Nsid`,
-# `RecordKey`, `AtUri`, `Cid`, `Datetime`, `Tid`).
-#
-# The path dependency is the development-tree shape. crates.io
-# publication (Phase 6) will replace it with a `version = "~0.1.0"`
-# pin matching the lexicon-set semver (§5.5).
+# §5 lexicon strategy: the companion crate ships the v1
+# lexicons, the codegen-produced Rust types, and the build-time
+# three-way-consistency-checked registry. The kryphocron crate
+# consumes it for `Tier`, `Visibility`, `UnknownNsid`, `SemVer`,
+# `DeprecationState`, `LexiconRegistryEntry`,
+# `KRYPHOCRON_LEXICON_REGISTRY`, and the validated AT-Protocol
+# identifier types (`Did`, `Nsid`, `RecordKey`, `AtUri`, `Cid`,
+# `Datetime`, `Tid`).
 kryphocron-lexicons = { path = "../kryphocron-lexicons", version = "0.1" }
 
 # §4.6 timing-channel equalization sleep primitive
 # (`tokio::time::sleep` consumed by `crate::timing::equalize_timing`).
-# Phase 7a wired the function body; tokio is now a production dep
-# rather than dev-only. Operators running on a non-tokio async
-# runtime must supply a tokio-compatible reactor or shim.
+# Tokio is a production dependency rather than dev-only;
+# operators on a non-tokio async runtime supply a tokio-
+# compatible reactor or shim. A runtime abstraction is a v0.2+
+# enrichment.
 tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
-# `trybuild` for Phase B's "this should not compile" assertions.
+# `trybuild` for "this should not compile" assertions on the
+# sealed surfaces.
 trybuild = "1"
-# Phase 4a (§7.2 JWT verification) tests are async because
-# `verify_jwt` is async (DID resolution may need network I/O).
-# Use the `tokio::test` macro with a single-thread runtime —
-# tests don't need the multi-thread scheduler.
+# §7.2 JWT verification tests are async because `verify_jwt` is
+# async (DID resolution may need network I/O). Use the
+# `tokio::test` macro with a single-thread runtime — tests
+# don't need the multi-thread scheduler.
 tokio = { version = "1", features = ["macros", "rt"] }
 
 [features]
 default = []
 
-# §9.4 / §6.10 ships `audit-serde-json` for operators consuming
-# JSON audit streams. Phase 1 declares the feature with no impls;
-# Phase 3 (§6 audit-event vocabulary) ships the variant set but
-# defers the transitive `Serialize` / `Deserialize` derive
-# wiring to Phase 6: §6.10's "every reachable type gains the
+# §9.4 / §6.10 `audit-serde-json` feature for operators
+# consuming JSON audit streams. v0.1 ships the audit-event
+# variant set without the transitive `Serialize` / `Deserialize`
+# derive wiring (§6.10's "every reachable type gains the
 # derives" goal requires changes across `crate::identity`
-# (ServiceIdentity's sealed-token PhantomData; Instant fields in
-# `BindOutcomeRepr::Expired`), `kryphocron-lexicons` (SemVer,
-# Nsid, Did currently lack derives), and the `proto-blue` family.
-# Both `cargo build --features audit-serde-json` and `cargo build`
-# succeed — the feature flag is structurally wired and the
-# `serde` / `serde_json` dependencies are correctly optional.
+# (ServiceIdentity's sealed-token PhantomData; Instant fields
+# in `BindOutcomeRepr::Expired`), `kryphocron-lexicons` (SemVer,
+# Nsid, Did currently lack derives), and downstream crates; a
+# v0.2+ enrichment). Both `cargo build --features
+# audit-serde-json` and `cargo build` succeed today — the
+# feature flag is structurally wired and the `serde` /
+# `serde_json` dependencies are correctly optional.
 audit-serde-json = ["dep:serde"]
 
 [dependencies.serde]
@@ -158,12 +155,11 @@ version = "1"
 optional = true
 features = ["derive"]
 
-# `serde_json` was [dependencies.serde_json] optional in Phase 1.
-# Phase 4a (§7.2 JWT verification) needs JSON parsing
-# unconditionally; moved to the unconditional `[dependencies]`
-# block above. The `audit-serde-json` feature still activates
-# `serde` for the optional Serialize/Deserialize derives on
-# audit-event types.
+# `serde_json` lives in the unconditional `[dependencies]`
+# block above because the §7.2 JWT verification path needs
+# JSON parsing on every authenticated request. The
+# `audit-serde-json` feature still activates `serde` for the
+# optional Serialize/Deserialize derives on audit-event types.
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -186,16 +182,17 @@ pedantic = { level = "allow", priority = -1 }
 todo = "deny"
 unimplemented = "deny"
 
-# §4-committed shapes carry large fields (ServiceIdentity holds key
-# material + rotation evidence; DenialReason and AuthDenial carry
-# the full diagnostic payload per round-5). Boxing them would be a
-# wire-format-touching change deferred to Phase 4's perf review;
-# Phase 1 keeps the spec-committed shapes verbatim.
+# §4-committed shapes carry large fields (ServiceIdentity holds
+# key material + rotation evidence; DenialReason and AuthDenial
+# carry the full diagnostic payload per round-5). Boxing them
+# would be a wire-format-touching change; v0.1 keeps the spec-
+# committed shapes verbatim, leaving any perf-driven boxing for
+# v0.2+.
 large_enum_variant = "allow"
 result_large_err = "allow"
 
-# §4.8 CapabilityClaim::new constructor takes 8 args by spec; the
-# alternative (a builder) is a Phase 4 ergonomics decision.
+# §4.8 CapabilityClaim::new constructor takes 8 args by spec;
+# the alternative (a builder) is a v0.2+ ergonomics decision.
 too_many_arguments = "allow"
 
 # The crate's #[must_use] discipline mostly lives on types

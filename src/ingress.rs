@@ -228,7 +228,7 @@ impl<'a> AuthContext<'a> {
             } else if let Some(svc_to_svc) =
                 narrowing_any.downcast_ref::<ServiceToService>()
             {
-                // ServiceToService verification (Phase 7e C3):
+                // ServiceToService verification:
                 // 1. Current ctx.requester must be Service —
                 //    otherwise this is structurally illegal
                 //    (Did → Service requires a trust declaration
@@ -653,7 +653,7 @@ pub struct ServiceToService {
     /// Target service identity.
     pub target: ServiceIdentity,
     /// Operator-managed trust declaration that authorizes the
-    /// delegation. Phase 1 placeholder; §7.4 commits the shape.
+    /// delegation. §7.4 commits the shape.
     pub trust_declaration: ServiceTrustDeclaration,
 }
 
@@ -755,7 +755,7 @@ impl ServiceTrustDeclaration {
 /// empty: an XRPC request IS the origin, so there's no upstream
 /// delegation to rehydrate.
 ///
-/// Phase 4e wires this entry point. The JWT scope itself is not
+/// The JWT scope itself is not
 /// projected into the AuthContext at this layer — downstream
 /// access-control code consults the [`crate::verification::VerifiedJwt`]
 /// directly when it needs to make scope-derived decisions; the
@@ -798,15 +798,15 @@ pub fn from_xrpc_request<'a>(
 ///
 /// The resulting context's [`Requester`] is [`Requester::Service`]
 /// carrying the claim's issuer identity. The attribution chain is
-/// rehydrated from the claim's verified upstream chain (Phase 4e):
+/// rehydrated from the claim's verified upstream chain:
 ///
 /// - For `ClaimOrigin::SelfOriginated` claims, the chain is empty
 ///   — the issuer IS the origin.
 /// - For `ClaimOrigin::DelegatedFromUpstream` claims, the
 ///   verified `crate::AttributionChain` returned by
 ///   [`crate::verification::verify_attribution_chain`] (carried
-///   inside the `VerifiedCapabilityClaim` per Phase 4e C3) is
-///   unpacked into the AuthContext.
+///   inside the `VerifiedCapabilityClaim`) is unpacked into the
+///   AuthContext.
 #[must_use]
 pub fn from_service_request<'a>(
     evidence: crate::verification::VerifiedCapabilityClaim,
@@ -839,7 +839,7 @@ pub fn from_service_request<'a>(
 /// [`Requester::Service`] carrying the session-bound peer
 /// identity from the originating handshake. The attribution chain
 /// is rehydrated from the inner [`crate::verification::VerifiedCapabilityClaim`]'s
-/// verified chain (Phase 4e). The sync-channel hop itself is
+/// verified chain. The sync-channel hop itself is
 /// transport, not delegation, so no extra entry is recorded for
 /// it — the `Requester::Service(session_peer)` carries the
 /// transport context, while the chain captures upstream
@@ -920,8 +920,8 @@ mod tests {
         assert_eq!(MAX_CHAIN_DEPTH, 8);
     }
 
-    /// §4.3 stage 1 (Phase 7c): `Requester::kind()` returns the
-    /// matching [`RequesterKind`] discriminant for each variant.
+    /// §4.3 stage 1: `Requester::kind()` returns the matching
+    /// [`RequesterKind`] discriminant for each variant.
     #[test]
     fn requester_kind_discriminant_matches_variant() {
         assert_eq!(
@@ -959,7 +959,7 @@ mod tests {
     }
 
     // ====================================================
-    // Phase 7e C2-C3 — derive_for tests.
+    // derive_for tests.
     // ====================================================
 
     mod derive_for_fixture {
@@ -1239,8 +1239,8 @@ mod tests {
         assert_eq!(derived.attribution_chain().entries().len(), 1);
     }
 
-    /// §4.2 NarrowCapabilities happy path (v0.1 polish pass 2:
-    /// evolved from Phase 7e's recording-only fixture).
+    /// §4.2 NarrowCapabilities happy path (v0.1 polish pass 2
+    /// evolved this from a recording-only fixture).
     /// Requester unchanged, chain records the dropped
     /// capabilities, AND the post-narrowing AuthContext's
     /// capability set equals the source set minus the drop.
@@ -1849,11 +1849,10 @@ mod tests {
         assert!(matches!(derived.requester(), Requester::Anonymous));
     }
 
-    /// §4.2 anonymous_for_public_read constructor (Phase 7f
-    /// Bucket D2): produces an AuthContext with
-    /// Requester::Anonymous, empty attribution chain, and the
-    /// caller-supplied trace_id / sinks / oracles passed through
-    /// verbatim.
+    /// §4.2 anonymous_for_public_read constructor: produces an
+    /// AuthContext with Requester::Anonymous, empty attribution
+    /// chain, and the caller-supplied trace_id / sinks / oracles
+    /// passed through verbatim.
     #[test]
     fn anonymous_for_public_read_constructs_anonymous_context() {
         let user = CapturingUserSink::new();

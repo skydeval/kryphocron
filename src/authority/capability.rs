@@ -292,7 +292,7 @@ pub struct OracleConsultations {
 /// Sealed: only crate-ship `*OracleResults` types implement it.
 /// Consumers cannot inject custom result types into the
 /// predicate signature, which preserves the §4.3 "single source
-/// of truth" property even though Phase 1 hand-writes the
+/// of truth" property even though v0.1 hand-writes the
 /// `*OracleResults` structs rather than macro-generating them.
 pub trait OracleResultsForCapability<C: ?Sized>: sealed::Sealed {}
 

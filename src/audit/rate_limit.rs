@@ -5,9 +5,9 @@
 //! §4.9 two-tier per-issuer rate limiter — **type-shape only**.
 //!
 //! The [`IssuanceRateLimiter`] struct names the four rate-limit
-//! buckets the §4.3 issuance chokepoint consults. Phase 1 ships
-//! the shape so [`crate::authority`] can refer to it; the
-//! sharded-LRU + token-bucket runtime mechanism lands in Phase 4.
+//! buckets the §4.3 issuance chokepoint consults. v0.1 ships the
+//! shape so [`crate::authority`] can refer to it; a future release
+//! lands the sharded-LRU + token-bucket runtime mechanism.
 
 use std::time::Duration;
 

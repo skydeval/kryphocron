@@ -5,9 +5,9 @@
 //! §4.8 wire-level capability claims, attribution chains, and
 //! delegation-receipt machinery.
 //!
-//! Phase 1 ships the **type vocabulary**. The actual deterministic
+//! v0.1 ships the **type vocabulary** plus the deterministic
 //! CBOR serialization, signature verification, and rotation-history
-//! resolution land in Phase 4 (§7).
+//! resolution committed by §7.
 //!
 //! The wire types are surfaced at the crate root via `pub use`
 //! so consumers refer to them without traversing the `wire`
@@ -38,9 +38,9 @@ pub(crate) use self::claim::{
     wire_bytes_are_canonical as wire_envelope_is_canonical, CLAIM_DOMAIN_TAG,
 };
 
-// Crate-internal re-exports for the `trust` submodule (Phase 4c
-// §7.4). The canonical-CBOR helpers are reused for trust-
-// declaration encode / decode + canonicality check.
+// Crate-internal re-exports for the `trust` submodule (§7.4).
+// The canonical-CBOR helpers are reused for trust-declaration
+// encode / decode + canonicality check.
 pub(crate) use self::canonical_cbor::{
     from_bytes as canonical_cbor_decode, to_canonical_bytes as canonical_cbor_encode,
 };
@@ -61,9 +61,9 @@ pub use self::receipt::{
 // payload canonicalization + signature-verify helpers. The
 // `delegation_receipt_payload_canonical_bytes` and
 // `ATTRIBUTION_RECEIPT_DOMAIN_TAG` re-exports stay declared so
-// future submodules (Phase 4e + later) can pull them through the
-// crate-internal namespace; current usage is via the
-// `verify_delegation_receipt` helper which encapsulates both.
+// future submodules can pull them through the crate-internal
+// namespace; current usage is via the `verify_delegation_receipt`
+// helper which encapsulates both.
 #[allow(unused_imports)]
 pub(crate) use self::receipt::{
     delegation_receipt_payload_canonical_bytes, verify_delegation_receipt,
@@ -86,10 +86,9 @@ pub use self::handshake_tracker::{
     MAX_HANDSHAKE_NONCE_REPLAY_WINDOW, MAX_HANDSHAKE_NONCE_TRACKER_ENTRIES,
 };
 
-// Crate-internal re-exports for `verification` (Phase 4d
-// follow-up): receive-side decoders + canonicality re-encoders.
-// Wired up in Commit 5 (verify_sync_handshake); silenced now to
-// keep this commit's surface usable by the next one.
+// Crate-internal re-exports for `verification`: receive-side
+// decoders + canonicality re-encoders used by
+// `verify_sync_handshake`.
 #[allow(unused_imports)]
 pub(crate) use self::handshake::{
     accept_to_wire_bytes, decode_accept_wire, decode_established_wire,

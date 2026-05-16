@@ -154,11 +154,11 @@ pub mod ingress;
 pub mod oracle;
 
 /// §7.3, §7.7 DID resolution and federation-peer trust trait
-/// surfaces. Phase 1 ships shapes only; concrete resolvers are
+/// surfaces. The crate ships trait shapes; concrete resolvers are
 /// operator territory.
 pub mod resolver;
 
-/// §7.4 service-trust-declaration verification (Phase 4c).
+/// §7.4 service-trust-declaration verification.
 ///
 /// Trust declarations are minted by operator tooling (typically a
 /// CLI signing with a hardware-token-held trust-root key). The
@@ -177,7 +177,7 @@ pub mod tier;
 /// of those types knows verification ran.
 pub mod verification;
 
-// Phase-1 internal areas that span §4 but don't carry their own
+// Internal areas that span §4 but don't carry their own
 // committed public module path in §9.1. We expose them at the
 // crate root to keep the public-surface lookup short.
 mod non_enumeration;
@@ -226,10 +226,10 @@ pub use oracle::{
 };
 pub use proto::{AtUri, BlobRef, Cid, CidError, Datetime, Did, Handle, Nsid, RecordKey, Rkey, Tid, UnknownNsid};
 
-// Phase 2 re-exports from the lexicon companion crate (§5.3 /
-// §5.4 / §5.6). The lexicon set's compiled-in registry is the
-// substrate's runtime trust anchor for tier classification and
-// deprecation state.
+// §5.3 / §5.4 / §5.6 re-exports from the lexicon companion crate.
+// The lexicon set's compiled-in registry is the substrate's
+// runtime trust anchor for tier classification and deprecation
+// state.
 pub use kryphocron_lexicons::{
     DeprecationState, LexiconRegistryEntry, KRYPHOCRON_CODEGEN_HASH,
     KRYPHOCRON_LEXICON_REGISTRY,

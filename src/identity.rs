@@ -117,11 +117,11 @@ pub struct PublicKey {
 /// [`crate::verification::JwtVerificationConfig::accepted_algorithms`].
 ///
 /// `Es256` and `Es256K` are recognized by the JWT parser and the
-/// allowlist mechanism but Phase 4a does not ship the underlying
+/// allowlist mechanism but v0.1 does not ship the underlying
 /// signature primitives — operators configuring them in
 /// `accepted_algorithms` will see verification fail with
 /// [`crate::verification::JwtVerificationError::UnsupportedAlgorithm`]
-/// at the signature-dispatch step. A later sub-phase will add the
+/// at the signature-dispatch step. A future release will add the
 /// `p256` / `k256` crate dependencies; tracked alongside the surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -130,12 +130,12 @@ pub enum SignatureAlgorithm {
     /// header value: `"EdDSA"` (RFC 8037).
     Ed25519,
     /// ECDSA over the NIST P-256 curve. JWT `alg` header value:
-    /// `"ES256"`. Phase 4a recognizes the variant; signature
-    /// verification stubs with `UnsupportedAlgorithm`.
+    /// `"ES256"`. The variant is recognized; signature
+    /// verification stubs with `UnsupportedAlgorithm` in v0.1.
     Es256,
     /// ECDSA over the secp256k1 curve. JWT `alg` header value:
-    /// `"ES256K"`. Phase 4a recognizes the variant; signature
-    /// verification stubs with `UnsupportedAlgorithm`.
+    /// `"ES256K"`. The variant is recognized; signature
+    /// verification stubs with `UnsupportedAlgorithm` in v0.1.
     Es256K,
 }
 
@@ -285,8 +285,7 @@ pub enum RotationChainError {
 /// The `rotation_signature` is a signature by `old_key` over a
 /// canonicalized rotation payload binding `new_key` and
 /// `rotated_at`. The detailed wire shape of the signature payload
-/// is committed in §7.3 and is not Phase 1 work; Phase 1 ships
-/// the type.
+/// is committed in §7.3; v0.1 ships the type vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RotationEntry {

@@ -5,8 +5,8 @@
 //! §4.8 attribution-chain wire format + per-entry delegation
 //! receipts (round-4 + round-5 patches).
 //!
-//! Phase 4e wires the receipt-payload canonical CBOR encoder, the
-//! [`sign_delegation_receipt`] helper for operator tooling that
+//! This module ships the receipt-payload canonical CBOR encoder,
+//! the [`sign_delegation_receipt`] helper for operator tooling that
 //! signs delegation receipts, and the
 //! [`ATTRIBUTION_RECEIPT_DOMAIN_TAG`] constant that domain-
 //! separates receipt signatures from §4.8's other signing
@@ -224,8 +224,9 @@ pub enum ReceiptVerificationFailure {
 /// §4.2.1. Receivers re-encode the decoded payload with this
 /// helper and verify the result byte-equals the on-wire payload —
 /// the round-trip check that closes the §7 round-4 non-canonicality
-/// hazard symmetrically for receipts as Phase 4b did for
-/// capability claims.
+/// hazard symmetrically for receipts as
+/// [`verify_capability_claim`](crate::verification::verify_capability_claim)
+/// does for capability claims.
 #[must_use]
 pub(crate) fn delegation_receipt_payload_canonical_bytes(
     payload: &DelegationReceiptPayload,
@@ -404,7 +405,7 @@ mod tests {
     #[test]
     fn attribution_entry_wire_carries_granted_capabilities_round_5() {
         // §4.8 round-5 patch: AttributionEntryWire has
-        // granted_capabilities. Phase B verifies this field is
+        // granted_capabilities. This test verifies the field is
         // present so the receiving substrate can enforce W13
         // monotonicity.
         let entry = AttributionEntryWire {

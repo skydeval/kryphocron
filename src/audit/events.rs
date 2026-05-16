@@ -339,10 +339,9 @@ pub enum ChannelCloseCause {
 /// transitions, and (under §7's federation surface) DID-document
 /// rotation/invalidation and peer-trust resolution outcomes.
 ///
-/// The §7-shaped variants ship in Phase 3 with placeholder field
+/// The §7-shaped variants ship in v0.1 with placeholder field
 /// types (`PeerOperation`, `PeerTrustConstraints`,
-/// `FallbackTrustPolicy`, `PeerTrustDecision`) per the kickoff's
-/// stub-now-fill-later pattern. §7.7 (Phase 4) lands the
+/// `FallbackTrustPolicy`, `PeerTrustDecision`). §7.7 commits the
 /// federation-side wire-format implementations that produce these
 /// events; the audit-event variant *shapes* committed by §6.4 do
 /// not change.
@@ -474,14 +473,14 @@ pub enum SubstrateAuditEvent {
 
     // ──────── §7 inter-service auth events ────────
     //
-    // Variants below ship in Phase 3 per §6.4. Their event-emission
-    // *paths* are wired in Phase 4 alongside §7's full inter-service
-    // auth implementation. Phase 3 ships the variant shapes so
-    // audit-tooling consumers see the §6.4-committed surface; the
-    // placeholder field types (`PeerOperation`, `InvalidationSource`,
-    // `FallbackTrustPolicy`, `PeerTrustDecision`,
-    // `PeerTrustConstraints`) are minimal v1 shells and Phase 4 may
-    // refine them — see release notes for migration.
+    // Variants below ship per §6.4. The event-emission *paths* are
+    // wired alongside §7's full inter-service auth implementation.
+    // v0.1 ships the variant shapes so audit-tooling consumers see
+    // the §6.4-committed surface; the placeholder field types
+    // (`PeerOperation`, `InvalidationSource`, `FallbackTrustPolicy`,
+    // `PeerTrustDecision`, `PeerTrustConstraints`) are minimal v1
+    // shells and a future release may refine them — see release
+    // notes for migration.
     /// DID document for a verified principal changed between
     /// cache-loaded and current resolution. §7.3 / §6.4.
     DidDocumentRotated {
@@ -631,26 +630,25 @@ pub enum InvalidationSource {
 }
 
 // ============================================================
-// §7-shaped placeholder types for §6.4 audit-event payloads.
+// §7-shaped peer-trust types for §6.4 audit-event payloads.
 // ============================================================
 //
 // §6.4 references `PeerOperation`, `PeerTrustConstraints`,
-// `FallbackTrustPolicy`, and `PeerTrustDecision`. None of these
-// exist in Phase 1's `crate::resolver` — Phase 1 ships the older
-// `TrustOperation` / `TrustDecision` shapes that §7 will replace.
-// Phase 3 ships the §6.4-named types as `#[non_exhaustive]`
-// minimal-v1 shells so the audit-event surface is constructible
-// today; Phase 4's §7.7 implementation either keeps these shapes,
-// extends them, or reconciles with new resolver-side types.
-// Chainlinks track the reconciliation work.
+// `FallbackTrustPolicy`, and `PeerTrustDecision`. v0.1 ships
+// these as `#[non_exhaustive]` minimal-v1 shells so the audit-
+// event surface is constructible today; a future spec patch may
+// extend the variants or reconcile with the resolver-side
+// `TrustOperation` / `TrustDecision` shapes. Operators
+// constructing these from the `#[non_exhaustive]` surface remain
+// forward-compatible.
 
 /// What cross-peer operation a [`SubstrateAuditEvent::PeerTrustGranted`]
 /// / [`SubstrateAuditEvent::PeerTrustDenied`] /
 /// [`SubstrateAuditEvent::PeerTrustUnknown`] is about (§7.7).
 ///
-/// Phase 3 ships v1 with the same three operations
-/// [`crate::resolver::TrustOperation`] enumerates. Phase 4 may
-/// refine or extend.
+/// v0.1 ships with the same three operations
+/// [`crate::resolver::TrustOperation`] enumerates. A future
+/// release may refine or extend.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerOperation {
@@ -665,10 +663,10 @@ pub enum PeerOperation {
 /// Constraints attached to a `TrustedWithConstraints` peer-trust
 /// grant (§7.7).
 ///
-/// Phase 3 ships an empty `#[non_exhaustive]` shell so
+/// v0.1 ships an empty `#[non_exhaustive]` shell so
 /// [`SubstrateAuditEvent::PeerTrustGranted`]'s `constraints:
-/// Option<PeerTrustConstraints>` field is constructible. Phase 4
-/// commits the constraint vocabulary.
+/// Option<PeerTrustConstraints>` field is constructible. A future
+/// release commits the constraint vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct PeerTrustConstraints {}
@@ -676,8 +674,8 @@ pub struct PeerTrustConstraints {}
 /// Operator-configured fallback policy applied when a trust query
 /// returns `Unknown` (§7.7 / §6.4).
 ///
-/// Phase 3 ships v1 with three variants; the spec at §6.4
-/// explicitly mentions `PromptOperator`. Phase 4 may extend.
+/// v0.1 ships with three variants; the spec at §6.4 explicitly
+/// mentions `PromptOperator`. A future release may extend.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FallbackTrustPolicy {
@@ -693,7 +691,7 @@ pub enum FallbackTrustPolicy {
 /// Decision the substrate applied to a peer-trust query in the
 /// interim while a fallback policy resolved (§7.7 / §6.4).
 ///
-/// Phase 3 ships v1 with three variants. Phase 4 may refine.
+/// v0.1 ships with three variants. A future release may refine.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerTrustDecision {
@@ -847,7 +845,7 @@ pub enum FallbackAuditEvent {
     /// A primary sink panicked during emission. Recorded by the
     /// [`crate::audit::SinkPanicGuard`] machinery (§4.3). §6.6.
     ///
-    /// (Renamed from Phase 1's `SinkPanic` to match §6.6's
+    /// (Renamed from an earlier `SinkPanic` draft to match §6.6's
     /// committed identifier.)
     SinkPanicked {
         /// Which sink panicked.
@@ -1406,8 +1404,8 @@ mod tests {
     }
 
     /// §7-shaped placeholder `PeerOperation` ships with three v1
-    /// variants matching `crate::resolver::TrustOperation`. Phase 4
-    /// may extend.
+    /// variants matching `crate::resolver::TrustOperation`. A
+    /// future release may extend.
     #[test]
     fn peer_operation_v1_variant_set_pinned() {
         for o in [
@@ -1582,8 +1580,8 @@ mod tests {
     // ============================================================
 
     /// §6.6 commits exactly two `FallbackAuditEvent` variants:
-    /// `SinkPanicked` (renamed from Phase 1's `SinkPanic`) and
-    /// `CompositeFailure`. Both gained an explicit `at:
+    /// `SinkPanicked` (renamed from an earlier `SinkPanic` draft)
+    /// and `CompositeFailure`. Both gained an explicit `at:
     /// SystemTime` field per §6.1.
     #[test]
     fn fallback_audit_event_v1_variant_set_pinned() {

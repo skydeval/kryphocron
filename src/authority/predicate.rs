@@ -195,7 +195,7 @@ pub enum BindError {
     },
 }
 
-/// Phase 7d: surface `composite_audit` failures as bind errors.
+/// Surface `composite_audit` failures as bind errors.
 ///
 /// Bind paths run their pipeline inside [`crate::audit::composite_audit`]
 /// (§4.9) and need a `From<CompositeAuditError>` impl on
@@ -331,8 +331,8 @@ pub struct PredicateContext<'a> {
 }
 
 impl<'a> PredicateContext<'a> {
-    /// Crate-internal constructor. Consumed by Phase 7d's
-    /// [`crate::UserProof::bind`] pipeline at stage 5
+    /// Crate-internal constructor. Consumed by
+    /// [`crate::UserProof::bind`]'s pipeline at stage 5
     /// (predicate evaluation).
     #[must_use]
     pub(crate) fn new(
@@ -376,10 +376,10 @@ impl<'a> PredicateContext<'a> {
 /// consultations have already executed and their results are
 /// presented as the typed [`UserCapability::OracleResults`].
 ///
-/// `required_jwt_scope` (Phase 4a, §7.2) declares the optional
-/// JWT scope string an operator-issued token must include for
-/// the issuance chokepoint to admit this capability. The default
-/// implementation returns `None` — Phase 1's v1 capabilities
+/// `required_jwt_scope` (§7.2) declares the optional JWT scope
+/// string an operator-issued token must include for the
+/// issuance chokepoint to admit this capability. The default
+/// implementation returns `None` — v0.1's v1 capabilities
 /// inherit the no-scope-required default. Operators wiring
 /// per-capability scope policies override it; mismatch produces
 /// [`crate::AuthDenial::ScopeMismatch`] which the bind path
@@ -427,12 +427,12 @@ mod tests {
     #[test]
     fn pipeline_stage_carries_jwt_scope_per_7_2() {
         // §7.2 extends PipelineStage with JwtScope. Pin the variant
-        // so the extension is part of Phase 1's surface.
+        // so the extension is part of v0.1's surface.
         let _s = PipelineStage::JwtScope;
     }
 
-    /// §4.3 stage 1 (Phase 7c): `RequesterLacksAuthority` carries
-    /// the capability class and the requester kind found. Pin the
+    /// §4.3 stage 1: `RequesterLacksAuthority` carries the
+    /// capability class and the requester kind found. Pin the
     /// variant shape so future refactors don't silently drop a
     /// forensic-correlation field.
     #[test]
@@ -450,7 +450,7 @@ mod tests {
         }
     }
 
-    /// §4.3 stage 0 (Phase 7d): `DenialReason::CapabilityDeprecated`
+    /// §4.3 stage 0: `DenialReason::CapabilityDeprecated`
     /// carries nsid + since_version + successor. Pin the variant
     /// shape so future refactors don't silently drop forensic
     /// detail.
@@ -475,10 +475,10 @@ mod tests {
         }
     }
 
-    /// §4.3 (Phase 7d): `BindError::DeniedAtPipeline { stage,
-    /// reason }` mirrors `BindOutcomeRepr::DeniedAtPipeline`. Pin
+    /// §4.3: `BindError::DeniedAtPipeline { stage, reason }`
+    /// mirrors `BindOutcomeRepr::DeniedAtPipeline`. Pin
     /// constructibility so the bind path's primary denial channel
-    /// is part of Phase 7d's surface.
+    /// is part of the v0.1 surface.
     #[test]
     fn bind_error_denied_at_pipeline_constructible() {
         let e = BindError::DeniedAtPipeline {

@@ -67,7 +67,7 @@ pub use self::v1::{
 
 /// Issue a user-class capability proof (§4.3).
 ///
-/// Pipeline (Phase 7c v0.1):
+/// Pipeline (v0.1):
 ///
 /// - **Stage 1 — requester authority.** User-class accepts
 ///   [`Requester::Did`] (the user themselves) and
@@ -80,7 +80,7 @@ pub use self::v1::{
 ///   `process_authority_id`).
 ///
 /// Stage 0 (§5.6 lexicon-deprecation gate) and stage 2 (subject
-/// ownership / authority check) defer to bind (Phase 7d). Stage 0
+/// ownership / authority check) defer to bind. Stage 0
 /// requires generic NSID extraction from the typed `Subject`; stage 2
 /// is the bind-time predicate's domain
 /// ([`DenialReason::OwnershipCheckFailed`](crate::DenialReason)).
@@ -110,7 +110,7 @@ where
 
 /// Issue a channel-class capability proof (§4.3).
 ///
-/// Pipeline (Phase 7c v0.1):
+/// Pipeline (v0.1):
 ///
 /// - **Stage 1 — requester authority.** Channel-class accepts
 ///   [`Requester::Did`] (a user dispatching a channel
@@ -153,7 +153,7 @@ where
 /// Substrate-class issuance accepts only non-interactive service
 /// principals (§4.6 read-everything-authority discipline).
 ///
-/// Pipeline (Phase 7c v0.1):
+/// Pipeline (v0.1):
 ///
 /// - **Stage 1 — requester authority.** Substrate-class accepts
 ///   [`Requester::Service`] only. [`Requester::Did`] and
@@ -169,7 +169,7 @@ where
 /// (scope-vs-trust-declaration check) is the bind-time
 /// predicate's domain; the
 /// [`crate::ingress::ServiceTrustDeclaration`] surface that
-/// powers it lands as part of Phase 7d.
+/// powers it is exercised end-to-end at bind time.
 ///
 /// # Errors
 ///
@@ -199,7 +199,7 @@ where
 /// through a service-identity-bearing operator surface, never
 /// directly as user-class requesters).
 ///
-/// Pipeline (Phase 7c v0.1):
+/// Pipeline (v0.1):
 ///
 /// - **Stage 1 — requester authority.** Moderation-class accepts
 ///   [`Requester::Service`] only. [`Requester::Did`] and
@@ -209,7 +209,7 @@ where
 ///   a process-static [`AuthorityId`].
 ///
 /// Stage 0 deferred to bind for moderation subjects that carry
-/// an NSID via their inner [`crate::ResourceId`] (Phase 7d).
+/// an NSID via their inner [`crate::ResourceId`].
 /// Stage 2 (jurisdiction check — does this moderator's
 /// service-identity carry authority over the moderation target?)
 /// is also bind-time. The v0.1 jurisdiction model is "any
@@ -245,7 +245,7 @@ where
 }
 
 // ============================================================
-// §7.2 JWT-scope enforcement (Phase 4a).
+// §7.2 JWT-scope enforcement.
 // ============================================================
 
 /// Match the verified JWT's scope against capability `C`'s
@@ -260,12 +260,10 @@ where
 /// fails with `granted: SmallVec::new()`. Issuance paths surface
 /// this as
 /// [`crate::audit::UserAuditEvent::CapabilityIssuanceDenied`] with
-/// [`crate::authority::DenialReason::JwtScopeInsufficient`] —
-/// Phase 4a wires
-/// the matching mechanism; the bind-pipeline surface that
-/// translates the denial to the audit event is staged for the
-/// later Phase 4 sub-phases that bring `issue_user::<C>` out of
-/// stub state.
+/// [`crate::authority::DenialReason::JwtScopeInsufficient`].
+/// `check_jwt_scope_for` provides the matching mechanism;
+/// `issue_user::<C>` is the consuming chokepoint that emits the
+/// audit event on denial.
 ///
 /// # Errors
 ///
@@ -299,7 +297,7 @@ pub(crate) fn check_jwt_scope_required(
 }
 
 // ============================================================
-// Phase 7c §4.3 issuance internals.
+// §4.3 issuance internals.
 // ============================================================
 
 /// §4.3 stage 1: extract the requester [`Did`] from `ctx`,
@@ -344,9 +342,8 @@ fn stage1_extract_requester_did(
 /// gated by §5.6 and surface as predicate-stage failures via the
 /// capability's own logic.
 ///
-/// Consumed by Phase 7d's [`UserProof::bind`] (Write-semantics
-/// only) and [`ModerationProof::bind`] (always) pipelines at
-/// stage 0.
+/// Consumed by [`UserProof::bind`] (Write-semantics only) and
+/// [`ModerationProof::bind`] (always) at pipeline stage 0.
 pub(crate) fn check_stage_0_deprecation(
     nsid: &crate::proto::Nsid,
     now_unix_seconds: i64,
@@ -380,7 +377,7 @@ pub(crate) fn check_stage_0_deprecation(
                         // Operators wanting an audit signal during
                         // grace install a `DeprecatedWriteDuringGrace`
                         // emission on top of bind's own audit emit
-                        // (Phase 7d ships the gate; the grace-window
+                        // (v0.1 ships the gate; the grace-window
                         // audit shim is a v0.2 enrichment).
                         Ok(())
                     }
@@ -436,7 +433,7 @@ mod tests {
     use smallvec::{smallvec, SmallVec};
 
     /// §7.2: when no scope is required, any JWT scope (including
-    /// empty) succeeds. Phase 1's v1 capabilities all inherit the
+    /// empty) succeeds. v0.1's v1 capabilities all inherit the
     /// `None` default — pin via `ViewPrivate`.
     #[test]
     fn no_scope_required_succeeds_with_empty_jwt_scope() {
@@ -508,9 +505,8 @@ mod tests {
     /// PipelineStage::JwtScope, ... }` as the audit-side renderings
     /// of a scope-mismatch denial. The mapping from
     /// `AuthDenial::ScopeMismatch` to those audit shapes lives in
-    /// the bind-pipeline path (later Phase 4 sub-phase); this test
-    /// pins that the variants exist and are constructible from
-    /// outside the audit module.
+    /// the bind-pipeline path; this test pins that the variants
+    /// exist and are constructible from outside the audit module.
     #[test]
     fn jwt_scope_insufficient_and_pipeline_stage_jwt_scope_reachable() {
         let _r = DenialReason::JwtScopeInsufficient {
@@ -527,7 +523,7 @@ mod tests {
     }
 
     // ========================================================
-    // Phase 7c §4.3 issuance chokepoint tests.
+    // §4.3 issuance chokepoint tests.
     // ========================================================
     //
     // Coverage matrix (10 scenarios):
@@ -953,7 +949,7 @@ mod tests {
     }
 
     // ========================================================
-    // Phase 7d §4.3 stage 0 deprecation-gate tests.
+    // §4.3 stage 0 deprecation-gate tests.
     // ========================================================
 
     /// §4.3 stage 0 (§5.6): an Active lexicon NSID passes the
