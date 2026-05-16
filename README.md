@@ -175,7 +175,17 @@ end-to-end:
   audit emit via `composite_audit` → stage 6 timing equalization
   (user-class) → return.
 - **§4.6 timing-channel equalization** — `equalize_timing` +
-  `equalize_timing_target_for::<C>` via tokio.
+  `equalize_timing_target_for::<C>` via `tokio::time::sleep`.
+  Coarse equalization to a deployment-configured target;
+  **NOT** a constant-time discipline. Granularity is limited by
+  the host scheduler (ms-scale jitter on Windows/WSL; tighter on
+  Linux), and a network-side adversary with high-resolution
+  latency measurement can still see through the equalization for
+  short-running operations. Operators with strong timing-channel
+  threat models should treat this as a coarse first defense and
+  layer constant-time-discipline cryptographic primitives + a
+  hardened timing primitive (e.g. randomized jitter, ring-buffered
+  release queues) at the perimeter. Full hardening is v2+ work.
 - **§4.9 composite-audit machinery** — class-priority commit
   order (substrate → moderation → user → channel), rollback
   fan-out to already-committed sinks, fallback-sink escalation
@@ -216,9 +226,6 @@ sealed per-class extraction traits in v0.2:
 User-class oracle consultations consult only the universal
 block-vs-resource-owner query in v0.1 (multi-query consultations
 land alongside a per-capability oracle-results-builder in v0.2).
-`AuthContext::derive_for(NarrowCapabilities)` ships
-recording-only — the `AuthContext` gains a capabilities field in
-v0.2 for structural superset enforcement.
 `tier::visible_to` is tier-only in v0.1; an audience-aware
 overload lands in v0.2.
 Moderation-class reborrow miss is silent at the audit layer in
