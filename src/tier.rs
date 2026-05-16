@@ -48,21 +48,61 @@ use crate::sealed;
 // `Tier::from_nsid` must live in the same crate as `Tier`).
 pub use kryphocron_lexicons::{Tier, UnknownNsid, Visibility};
 
-/// Visibility predicate against an [`crate::AuthContext`].
+/// Visibility predicate against an [`crate::AuthContext`] (§4.1).
 ///
-/// Free function form — `Tier` lives in `kryphocron-lexicons` so
-/// the orphan rules prevent an inherent `impl Tier { fn visible_to
-/// }` from this crate. Phase 4 may revisit by introducing an
-/// extension trait. `Hidden` and `Forbidden` are distinct
-/// **internally** — audit pipelines and operators distinguish
-/// "exists but audience-gated for this viewer" from
-/// "policy-forbidden" — but they collapse to the same wire response
-/// (per §4.1's closed-namespace non-enumeration discipline).
+/// Coarse tier × requester-class predicate. Returns one of three
+/// [`Visibility`] variants:
+///
+/// - [`Visibility::Visible`] — viewer may read.
+/// - [`Visibility::Hidden`] — viewer is audience-gated; the
+///   record exists but is not visible to this viewer at the tier
+///   layer.
+/// - [`Visibility::Forbidden`] — policy-forbidden (e.g., blocked
+///   relationship). Reserved for v0.2 oracle-aware enrichment;
+///   not returned by the v0.1 implementation since visible_to has
+///   no resource-owner DID to consult the block oracle against.
+///
+/// V0.1 matrix:
+///
+/// | Tier            | Anonymous | Did                | Service          |
+/// | --------------- | --------- | ------------------ | ---------------- |
+/// | [`Tier::Public`]  | Visible   | Visible            | Visible          |
+/// | [`Tier::Private`] | Hidden    | Hidden (see below) | Visible (§4.6)   |
+///
+/// **Private + Did returns Hidden conservatively.** visible_to is
+/// structurally tier-only — its signature `(tier, ctx)` carries
+/// neither the value nor its audience field, so audience-membership
+/// can't be consulted at this layer. Callers needing audience-aware
+/// visibility on a specific record should call the bind path
+/// directly (which consults the audience oracle at stage 3 per
+/// Phase 7d). The conservative-Hidden default fails closed for
+/// the read path; bind succeeds for in-audience viewers.
+///
+/// **Private + Service returns Visible** per §4.6
+/// read-everything-authority — substrate-internal machinery
+/// processes records regardless of tier; the tier discipline
+/// exists for user-facing read paths.
+///
+/// `Hidden` and `Forbidden` are distinct **internally** — audit
+/// pipelines and operators distinguish "exists but audience-gated
+/// for this viewer" from "policy-forbidden" — but they collapse
+/// to the same wire response (per §4.1's closed-namespace
+/// non-enumeration discipline).
 #[must_use]
-pub fn visible_to(_tier: Tier, _ctx: &crate::ingress::AuthContext<'_>) -> Visibility {
-    // Phase 1/2: shape only. Phase 4 walks the §4.3 pipeline; the
-    // public predicate result is one of three Visibility variants.
-    unimplemented!("§4.1 visible_to: Phase 4 wires the pipeline");
+pub fn visible_to(tier: Tier, ctx: &crate::ingress::AuthContext<'_>) -> Visibility {
+    use crate::ingress::Requester;
+    match (tier, ctx.requester()) {
+        // Public: visible to everyone.
+        (Tier::Public, _) => Visibility::Visible,
+        // Private + Service: substrate-internal sees all (§4.6).
+        (Tier::Private, Requester::Service(_)) => Visibility::Visible,
+        // Private + Anonymous or Did: Hidden (conservative —
+        // visible_to is tier-only; bind runs the real audience
+        // check).
+        (Tier::Private, _) => Visibility::Hidden,
+        // Tier is #[non_exhaustive]; future variants fail closed.
+        (_, _) => Visibility::Hidden,
+    }
 }
 
 /// Trait carrying a [`Tier`] as a type-level constant.
@@ -239,5 +279,235 @@ mod tests {
             Tier::from_nsid(&nsid),
             Err(UnknownNsid::NotRegistered(_))
         ));
+    }
+
+    // ====================================================
+    // Phase 7e C1 — visible_to tests.
+    // ====================================================
+
+    /// Minimal AuthContext fixture for the visible_to matrix tests.
+    /// visible_to only consults `ctx.requester()`, so the sinks /
+    /// oracles can be no-ops; we only vary the Requester variant.
+    mod visible_to_fixture {
+        use crate::audit::*;
+        use crate::authority::moderation::InspectionNotificationQueueImpl;
+        use crate::oracle::*;
+        use std::time::{Duration, SystemTime};
+
+        pub(super) struct NoSink;
+        impl UserAuditSink for NoSink {
+            fn record(&self, _: UserAuditEvent) -> Result<(), AuditError> {
+                Ok(())
+            }
+        }
+        impl ChannelAuditSink for NoSink {
+            fn record(&self, _: ChannelAuditEvent) -> Result<(), AuditError> {
+                Ok(())
+            }
+        }
+        impl SubstrateAuditSink for NoSink {
+            fn record(&self, _: SubstrateAuditEvent) -> Result<(), AuditError> {
+                Ok(())
+            }
+        }
+        impl ModerationAuditSink for NoSink {
+            fn record(&self, _: ModerationAuditEvent) -> Result<(), AuditError> {
+                Ok(())
+            }
+        }
+        impl FallbackAuditSink for NoSink {
+            fn record_panic(
+                &self,
+                _: SinkKind,
+                _: crate::identity::TraceId,
+                _: crate::authority::CapabilityKind,
+                _: SystemTime,
+            ) {
+            }
+            fn record_composite_failure(
+                &self,
+                _: crate::identity::TraceId,
+                _: CompositeOpId,
+                _: &[SinkKind],
+                _: &[SinkKind],
+                _: SystemTime,
+            ) {
+            }
+            fn record_event(&self, _: FallbackAuditEvent) {}
+        }
+        impl InspectionNotificationQueueImpl for NoSink {
+            fn enqueue(
+                &self,
+                _: &crate::proto::Did,
+                _: crate::authority::InspectionNotification,
+            ) {
+            }
+        }
+
+        pub(super) struct NoOracle;
+        impl BlockOracle for NoOracle {
+            fn block_state(&self, _: &crate::proto::Did, _: &crate::proto::Did) -> BlockState {
+                BlockState::None
+            }
+            fn last_synced_at(&self) -> SystemTime {
+                SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(&self, _: BlockOracleQuery) -> Duration {
+                Duration::ZERO
+            }
+        }
+        impl AudienceOracle for NoOracle {
+            fn audience_state(
+                &self,
+                _: &crate::proto::Did,
+                _: &crate::authority::ResourceId,
+            ) -> AudienceState {
+                AudienceState::NoAudienceConfigured
+            }
+            fn last_synced_at(&self) -> SystemTime {
+                SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(&self, _: AudienceOracleQuery) -> Duration {
+                Duration::ZERO
+            }
+        }
+        impl MuteOracle for NoOracle {
+            fn mute_state(&self, _: &crate::proto::Did, _: &crate::proto::Did) -> MuteState {
+                MuteState::None
+            }
+            fn last_synced_at(&self) -> SystemTime {
+                SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(&self, _: MuteOracleQuery) -> Duration {
+                Duration::ZERO
+            }
+        }
+    }
+
+    use crate::ingress::{
+        AttributionChain, AuditSinks, AuthContext, OracleSet, Requester,
+    };
+    use crate::proto::Did;
+
+    fn build_ctx<'a>(
+        sink: &'a visible_to_fixture::NoSink,
+        oracle: &'a visible_to_fixture::NoOracle,
+        correlation_key: &'a crate::identity::CorrelationKey,
+        requester: Requester,
+    ) -> AuthContext<'a> {
+        AuthContext::new_internal(
+            requester,
+            crate::identity::TraceId::from_bytes([0u8; 16]),
+            AuditSinks {
+                user: sink,
+                channel: sink,
+                substrate: sink,
+                moderation: sink,
+                fallback: sink,
+                inspection_queue: sink,
+                correlation_key,
+            },
+            OracleSet {
+                block: oracle,
+                audience: oracle,
+                mute: oracle,
+            },
+            AttributionChain::empty(),
+        )
+    }
+
+    fn sample_did() -> Did {
+        Did::new("did:plc:phase7e").unwrap()
+    }
+
+    /// §4.1 Public + Anonymous → Visible.
+    #[test]
+    fn public_visible_to_anonymous() {
+        let sink = visible_to_fixture::NoSink;
+        let oracle = visible_to_fixture::NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx = build_ctx(&sink, &oracle, &ck, Requester::Anonymous);
+        assert_eq!(visible_to(Tier::Public, &ctx), Visibility::Visible);
+    }
+
+    /// §4.1 Public + Did → Visible.
+    #[test]
+    fn public_visible_to_did() {
+        let sink = visible_to_fixture::NoSink;
+        let oracle = visible_to_fixture::NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx = build_ctx(&sink, &oracle, &ck, Requester::Did(sample_did()));
+        assert_eq!(visible_to(Tier::Public, &ctx), Visibility::Visible);
+    }
+
+    /// §4.1 Public + Service → Visible.
+    #[test]
+    fn public_visible_to_service() {
+        let sink = visible_to_fixture::NoSink;
+        let oracle = visible_to_fixture::NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc = crate::identity::ServiceIdentity::new_internal(
+            sample_did(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        );
+        let ctx = build_ctx(&sink, &oracle, &ck, Requester::Service(svc));
+        assert_eq!(visible_to(Tier::Public, &ctx), Visibility::Visible);
+    }
+
+    /// §4.1 Private + Anonymous → Hidden (no identity to
+    /// audience-check against).
+    #[test]
+    fn private_hidden_from_anonymous() {
+        let sink = visible_to_fixture::NoSink;
+        let oracle = visible_to_fixture::NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx = build_ctx(&sink, &oracle, &ck, Requester::Anonymous);
+        assert_eq!(visible_to(Tier::Private, &ctx), Visibility::Hidden);
+    }
+
+    /// §4.1 Private + Did → Hidden (conservative; visible_to is
+    /// tier-only and can't audience-check). Documented as the v0.1
+    /// shape — bind path runs the real audience oracle at stage 3.
+    #[test]
+    fn private_hidden_from_did_conservative() {
+        let sink = visible_to_fixture::NoSink;
+        let oracle = visible_to_fixture::NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx = build_ctx(&sink, &oracle, &ck, Requester::Did(sample_did()));
+        assert_eq!(visible_to(Tier::Private, &ctx), Visibility::Hidden);
+    }
+
+    /// §4.1 / §4.6 Private + Service → Visible (substrate-internal
+    /// sees all per read-everything-authority).
+    #[test]
+    fn private_visible_to_service() {
+        let sink = visible_to_fixture::NoSink;
+        let oracle = visible_to_fixture::NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc = crate::identity::ServiceIdentity::new_internal(
+            sample_did(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        );
+        let ctx = build_ctx(&sink, &oracle, &ck, Requester::Service(svc));
+        assert_eq!(visible_to(Tier::Private, &ctx), Visibility::Visible);
     }
 }
