@@ -288,10 +288,11 @@ pub enum ScopeError {
 
 /// 16-byte moderation case identifier (§4.3).
 ///
-/// Future constructors will use `getrandom`-style randomness via
-/// the `OsRng` adapter. Phase 1 ships a manual-byte constructor
-/// only; Phase 4 wires the random constructor once the substrate's
-/// randomness discipline is in place. The shape is committed.
+/// Constructed via [`ModerationCaseId::from_bytes`] from a
+/// caller-supplied 16-byte value (typically generated upstream
+/// from the OS CSPRNG via `getrandom` — the v0.1 surface keeps
+/// case-id generation operator-controlled rather than baking a
+/// random-source choice into the crate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModerationCaseId([u8; 16]);
 

@@ -17,11 +17,15 @@
 //!    [`ModerationCapability`]).
 //! 4. Defines an empty `*OracleResults` struct gated by
 //!    [`OracleResultsForCapability`].
-//! 5. Implements [`IssuancePolicy`] for user-class capabilities
-//!    (stub predicate; Phase 4 fills in real logic).
+//! 5. Implements [`IssuancePolicy`] for user-class capabilities.
+//!    The v1 predicate bodies are permissive (always-Ok) — v0.1
+//!    delegates per-capability policy to the bind path's oracle
+//!    consultations + audience checks. A future enrichment pass
+//!    can swap the permissive predicates for capability-specific
+//!    logic without touching the trait surface.
 //!
-//! Per-capability query sets are Phase-1 interpretations
-//! pending the operator policy team's review (CHAINLINKS #6).
+//! Per-capability query sets are v0.1 interpretations pending
+//! operator-policy review.
 
 use std::time::Duration;
 
@@ -164,8 +168,11 @@ impl IssuancePolicy for ViewPrivate {
         _target: &ResourceId,
         _oracle_results: &ViewPrivateOracleResults,
     ) -> Result<(), DenialReason> {
-        // Phase 1 stub. Phase 4 fills in the audience-membership
-        // / owner ownership logic. For Phase 1, allow.
+        // v0.1: permissive predicate. The bind pipeline
+        // consults the block oracle at stage 2 and (per v0.2
+        // chainlink) the audience oracle at stage 3; predicate-
+        // level audience/ownership refinement lands alongside
+        // those.
         Ok(())
     }
 }

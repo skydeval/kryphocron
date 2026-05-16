@@ -1242,9 +1242,12 @@ pub enum ClaimConstructionError {
         /// Maximum permitted.
         max: Duration,
     },
-    /// Signing operation failed. Phase 4 fills in details; in
-    /// Phase 1 this is the canonical "no signing implementation
-    /// yet" error returned by [`CapabilityClaim::new`].
+    /// Signing operation failed. Currently surfaces the
+    /// issuer-vs-signing-key coherence check (a claim built with
+    /// a signing key whose public half doesn't match
+    /// `issuer.key_material()` would fail verification at every
+    /// receiver; we surface it at construction so operators don't
+    /// ship broken claims).
     #[error("signing failed")]
     SigningFailed,
     /// Operator-supplied rationale exceeded its byte budget.

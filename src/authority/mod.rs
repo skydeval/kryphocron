@@ -59,9 +59,11 @@ pub use self::v1::{
 // Issuance chokepoints (§4.3).
 // ============================================================
 //
-// Four functions, one per class. Phase 1 ships stubs that
-// produce a structured `AuthDenial` rather than a working proof;
-// Phase 4 wires the §4.3 pipeline through the chokepoint.
+// Four functions, one per class. Each runs the §4.3 stage 1
+// requester-authority check and constructs the sealed
+// `*Proof<C>` value on success. Stage 0 (lexicon deprecation
+// gate) and stage 2 (subject ownership) defer to the bind
+// pipeline at `*Proof::bind` (see [`crate::authority::proof`]).
 
 /// Issue a user-class capability proof (§4.3).
 ///

@@ -329,8 +329,9 @@ pub enum CompositeAuditError {
 ///
 /// Constructible **only** within `crate::audit::composite`
 /// (`pub(in crate::audit::composite)` per §4.9 A6 invariant).
-/// Phase 1 ships the type shape; Phase 4 wires the emission
-/// path through a crate-internal sink-dispatch trait.
+/// Emitted by [`composite_audit`]'s rollback path to every
+/// sibling sink that already committed within a scope when a
+/// later sink failed (crate-internal dispatch).
 #[derive(Debug, Clone)]
 pub struct CompositeRollbackMarker {
     pub(in crate::audit::composite) trace_id: TraceId,

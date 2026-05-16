@@ -331,9 +331,10 @@ pub struct SessionDigest([u8; 32]);
 impl SessionDigest {
     /// Construct a [`SessionDigest`] from raw bytes.
     ///
-    /// Phase 1 ships the type; the keyed-hash construction in
-    /// [`SessionDigest::compute`] is stubbed until Phase 4 wires
-    /// in the Blake3 dependency per §9.5.
+    /// Operators typically construct digests via
+    /// [`SessionDigest::compute`] (keyed Blake3 over the session
+    /// id under the deployment correlation key); this constructor
+    /// is for round-tripping persisted digests or for testing.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         SessionDigest(bytes)
