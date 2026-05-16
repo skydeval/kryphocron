@@ -827,16 +827,92 @@ impl<S: SubstrateScope> SubstrateProof<S> {
         }
     }
 
-    /// Bind. Phase 1 stub.
-    pub fn bind<'p>(
+    /// Bind the substrate proof against a scope target.
+    ///
+    /// Consumes `self`. Pipeline (Phase 7d v0.1):
+    /// - **Pre-checks** (no audit): target match, context match,
+    ///   expiry.
+    /// - **Service-only enforcement**: substrate bind requires
+    ///   the AuthContext requester be [`Requester::Service`] (per
+    ///   §4.6 read-everything-authority discipline + Phase 7c
+    ///   issuance gate). If somehow precheck_context_match passed
+    ///   but the requester is a Did, returns
+    ///   [`BindError::ContextMismatch`] (defense in depth).
+    /// - **Stage 5 — Audit emit**: emits
+    ///   [`crate::audit::SubstrateAuditEvent::ScopeBound`] with
+    ///   `outcome: BindOutcomeRepr::Success` via composite_audit.
+    ///   Substrate-class skips stages 0/2-4 (no NSID, no oracles,
+    ///   no predicate per §4.6) and stage 6 timing equalization.
+    ///
+    /// V0.1 audit-detail gap: scope_repr ships with placeholder
+    /// `ScopeKind::Shard` regardless of the actual ScopeSelector
+    /// variant. Real extraction needs a sealed `HasScopeKind`
+    /// trait paralleling HasResourceLocation — v0.2 chainlink.
+    ///
+    /// # Errors
+    ///
+    /// Returns precondition errors without audit emit. Returns
+    /// [`BindError::AuditUnavailable`] / [`BindError::AuditPanicked`]
+    /// on audit-machinery failure.
+    pub async fn bind<'p>(
         self,
-        _ctx: &AuthContext<'_>,
-        _target: &<S as SubstrateScope>::Subject,
+        ctx: &AuthContext<'_>,
+        target: &<S as SubstrateScope>::Subject,
     ) -> Result<BoundSubstrateProof<'p, S>, BindError>
     where
         Self: 'p,
+        <S as SubstrateScope>::Subject: PartialEq,
     {
-        unimplemented!("§4.3 SubstrateProof::bind: Phase 4");
+        precheck_target_match(&self.subject, target)?;
+        precheck_context_match(&self.requester, ctx)?;
+        precheck_expired(self.issued_at, S::MAX_AGE)?;
+
+        // Substrate-class is Service-only (§4.6 +
+        // Phase 7c gate). Extract ServiceIdentity from
+        // AuthContext for the audit event's `service` field.
+        let service = match ctx.requester() {
+            Requester::Service(svc) => svc.clone(),
+            _ => return Err(BindError::ContextMismatch),
+        };
+
+        let trace_id = self.trace_id;
+        let now = std::time::SystemTime::now();
+
+        // V0.1 placeholder: ScopeKind::Shard regardless of variant.
+        // v0.2 chainlink: introduce HasScopeKind sealed trait.
+        let scope_repr = crate::target::TargetRepresentation::structural_only(
+            crate::target::StructuralRepresentation::Scope {
+                kind: crate::target::ScopeKind::Shard,
+            },
+        );
+
+        let _ = target; // validated by precheck_target_match
+
+        let pipeline_result: Result<BindFlow, BindError> =
+            crate::audit::composite_audit(trace_id, ctx.audit(), async |scope| {
+                let event = crate::audit::SubstrateAuditEvent::ScopeBound {
+                    trace_id,
+                    service,
+                    scope_repr,
+                    capability: S::KIND,
+                    outcome: crate::authority::BindOutcomeRepr::Success,
+                    at: now,
+                };
+                scope.emit_substrate(event);
+                Ok(BindFlow::Success)
+            })
+            .await;
+
+        match pipeline_result {
+            Ok(BindFlow::Success) => Ok(BoundSubstrateProof {
+                proof: self,
+                _life: PhantomData,
+            }),
+            Ok(BindFlow::DeniedAtPipeline { stage, reason }) => {
+                Err(BindError::DeniedAtPipeline { stage, reason })
+            }
+            Err(bind_err) => Err(bind_err),
+        }
     }
 }
 
@@ -863,12 +939,65 @@ impl<'p, S: SubstrateScope> BoundSubstrateProof<'p, S> {
         self.proof.trace_id
     }
 
-    /// Reborrow. Phase 1 stub.
-    pub fn reborrow<'r>(
+    /// Re-derive a substrate borrow.
+    ///
+    /// Re-checks expiry against [`SubstrateScope::MAX_AGE`].
+    /// Successful reborrow is silent. On miss, emits
+    /// [`crate::audit::SubstrateAuditEvent::ScopeBound`] with
+    /// `outcome: BindOutcomeRepr::Expired` (no dedicated
+    /// SubstrateReborrowFailed variant exists; reuse the
+    /// success-path variant with the appropriate non-Success
+    /// outcome).
+    pub async fn reborrow<'r>(
         &'r self,
-        _ctx: &AuthContext<'_>,
+        ctx: &AuthContext<'_>,
     ) -> Result<SubstrateProofRef<'r, S>, BindFailureReason> {
-        unimplemented!("§4.3 BoundSubstrateProof::reborrow: Phase 4");
+        if self.proof.issued_at.elapsed() <= S::MAX_AGE {
+            return Ok(SubstrateProofRef { proof: &self.proof });
+        }
+
+        let trace_id = self.proof.trace_id;
+        let now = std::time::SystemTime::now();
+
+        // Substrate reborrow can only happen with a Service
+        // requester (the original bind was Service-only). If the
+        // reborrow ctx isn't Service, fall back to silent failure
+        // — we can't construct a forensic-honest ScopeBound event.
+        let service = match ctx.requester() {
+            Requester::Service(svc) => svc.clone(),
+            _ => return Err(BindFailureReason::Expired),
+        };
+        let scope_repr = crate::target::TargetRepresentation::structural_only(
+            crate::target::StructuralRepresentation::Scope {
+                kind: crate::target::ScopeKind::Shard,
+            },
+        );
+
+        let audit_result: Result<(), BindError> = crate::audit::composite_audit(
+            trace_id,
+            ctx.audit(),
+            async |scope| {
+                let event = crate::audit::SubstrateAuditEvent::ScopeBound {
+                    trace_id,
+                    service,
+                    scope_repr,
+                    capability: S::KIND,
+                    outcome: crate::authority::BindOutcomeRepr::Expired {
+                        issued_at: self.proof.issued_at,
+                        max_age: S::MAX_AGE,
+                    },
+                    at: now,
+                };
+                scope.emit_substrate(event);
+                Ok::<(), BindError>(())
+            },
+        )
+        .await;
+
+        match audit_result {
+            Ok(()) => Err(BindFailureReason::Expired),
+            Err(_) => Err(BindFailureReason::AuditUnavailable),
+        }
     }
 }
 
@@ -1991,6 +2120,191 @@ mod channel_bind_tests {
         assert_eq!(
             CapabilityKind::EmitToSyncChannel.class(),
             CapabilityClass::Channel
+        );
+    }
+}
+
+// ========================================================
+// Phase 7d C6 — SubstrateProof::bind + BoundSubstrateProof::reborrow tests.
+// ========================================================
+
+#[cfg(test)]
+mod substrate_bind_tests {
+    use super::bind_test_fixtures::*;
+    use super::*;
+    use crate::audit::SubstrateAuditEvent;
+    use crate::authority::v1::ScanShard;
+    use crate::authority::{
+        issue_substrate, BindOutcomeRepr, CapabilityClass, CapabilityKind,
+    };
+    use std::time::Duration;
+
+    fn sample_substrate_subject() -> crate::authority::ScopeSelector {
+        crate::authority::ScopeSelector::Shard(
+            crate::authority::ShardRange::new(
+                crate::authority::ShardId::from_bytes([0; 8]),
+                crate::authority::ShardId::from_bytes([0xFF; 8]),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sample_service_identity() -> crate::identity::ServiceIdentity {
+        crate::identity::ServiceIdentity::new_internal(
+            sample_did(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    fn issue_scan_for(
+        ctx: &AuthContext<'_>,
+        subject: crate::authority::ScopeSelector,
+    ) -> SubstrateProof<ScanShard> {
+        match issue_substrate::<ScanShard>(ctx, subject) {
+            Ok(p) => p,
+            Err(_) => panic!("issuance prerequisite failed"),
+        }
+    }
+
+    /// §4.3 / §4.6 happy path: substrate bind with Service
+    /// requester returns Ok(BoundSubstrateProof). One ScopeBound
+    /// event captured with outcome Success.
+    #[tokio::test]
+    async fn bind_succeeds_with_service_requester() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let proof = issue_scan_for(&ctx, sample_substrate_subject());
+
+        let r = proof.bind(&ctx, &sample_substrate_subject()).await;
+        assert!(r.is_ok());
+
+        let captured = fixture.substrate.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            SubstrateAuditEvent::ScopeBound {
+                capability, outcome, ..
+            } => {
+                assert_eq!(*capability, CapabilityKind::ScanShard);
+                assert!(matches!(outcome, BindOutcomeRepr::Success));
+            }
+            other => panic!("expected ScopeBound, got {other:?}"),
+        }
+    }
+
+    /// §4.3 precondition: target ≠ proof.subject → TargetMismatch.
+    #[tokio::test]
+    async fn bind_rejects_target_mismatch_at_precondition() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let proof = issue_scan_for(&ctx, sample_substrate_subject());
+
+        let different_target = crate::authority::ScopeSelector::Shard(
+            crate::authority::ShardRange::new(
+                crate::authority::ShardId::from_bytes([0x10; 8]),
+                crate::authority::ShardId::from_bytes([0x20; 8]),
+            )
+            .unwrap(),
+        );
+        let r = proof.bind(&ctx, &different_target).await;
+        assert!(matches!(r, Err(BindError::TargetMismatch)));
+        assert_eq!(fixture.substrate.captured().len(), 0);
+    }
+
+    /// §4.3 precondition: AuthContext requester ≠ proof.requester
+    /// → ContextMismatch.
+    #[tokio::test]
+    async fn bind_rejects_context_mismatch_at_precondition() {
+        let fixture = BindFixture::new();
+        let svc_a = sample_service_identity();
+        let ctx_a = fixture.build_ctx(Requester::Service(svc_a));
+        let proof = issue_scan_for(&ctx_a, sample_substrate_subject());
+
+        let svc_b = crate::identity::ServiceIdentity::new_internal(
+            sample_did_other(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        );
+        let ctx_b = fixture.build_ctx(Requester::Service(svc_b));
+        let r = proof.bind(&ctx_b, &sample_substrate_subject()).await;
+        assert!(matches!(r, Err(BindError::ContextMismatch)));
+        assert_eq!(fixture.substrate.captured().len(), 0);
+    }
+
+    /// §4.3 reborrow: substrate bound proof inside MAX_AGE
+    /// re-derives silent ProofRef.
+    #[tokio::test]
+    async fn reborrow_succeeds_within_max_age() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let proof = issue_scan_for(&ctx, sample_substrate_subject());
+
+        let bound = match proof.bind(&ctx, &sample_substrate_subject()).await {
+            Ok(b) => b,
+            Err(_) => panic!("bind prerequisite failed"),
+        };
+        let captured_after_bind = fixture.substrate.captured().len();
+
+        let r = bound.reborrow(&ctx).await;
+        assert!(r.is_ok());
+        assert_eq!(
+            fixture.substrate.captured().len(),
+            captured_after_bind,
+            "successful reborrow is silent"
+        );
+    }
+
+    /// §4.3 reborrow: past MAX_AGE returns Expired and emits
+    /// ScopeBound{outcome: Expired} (substrate reuses the
+    /// success-path variant with non-Success outcome — no
+    /// dedicated SubstrateReborrowFailed variant exists).
+    #[tokio::test]
+    async fn reborrow_returns_expired_past_max_age_and_emits_event() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+
+        // ScanShard MAX_AGE = 120s; backdate 200s.
+        let backdated = SubstrateProof::<ScanShard>::new_internal(
+            sample_did(),
+            sample_substrate_subject(),
+            Instant::now() - Duration::from_secs(200),
+            AuthorityId::from_bytes([0u8; 16]),
+            TraceId::from_bytes([0xCD; 16]),
+        );
+        let bound = BoundSubstrateProof {
+            proof: backdated,
+            _life: PhantomData,
+        };
+
+        let r = bound.reborrow(&ctx).await;
+        assert!(matches!(r, Err(BindFailureReason::Expired)));
+
+        let captured = fixture.substrate.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            SubstrateAuditEvent::ScopeBound { outcome, .. } => {
+                assert!(
+                    matches!(outcome, BindOutcomeRepr::Expired { .. }),
+                    "expected outcome=Expired, got {outcome:?}"
+                );
+            }
+            other => panic!("expected ScopeBound{{outcome: Expired}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substrate_class_discriminator_pinned() {
+        assert_eq!(
+            CapabilityKind::ScanShard.class(),
+            CapabilityClass::Substrate
         );
     }
 }
