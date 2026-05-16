@@ -41,12 +41,23 @@ thiserror = "2"
 # defaults to Ed25519-only per §7.2's conservative-default
 # discipline. ECDSA variants (ES256/ES256K) are operator opt-in
 # and currently stub with `UnsupportedAlgorithm`.
-ed25519-dalek = "2"
+#
+# v0.1 polish: tilde-pinned at the current resolved minor
+# (`~2.2`, patch-updates-only). Signature-verification correctness
+# is the highest-stakes correctness surface in the crate; minor
+# bumps must be explicit Cargo.toml edits, not silent transitive
+# resolution drifts.
+ed25519-dalek = "~2.2"
 
-# §7.2 / §9.5 base64url decoding for JWT segment parsing. Pinned
-# to 0.22 to align with the version proto-blue's lexicon parsing
-# transitively pulls in (one major version across the dep tree).
-base64 = "0.22"
+# §7.2 / §9.5 base64url decoding for JWT segment parsing.
+# Originally pinned to 0.22 to align with proto-blue's lexicon
+# parsing (one major version across the dep tree). v0.1 polish:
+# tightened to tilde (`~0.22`) for canonical-encoding stability —
+# accidental minor bumps in a foundational primitives crate must
+# require an explicit Cargo.toml edit. For 0.x crates this is
+# functionally equivalent to a bare `0.22` (cargo treats minor as
+# breaking), but the tilde marks the pin as discipline-managed.
+base64 = "~0.22"
 
 # §7.2 / §9.5 JSON parsing for JWT headers and payloads. Phase 4a
 # moves this from `optional` to unconditional because the
@@ -60,9 +71,14 @@ serde_json = "1"
 # capability-claim wire format. Phase 4b uses ciborium's `Value`
 # tree as the building block and a project-internal canonicalizer
 # (RFC 8949 §4.2.1 length-then-bytewise map-key sort) to produce
-# round-trip-stable signatures. Pinned to 0.2 to align with the
-# version proto-blue's lexicon parsing transitively pulls in.
-ciborium = "0.2"
+# round-trip-stable signatures. Originally pinned to 0.2 to align
+# with proto-blue's lexicon parsing transitive tree. v0.1 polish:
+# tightened to tilde (`~0.2`) — canonical-CBOR output is the
+# wire-format-deciding encoder for signed capability claims; a
+# silent minor bump that altered map-key ordering or tag rendering
+# would invalidate every signature ever produced under the prior
+# encoding.
+ciborium = "~0.2"
 
 # §4.4 / §7.5 / §9.5 keyed Blake3 for session-id derivation
 # (`SubstrateSessionDerivationKey`-keyed over `nonce || entropy`)
@@ -70,16 +86,25 @@ ciborium = "0.2"
 # session id, §4.4). Phase 4d wires both call sites; Phase 1
 # shipped the type vocabulary with the keyed-hash construction
 # stubbed.
-blake3 = "1"
+#
+# v0.1 polish: tilde-pinned at the current resolved minor
+# (`~1.8`, patch-updates-only). Session-digest correlation depends
+# on stable keyed-hash output across versions; minor bumps require
+# explicit Cargo.toml edits.
+blake3 = "~1.8"
 
 # §7.5 / §9.5 OS CSPRNG access for
 # `SubstrateSessionDerivationKey::generate` and the responder-side
 # `responder_entropy` produced fresh per handshake. Already in the
 # transitive dep tree (via ed25519-dalek's rand_core); promoted to
 # a direct dep so the surface is explicit and pinned at the major
-# version we depend on. Pinned to 0.2 to align with the version
-# proto-blue's lexicon parsing transitively pulls in.
-getrandom = "0.2"
+# version we depend on. Originally pinned to 0.2 to align with
+# proto-blue's lexicon parsing transitive tree. v0.1 polish:
+# tightened to tilde (`~0.2`) — CSPRNG access is correctness-
+# critical for unforgeable session derivation; a silent minor bump
+# changing the OS entropy contract is the kind of surface a
+# foundational primitives crate must not silently inherit.
+getrandom = "~0.2"
 
 # Phase 2 (§5 lexicon strategy) deliverable: the companion crate
 # ships the v1 lexicons, the codegen-produced Rust types, and the
