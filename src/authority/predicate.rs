@@ -332,10 +332,10 @@ pub struct PredicateContext<'a> {
 }
 
 impl<'a> PredicateContext<'a> {
-    /// Crate-internal constructor. Reserved for Phase 4f's
-    /// `bind` pipeline; not yet consumed by the crate itself.
+    /// Crate-internal constructor. Consumed by Phase 7d's
+    /// [`crate::UserProof::bind`] pipeline at stage 5
+    /// (predicate evaluation).
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn new(
         requester: &'a Requester,
         trace_id: TraceId,

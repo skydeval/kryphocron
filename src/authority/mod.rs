@@ -341,10 +341,10 @@ fn stage1_extract_requester_did(
 /// registry is authoritative for v1 lexicons; non-v1 NSIDs aren't
 /// gated by §5.6 and surface as predicate-stage failures via the
 /// capability's own logic.
-//
-// Phase 7d C1 ships the gate; consumers (UserProof::bind,
-// ModerationProof::bind) land in C4 / C7 and remove this allow.
-#[allow(dead_code)]
+///
+/// Consumed by Phase 7d's [`UserProof::bind`] (Write-semantics
+/// only) and [`ModerationProof::bind`] (always) pipelines at
+/// stage 0.
 pub(crate) fn check_stage_0_deprecation(
     nsid: &crate::proto::Nsid,
     now_unix_seconds: i64,
