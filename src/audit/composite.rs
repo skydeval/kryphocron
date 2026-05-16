@@ -854,10 +854,12 @@ mod tests {
     ) -> crate::ingress::AuditSinks<'a> {
         // Composite-audit tests don't exercise the inspection
         // queue (it's outside composite-rollback semantics per
-        // §6.7). Use the no-op default to satisfy the AuditSinks
-        // shape.
+        // §6.7) or compute session digests. Use no-op defaults
+        // to satisfy the AuditSinks shape.
         static NO_INSPECTION: crate::authority::NoInspectionNotifications =
             crate::authority::NoInspectionNotifications;
+        static NO_CORRELATION_KEY: crate::identity::CorrelationKey =
+            crate::identity::CorrelationKey::from_bytes([0u8; 32]);
         crate::ingress::AuditSinks {
             user,
             channel,
@@ -865,6 +867,7 @@ mod tests {
             moderation,
             fallback,
             inspection_queue: &NO_INSPECTION,
+            correlation_key: &NO_CORRELATION_KEY,
         }
     }
 

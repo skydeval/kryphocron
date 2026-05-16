@@ -31,7 +31,7 @@ use crate::audit::{
     ChannelAuditSink, FallbackAuditSink, ModerationAuditSink, SubstrateAuditSink,
     UserAuditSink,
 };
-use crate::identity::{ServiceIdentity, TraceId};
+use crate::identity::{CorrelationKey, ServiceIdentity, TraceId};
 use crate::oracle::{AudienceOracle, BlockOracle, MuteOracle};
 use crate::proto::Did;
 use crate::sealed;
@@ -230,6 +230,16 @@ pub struct AuditSinks<'a> {
     /// authoritative" — see [`InspectionNotificationQueueImpl`]
     /// for the discipline.
     pub inspection_queue: &'a dyn InspectionNotificationQueueImpl,
+    /// §4.4 deployment correlation key — channel-class bind
+    /// ([`crate::authority::ChannelProof::bind`]) computes
+    /// `SessionDigest::compute(session_id, correlation_key)` for
+    /// the audit-event `session_digest` field so cross-deployment
+    /// session correlation is foreclosed.
+    ///
+    /// Operators rotate this key infrequently (yearly per §4.4
+    /// guidance); rotation invalidates audit correlation across
+    /// the rotation boundary, which is the designed effect.
+    pub correlation_key: &'a CorrelationKey,
 }
 
 /// Oracle set installed at the substrate process boundary

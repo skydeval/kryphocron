@@ -551,16 +551,135 @@ impl<E: Endpoint> ChannelProof<E> {
         }
     }
 
-    /// Bind. Phase 1 stub.
-    pub fn bind<'p>(
+    /// Bind the channel proof against a target.
+    ///
+    /// Consumes `self`. Pipeline (Phase 7d v0.1):
+    /// - **Pre-checks** (no audit): target match, context match,
+    ///   expiry.
+    /// - **Stage 5 — Audit emit**: emits
+    ///   [`crate::audit::ChannelAuditEvent::ChannelBound`] with
+    ///   `outcome: BindOutcomeRepr::Success` via composite_audit.
+    ///   Channel-class skips stage 0 (ChannelBinding has no NSID),
+    ///   stages 2-4 (Endpoint trait has no ORACLE_CONSULTATIONS or
+    ///   IssuancePolicy), and stage 6 timing equalization
+    ///   (`equalize_timing_target_for` is `<C: UserCapability>`-bounded).
+    ///   The §4.6 timing channel for channel-class bind is
+    ///   structurally narrower (no oracle latency to mask); v0.1
+    ///   defers a per-class equalization helper to a v0.2
+    ///   chainlink.
+    ///
+    /// `session_digest` for the audit event is computed via
+    /// [`crate::SessionDigest::compute`] using the
+    /// [`crate::ingress::AuditSinks::correlation_key`].
+    ///
+    /// # Errors
+    ///
+    /// Returns precondition errors ([`BindError::TargetMismatch`] /
+    /// [`BindError::ContextMismatch`] / [`BindError::Expired`])
+    /// without audit emit. Returns
+    /// [`BindError::AuditUnavailable`] /
+    /// [`BindError::AuditPanicked`] on audit-machinery failure.
+    ///
+    /// **No `DeniedAtPipeline` outcomes in v0.1** — channel-class
+    /// has no stages between preconditions and emit. Operator-
+    /// installable channel-policy denial is a v0.2 surface.
+    pub async fn bind<'p>(
         self,
-        _ctx: &AuthContext<'_>,
-        _target: &<E as Endpoint>::Subject,
+        ctx: &AuthContext<'_>,
+        target: &<E as Endpoint>::Subject,
     ) -> Result<BoundChannelProof<'p, E>, BindError>
     where
         Self: 'p,
+        <E as Endpoint>::Subject: PartialEq,
     {
-        unimplemented!("§4.3 ChannelProof::bind: Phase 4");
+        precheck_target_match(&self.subject, target)?;
+        precheck_context_match(&self.requester, ctx)?;
+        precheck_expired(self.issued_at, E::MAX_AGE)?;
+
+        // Channel subjects (ChannelBinding) carry the peer
+        // ServiceIdentity directly; extract for the audit event.
+        // This downcast is sound only when E::Subject is
+        // ChannelBinding — v1's only Endpoint impls
+        // (EmitToSyncChannel, AppViewSync, GraphSync) all use
+        // ChannelBinding as Subject.
+        //
+        // For v0.1 we need a way to extract (peer, session_id)
+        // from a generic E::Subject. The cleanest path is a sealed
+        // ChannelSubjectShape trait paralleling HasResourceLocation
+        // — but that's another foundation surface. v0.1 ships a
+        // direct cast via Any-style downcast wrapped in the
+        // capability-marker invariant. In practice, the v1
+        // capability_marker! macro hard-codes
+        // `Subject = ChannelBinding`; if a future Endpoint impl
+        // uses a different Subject type, this code path needs the
+        // sealed trait.
+        //
+        // For 7d we punt on the trait surface and use an unsafe-
+        // free approach: add the sealed trait as a v0.2 chainlink;
+        // ship the audit event with a placeholder peer + session
+        // digest derived from the proof's recorded Did + a
+        // synthesized session id for v0.1.
+        //
+        // This is an intentional v0.1 audit-surface gap documented
+        // in the completion report: channel bind audit emits with
+        // peer = synthesized-from-Did, session_digest = computed
+        // from a placeholder session_id. The composite_audit
+        // emission semantics are exercised; the audit-event
+        // forensic detail is degraded.
+
+        let trace_id = self.trace_id;
+        let proof_requester_did = self.requester.clone();
+        let now = std::time::SystemTime::now();
+
+        // v0.1: synthesize a peer ServiceIdentity from the proof's
+        // recorded Did. v0.2 chainlink: extract real peer from
+        // Subject via a sealed `ChannelSubjectShape` trait.
+        let peer_placeholder = crate::identity::ServiceIdentity::new_internal(
+            proof_requester_did.clone(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        );
+        // v0.1: synthesize a session id placeholder. v0.2 chainlink:
+        // extract real session_id from Subject via the same sealed
+        // trait above.
+        let session_id_placeholder =
+            crate::identity::SessionId::from_bytes([0u8; 32]);
+        let session_digest = crate::identity::SessionDigest::compute(
+            &session_id_placeholder,
+            ctx.audit().correlation_key,
+        );
+
+        let _ = target; // v0.1: target validated by precheck_target_match only
+
+        let pipeline_result: Result<BindFlow, BindError> =
+            crate::audit::composite_audit(trace_id, ctx.audit(), async |scope| {
+                let event = crate::audit::ChannelAuditEvent::ChannelBound {
+                    trace_id,
+                    peer: peer_placeholder,
+                    session_digest,
+                    endpoint: E::KIND,
+                    outcome: crate::authority::BindOutcomeRepr::Success,
+                    at: now,
+                };
+                scope.emit_channel(event);
+                Ok(BindFlow::Success)
+            })
+            .await;
+
+        match pipeline_result {
+            Ok(BindFlow::Success) => Ok(BoundChannelProof {
+                proof: self,
+                _life: PhantomData,
+            }),
+            Ok(BindFlow::DeniedAtPipeline { stage, reason }) => {
+                Err(BindError::DeniedAtPipeline { stage, reason })
+            }
+            Err(bind_err) => Err(bind_err),
+        }
     }
 }
 
@@ -587,12 +706,64 @@ impl<'p, E: Endpoint> BoundChannelProof<'p, E> {
         self.proof.trace_id
     }
 
-    /// Reborrow. Phase 1 stub.
-    pub fn reborrow<'r>(
+    /// Re-derive a non-`Copy` channel borrow.
+    ///
+    /// Re-checks expiry against [`Endpoint::MAX_AGE`]. Per §4.3
+    /// reborrow does NOT re-run channel-policy checks — operators
+    /// wanting fresh checks call `bind` again on a fresh proof.
+    /// Success is silent; failure emits
+    /// [`crate::audit::ChannelAuditEvent::ChannelReborrowFailed`]
+    /// and returns [`BindFailureReason::Expired`].
+    pub async fn reborrow<'r>(
         &'r self,
-        _ctx: &AuthContext<'_>,
+        ctx: &AuthContext<'_>,
     ) -> Result<ChannelProofRef<'r, E>, BindFailureReason> {
-        unimplemented!("§4.3 BoundChannelProof::reborrow: Phase 4");
+        if self.proof.issued_at.elapsed() <= E::MAX_AGE {
+            return Ok(ChannelProofRef { proof: &self.proof });
+        }
+
+        let trace_id = self.proof.trace_id;
+        let now = std::time::SystemTime::now();
+        // Same v0.1 placeholder approach as bind() — see the
+        // ChannelProof::bind rustdoc and the completion report.
+        let peer_placeholder = crate::identity::ServiceIdentity::new_internal(
+            self.proof.requester.clone(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        );
+        let session_id_placeholder =
+            crate::identity::SessionId::from_bytes([0u8; 32]);
+        let session_digest = crate::identity::SessionDigest::compute(
+            &session_id_placeholder,
+            ctx.audit().correlation_key,
+        );
+
+        let audit_result: Result<(), BindError> = crate::audit::composite_audit(
+            trace_id,
+            ctx.audit(),
+            async |scope| {
+                let event = crate::audit::ChannelAuditEvent::ChannelReborrowFailed {
+                    trace_id,
+                    peer: peer_placeholder,
+                    session_digest,
+                    endpoint: E::KIND,
+                    reason: BindFailureReason::Expired,
+                    at: now,
+                };
+                scope.emit_channel(event);
+                Ok::<(), BindError>(())
+            },
+        )
+        .await;
+
+        match audit_result {
+            Ok(()) => Err(BindFailureReason::Expired),
+            Err(_) => Err(BindFailureReason::AuditUnavailable),
+        }
     }
 }
 
@@ -992,6 +1163,8 @@ mod tests {
         let oracle: Arc<NoOracle> = Arc::new(NoOracle);
         let inspection: Arc<crate::authority::NoInspectionNotifications> =
             Arc::new(crate::authority::NoInspectionNotifications);
+        let correlation_key =
+            crate::identity::CorrelationKey::from_bytes([0u8; 32]);
 
         let did_a = Did::new("did:plc:contextmatch-a").unwrap();
         let did_b = Did::new("did:plc:contextmatch-b").unwrap();
@@ -1006,6 +1179,7 @@ mod tests {
                 moderation: &*sink,
                 fallback: &*sink,
                 inspection_queue: &*inspection,
+                correlation_key: &correlation_key,
             },
             OracleSet {
                 block: &*oracle,
@@ -1034,6 +1208,7 @@ mod tests {
                 moderation: &*sink,
                 fallback: &*sink,
                 inspection_queue: &*inspection,
+                correlation_key: &correlation_key,
             },
             OracleSet {
                 block: &*oracle,
@@ -1319,6 +1494,7 @@ mod bind_test_fixtures {
         pub moderation: Arc<CapturingModerationSink>,
         pub fallback: Arc<NoopFallback>,
         pub inspection: Arc<CapturingInspection>,
+        pub correlation_key: crate::identity::CorrelationKey,
         pub block: Arc<ConfigurableBlockOracle>,
         pub audience: Arc<NoopAudienceOracle>,
         pub mute: Arc<NoopMuteOracle>,
@@ -1333,6 +1509,7 @@ mod bind_test_fixtures {
                 moderation: Arc::new(CapturingModerationSink::new()),
                 fallback: Arc::new(NoopFallback),
                 inspection: Arc::new(CapturingInspection::new()),
+                correlation_key: crate::identity::CorrelationKey::from_bytes([0u8; 32]),
                 block: Arc::new(ConfigurableBlockOracle {
                     state: BlockState::None,
                 }),
@@ -1358,6 +1535,7 @@ mod bind_test_fixtures {
                     moderation: &*self.moderation,
                     fallback: &*self.fallback,
                     inspection_queue: &*self.inspection,
+                    correlation_key: &self.correlation_key,
                 },
                 OracleSet {
                     block: &*self.block,
@@ -1645,6 +1823,174 @@ mod user_bind_tests {
         assert_eq!(
             CapabilityKind::ViewPrivate.class(),
             CapabilityClass::User
+        );
+    }
+}
+
+// ========================================================
+// Phase 7d C5 — ChannelProof::bind + BoundChannelProof::reborrow tests.
+// ========================================================
+
+#[cfg(test)]
+mod channel_bind_tests {
+    use super::bind_test_fixtures::*;
+    use super::*;
+    use crate::audit::ChannelAuditEvent;
+    use crate::authority::v1::EmitToSyncChannel;
+    use crate::authority::{issue_channel, BindOutcomeRepr, CapabilityClass, CapabilityKind};
+    use std::time::Duration;
+
+    fn sample_channel_subject() -> crate::authority::ChannelBinding {
+        crate::authority::ChannelBinding {
+            peer: crate::identity::ServiceIdentity::new_internal(
+                sample_did(),
+                crate::identity::KeyId::from_bytes([0u8; 32]),
+                crate::identity::PublicKey {
+                    algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                    bytes: [0u8; 32],
+                },
+                None,
+            ),
+            session_id: crate::identity::SessionId::from_bytes([0u8; 32]),
+        }
+    }
+
+    fn issue_emit_for(
+        ctx: &AuthContext<'_>,
+        subject: crate::authority::ChannelBinding,
+    ) -> ChannelProof<EmitToSyncChannel> {
+        match issue_channel::<EmitToSyncChannel>(ctx, subject) {
+            Ok(p) => p,
+            Err(_) => panic!("issuance prerequisite failed"),
+        }
+    }
+
+    /// §4.3 happy path: channel bind with Did requester returns
+    /// Ok(BoundChannelProof). One ChannelBound event captured
+    /// with outcome Success.
+    #[tokio::test]
+    async fn bind_succeeds_with_did_requester() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_emit_for(&ctx, sample_channel_subject());
+
+        let r = proof.bind(&ctx, &sample_channel_subject()).await;
+        assert!(r.is_ok());
+
+        let captured = fixture.channel.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            ChannelAuditEvent::ChannelBound {
+                endpoint, outcome, ..
+            } => {
+                assert_eq!(*endpoint, CapabilityKind::EmitToSyncChannel);
+                assert!(matches!(outcome, BindOutcomeRepr::Success));
+            }
+            other => panic!("expected ChannelBound, got {other:?}"),
+        }
+    }
+
+    /// §4.3 precondition: target ≠ proof.subject → TargetMismatch
+    /// (no audit emit).
+    #[tokio::test]
+    async fn bind_rejects_target_mismatch_at_precondition() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_emit_for(&ctx, sample_channel_subject());
+
+        // Different SessionId than what the proof was issued for
+        let different_target = crate::authority::ChannelBinding {
+            peer: crate::identity::ServiceIdentity::new_internal(
+                sample_did(),
+                crate::identity::KeyId::from_bytes([0u8; 32]),
+                crate::identity::PublicKey {
+                    algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                    bytes: [0u8; 32],
+                },
+                None,
+            ),
+            session_id: crate::identity::SessionId::from_bytes([0xFF; 32]),
+        };
+        let r = proof.bind(&ctx, &different_target).await;
+        assert!(matches!(r, Err(BindError::TargetMismatch)));
+        assert_eq!(fixture.channel.captured().len(), 0);
+    }
+
+    /// §4.3 precondition: AuthContext requester ≠ proof.requester
+    /// → ContextMismatch (no audit emit).
+    #[tokio::test]
+    async fn bind_rejects_context_mismatch_at_precondition() {
+        let fixture = BindFixture::new();
+        let ctx_a = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_emit_for(&ctx_a, sample_channel_subject());
+
+        let ctx_b = fixture.build_ctx(Requester::Did(sample_did_other()));
+        let r = proof.bind(&ctx_b, &sample_channel_subject()).await;
+        assert!(matches!(r, Err(BindError::ContextMismatch)));
+        assert_eq!(fixture.channel.captured().len(), 0);
+    }
+
+    /// §4.3 reborrow: channel bound proof inside MAX_AGE re-derives
+    /// silent ProofRef. No audit emit on success.
+    #[tokio::test]
+    async fn reborrow_succeeds_within_max_age() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_emit_for(&ctx, sample_channel_subject());
+
+        let bound = match proof.bind(&ctx, &sample_channel_subject()).await {
+            Ok(b) => b,
+            Err(_) => panic!("bind prerequisite failed"),
+        };
+        let captured_after_bind = fixture.channel.captured().len();
+
+        let r = bound.reborrow(&ctx).await;
+        assert!(r.is_ok());
+        assert_eq!(
+            fixture.channel.captured().len(),
+            captured_after_bind,
+            "successful reborrow is silent"
+        );
+    }
+
+    /// §4.3 reborrow: past MAX_AGE returns Expired and emits
+    /// ChannelReborrowFailed.
+    #[tokio::test]
+    async fn reborrow_returns_expired_past_max_age_and_emits_event() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+
+        // EmitToSyncChannel MAX_AGE = 60s; backdate 100s.
+        let backdated = ChannelProof::<EmitToSyncChannel>::new_internal(
+            sample_did(),
+            sample_channel_subject(),
+            Instant::now() - Duration::from_secs(100),
+            AuthorityId::from_bytes([0u8; 16]),
+            TraceId::from_bytes([0xCD; 16]),
+        );
+        let bound = BoundChannelProof {
+            proof: backdated,
+            _life: PhantomData,
+        };
+
+        let r = bound.reborrow(&ctx).await;
+        assert!(matches!(r, Err(BindFailureReason::Expired)));
+
+        let captured = fixture.channel.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            ChannelAuditEvent::ChannelReborrowFailed { reason, .. } => {
+                assert!(matches!(reason, BindFailureReason::Expired));
+            }
+            other => panic!("expected ChannelReborrowFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_class_discriminator_pinned() {
+        assert_eq!(
+            CapabilityKind::EmitToSyncChannel.class(),
+            CapabilityClass::Channel
         );
     }
 }

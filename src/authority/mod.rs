@@ -715,6 +715,7 @@ mod tests {
         _moderation: Arc<NoopModerationSink>,
         _fallback: Arc<NoopFallback>,
         _inspection: Arc<NoInspectionNotifications>,
+        _correlation_key: crate::identity::CorrelationKey,
         _block: Arc<NoopBlockOracle>,
         _audience: Arc<NoopAudienceOracle>,
         _mute: Arc<NoopMuteOracle>,
@@ -729,6 +730,7 @@ mod tests {
                 _moderation: Arc::new(NoopModerationSink),
                 _fallback: Arc::new(NoopFallback),
                 _inspection: Arc::new(NoInspectionNotifications),
+                _correlation_key: crate::identity::CorrelationKey::from_bytes([0u8; 32]),
                 _block: Arc::new(NoopBlockOracle),
                 _audience: Arc::new(NoopAudienceOracle),
                 _mute: Arc::new(NoopMuteOracle),
@@ -746,6 +748,7 @@ mod tests {
                     moderation: &*self._moderation,
                     fallback: &*self._fallback,
                     inspection_queue: &*self._inspection,
+                    correlation_key: &self._correlation_key,
                 },
                 OracleSet {
                     block: &*self._block,
