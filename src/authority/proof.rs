@@ -1605,6 +1605,7 @@ mod tests {
                 mute: &*oracle,
             },
             AttributionChain::empty(),
+            crate::authority::capability::CapabilitySet::empty(),
         );
 
         // Match → Ok
@@ -1634,6 +1635,7 @@ mod tests {
                 mute: &*oracle,
             },
             AttributionChain::empty(),
+            crate::authority::capability::CapabilitySet::empty(),
         );
         assert!(matches!(
             precheck_context_match(&did_a, &ctx_anon),
@@ -1961,6 +1963,7 @@ mod bind_test_fixtures {
                     mute: &*self.mute,
                 },
                 AttributionChain::empty(),
+                crate::authority::capability::CapabilitySet::empty(),
             )
         }
     }

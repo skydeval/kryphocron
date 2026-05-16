@@ -250,6 +250,24 @@ impl CapabilitySet {
     pub fn is_empty(&self) -> bool {
         self.kinds.is_empty()
     }
+
+    /// Return a new [`CapabilitySet`] containing every kind in
+    /// `self` that is NOT in `other` (set difference).
+    ///
+    /// Used by [`crate::AuthContext::derive_for`]'s
+    /// `NarrowCapabilities` path to compute the post-narrowing
+    /// capability set after the superset check has confirmed
+    /// `other` is a subset of `self`. Resulting set is
+    /// normalized (deduped + sorted) by [`Self::from_kinds`].
+    #[must_use]
+    pub fn without(&self, other: &CapabilitySet) -> CapabilitySet {
+        CapabilitySet::from_kinds(
+            self.kinds
+                .iter()
+                .copied()
+                .filter(|k| !other.kinds.contains(k)),
+        )
+    }
 }
 
 /// Declared per-capability oracle consultation list (§4.3).

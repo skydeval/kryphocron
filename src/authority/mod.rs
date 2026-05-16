@@ -758,6 +758,7 @@ mod tests {
                     mute: &*self._mute,
                 },
                 AttributionChain::empty(),
+                crate::authority::capability::CapabilitySet::empty(),
             )
         }
     }

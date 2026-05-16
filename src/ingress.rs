@@ -57,6 +57,20 @@ pub struct AuthContext<'a> {
     audit: AuditSinks<'a>,
     oracles: OracleSet<'a>,
     attribution_chain: AttributionChain,
+    /// Capability set the context is authorized to carry
+    /// (§4.2 / §4.8). For `Requester::Did` constructed from a
+    /// verified JWT this is empty in v0.1 — the JWT scope is not
+    /// projected into the AuthContext at the ingress layer; see
+    /// [`from_xrpc_request`]'s doc. For `Requester::Service`
+    /// constructed from a verified capability claim or sync
+    /// message, it carries the claim's authorized capabilities.
+    /// For `Requester::Anonymous` it is empty.
+    ///
+    /// Consumed by [`AuthContext::derive_for`]'s
+    /// `NarrowCapabilities` path: the dropped set must be a
+    /// subset of this field, otherwise the derivation fails
+    /// with [`DeriveError::NarrowingExceedsAuthority`].
+    capabilities: CapabilitySet,
     _no_clone: PhantomData<*const ()>,
 }
 
@@ -80,6 +94,7 @@ impl<'a> AuthContext<'a> {
         audit: AuditSinks<'a>,
         oracles: OracleSet<'a>,
         attribution_chain: AttributionChain,
+        capabilities: CapabilitySet,
     ) -> Self {
         AuthContext {
             requester,
@@ -87,8 +102,21 @@ impl<'a> AuthContext<'a> {
             audit,
             oracles,
             attribution_chain,
+            capabilities,
             _no_clone: PhantomData,
         }
+    }
+
+    /// Borrow the capability set the context is authorized to
+    /// carry (§4.2 / §4.8).
+    ///
+    /// See the [field documentation][Self#fields] for the
+    /// per-requester semantics. v0.1 polish pass 2 adds this
+    /// accessor alongside the structural superset check in
+    /// [`Self::derive_for`]'s `NarrowCapabilities` path.
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilitySet {
+        &self.capabilities
     }
 
     /// Borrow the requester identity.
@@ -161,28 +189,41 @@ impl<'a> AuthContext<'a> {
         // (only the three crate-ship impls exist); the unreachable
         // arm covers a future v0.X variant addition that forgets
         // to extend this match.
-        let (new_requester, derivation_reason, narrowing_kind) =
+        let (new_requester, derivation_reason, narrowing_kind, new_capabilities) =
             if narrowing_any.is::<ToAnonymous>() {
+                // Anonymous carries no capabilities.
                 (
                     Requester::Anonymous,
                     DerivationReason::DropPrivilegeToAnonymous,
                     crate::audit::NarrowingKind::ToAnonymous,
+                    CapabilitySet::empty(),
                 )
             } else if let Some(narrow) = narrowing_any.downcast_ref::<NarrowCapabilities>() {
-                // NarrowCapabilities records the dropped capabilities
-                // in the chain entry. **V0.1 gap**: AuthContext does
-                // not carry a `capabilities: CapabilitySet` field, so
-                // the "dropped is a subset of current" structural check
-                // is not enforceable at this layer. The narrowing
-                // succeeds and the chain entry preserves the forensic
-                // trail. v0.2 may add a capabilities field +
-                // structural superset check.
+                // v0.1 polish pass 2 wires the structural superset
+                // check: the dropped set must be a subset of the
+                // currently-carried capabilities. A caller asking to
+                // drop authority they don't hold is either a
+                // programming bug or a probing attempt; either way
+                // the substrate rejects with a distinct outcome so
+                // forensic analysis can separate this from generic
+                // IllegalNarrowing.
+                if !self.capabilities.is_superset_of(&narrow.drop) {
+                    emit_derived_context(
+                        self,
+                        self.requester.clone(),
+                        crate::audit::NarrowingKind::NarrowCapabilities,
+                        crate::audit::DerivationOutcome::NarrowingExceedsAuthority,
+                        now,
+                    );
+                    return Err(DeriveError::NarrowingExceedsAuthority);
+                }
                 (
                     self.requester.clone(),
                     DerivationReason::NarrowCapabilities {
                         dropped: narrow.drop.clone(),
                     },
                     crate::audit::NarrowingKind::NarrowCapabilities,
+                    self.capabilities.without(&narrow.drop),
                 )
             } else if let Some(svc_to_svc) =
                 narrowing_any.downcast_ref::<ServiceToService>()
@@ -250,6 +291,13 @@ impl<'a> AuthContext<'a> {
                     );
                     return Err(DeriveError::UndeclaredServiceTrust);
                 }
+                // ServiceToService delegation: the resulting
+                // context's capability set is what the operator-
+                // managed trust declaration authorizes — not what
+                // the source service held. This is the §7.4 model:
+                // trust declarations are authority grants from one
+                // service to another, governed by an out-of-band
+                // operator-managed root.
                 (
                     Requester::Service(svc_to_svc.target.clone()),
                     DerivationReason::ServiceToServiceDelegation {
@@ -258,6 +306,7 @@ impl<'a> AuthContext<'a> {
                             .declaration_id(),
                     },
                     crate::audit::NarrowingKind::ServiceToService,
+                    svc_to_svc.trust_declaration.capabilities().clone(),
                 )
             } else {
                 unreachable!(
@@ -300,6 +349,7 @@ impl<'a> AuthContext<'a> {
             self.audit,
             self.oracles,
             new_chain,
+            new_capabilities,
         ))
     }
 }
@@ -548,6 +598,16 @@ pub enum DeriveError {
     /// was supplied.
     #[error("undeclared service trust")]
     UndeclaredServiceTrust,
+    /// `NarrowCapabilities` requested a drop set that exceeded
+    /// the source context's authorized capability set. The
+    /// caller asked to drop authority the context did not hold;
+    /// this is distinct from [`Self::IllegalNarrowing`] (which
+    /// covers structural narrowing misuse) so forensic analysis
+    /// can separate "drop set exceeded authority" — a probing
+    /// or programming-error pattern — from generic structural
+    /// illegality.
+    #[error("narrowing exceeds authority")]
+    NarrowingExceedsAuthority,
 }
 
 // ============================================================
@@ -701,6 +761,20 @@ impl ServiceTrustDeclaration {
 /// directly when it needs to make scope-derived decisions; the
 /// AuthContext carries the requester identity, the trace_id, the
 /// audit sinks, and the oracles.
+///
+/// **Capability set:** v0.1 ships this constructor with
+/// `AuthContext::capabilities` set to `CapabilitySet::empty()`.
+/// JWT scope strings are operator-defined free text (typically
+/// NSID-shaped) and do not map structurally to v1's
+/// [`CapabilityKind`] enumeration; projecting scope into the
+/// capability set would conflate two distinct authority surfaces.
+/// A `Requester::Did` constructed via this path therefore cannot
+/// legally [`AuthContext::derive_for`] a non-empty
+/// `NarrowCapabilities` — the dropped set must be empty (a no-op
+/// narrowing, recorded for forensic continuity) or the derivation
+/// returns [`DeriveError::NarrowingExceedsAuthority`]. Operators
+/// needing scope-aware sub-context derivation consult
+/// [`crate::verification::VerifiedJwt::scope`] directly.
 #[must_use]
 pub fn from_xrpc_request<'a>(
     evidence: crate::verification::VerifiedJwt,
@@ -714,6 +788,7 @@ pub fn from_xrpc_request<'a>(
         sinks,
         oracles,
         AttributionChain::empty(),
+        CapabilitySet::empty(),
     )
 }
 
@@ -740,12 +815,19 @@ pub fn from_service_request<'a>(
 ) -> AuthContext<'a> {
     let issuer = evidence.issuer().clone();
     let chain = evidence.chain().cloned().unwrap_or_else(AttributionChain::empty);
+    // v0.1 polish pass 2: project the verified claim's authorized
+    // capabilities into the AuthContext so `derive_for(
+    // NarrowCapabilities)` can structurally enforce that drops are
+    // subsets of what the claim actually authorized.
+    let capabilities =
+        CapabilitySet::from_kinds(evidence.capabilities().iter().copied());
     AuthContext::new_internal(
         Requester::Service(issuer),
         trace_id,
         sinks,
         oracles,
         chain,
+        capabilities,
     )
 }
 
@@ -782,12 +864,19 @@ pub fn from_sync_channel_message<'a>(
         .chain()
         .cloned()
         .unwrap_or_else(AttributionChain::empty);
+    // v0.1 polish pass 2: project the inner verified claim's
+    // authorized capabilities. The sync-channel transport doesn't
+    // add or remove authority — the capability surface is whatever
+    // the inner capability claim carried.
+    let capabilities =
+        CapabilitySet::from_kinds(evidence.payload().capabilities().iter().copied());
     AuthContext::new_internal(
         Requester::Service(session_identity),
         trace_id,
         sinks,
         oracles,
         chain,
+        capabilities,
     )
 }
 
@@ -815,6 +904,8 @@ pub fn anonymous_for_public_read<'a>(
         sinks,
         oracles,
         AttributionChain::empty(),
+        // Anonymous requesters carry no authorized capabilities.
+        CapabilitySet::empty(),
     )
 }
 
@@ -1035,6 +1126,29 @@ mod tests {
         correlation_key: &'a crate::identity::CorrelationKey,
         requester: Requester,
     ) -> AuthContext<'a> {
+        build_ctx_with_caps(
+            user_sink,
+            no_sink,
+            no_oracle,
+            correlation_key,
+            requester,
+            crate::authority::capability::CapabilitySet::empty(),
+        )
+    }
+
+    /// Tests that need to seed the AuthContext with a non-empty
+    /// capability set (so they can exercise the v0.1-polish-pass-2
+    /// superset check in `derive_for(NarrowCapabilities)`) use
+    /// this builder. Everything else delegates here via
+    /// `build_ctx` with an empty set.
+    fn build_ctx_with_caps<'a>(
+        user_sink: &'a dyn UserAuditSink,
+        no_sink: &'a NoSink,
+        no_oracle: &'a NoOracle,
+        correlation_key: &'a crate::identity::CorrelationKey,
+        requester: Requester,
+        capabilities: crate::authority::capability::CapabilitySet,
+    ) -> AuthContext<'a> {
         AuthContext::new_internal(
             requester,
             crate::identity::TraceId::from_bytes([0xEE; 16]),
@@ -1053,6 +1167,7 @@ mod tests {
                 mute: no_oracle,
             },
             AttributionChain::empty(),
+            capabilities,
         )
     }
 
@@ -1123,8 +1238,11 @@ mod tests {
         assert_eq!(derived.attribution_chain().entries().len(), 1);
     }
 
-    /// §4.2 NarrowCapabilities from a Did context: requester
-    /// unchanged, chain records the dropped capabilities.
+    /// §4.2 NarrowCapabilities happy path (v0.1 polish pass 2:
+    /// evolved from Phase 7e's recording-only fixture).
+    /// Requester unchanged, chain records the dropped
+    /// capabilities, AND the post-narrowing AuthContext's
+    /// capability set equals the source set minus the drop.
     #[test]
     fn derive_for_narrow_capabilities() {
         use crate::authority::capability::{CapabilityKind, CapabilitySet};
@@ -1134,12 +1252,20 @@ mod tests {
         let no_oracle = NoOracle;
         let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
         let did = sample_did();
-        let ctx = build_ctx(
+        // Seed the source context with two capabilities so the drop
+        // exercises both subset enforcement (passes) and difference
+        // computation (one remains).
+        let initial = CapabilitySet::from_kinds([
+            CapabilityKind::ViewPrivate,
+            CapabilityKind::EditPrivatePost,
+        ]);
+        let ctx = build_ctx_with_caps(
             &user,
             &no_sink,
             &no_oracle,
             &ck,
             Requester::Did(did.clone()),
+            initial.clone(),
         );
 
         let dropped = CapabilitySet::from_kinds([CapabilityKind::EditPrivatePost]);
@@ -1162,6 +1288,141 @@ mod tests {
                 assert_eq!(d, &dropped);
             }
             other => panic!("expected NarrowCapabilities, got {other:?}"),
+        }
+        // v0.1 polish pass 2: the resulting capability set is the
+        // source set minus the drop.
+        let expected_after =
+            CapabilitySet::from_kinds([CapabilityKind::ViewPrivate]);
+        assert_eq!(derived.capabilities(), &expected_after);
+    }
+
+    /// v0.1 polish pass 2: `NarrowCapabilities` whose drop set is
+    /// NOT a subset of the source context's authorized
+    /// capabilities fails closed with
+    /// `DeriveError::NarrowingExceedsAuthority`. The caller asked
+    /// to drop authority they don't hold — a probing pattern.
+    #[test]
+    fn derive_for_narrow_capabilities_rejects_superset() {
+        use crate::authority::capability::{CapabilityKind, CapabilitySet};
+
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        // Source holds only ViewPrivate.
+        let initial = CapabilitySet::from_kinds([CapabilityKind::ViewPrivate]);
+        let ctx = build_ctx_with_caps(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Did(sample_did()),
+            initial,
+        );
+
+        // Drop targets BOTH ViewPrivate AND EditPrivatePost — the
+        // second is not held, so the drop set exceeds authority.
+        let exceeding = CapabilitySet::from_kinds([
+            CapabilityKind::ViewPrivate,
+            CapabilityKind::EditPrivatePost,
+        ]);
+        let result = ctx.derive_for(NarrowCapabilities { drop: exceeding });
+        assert!(matches!(result, Err(DeriveError::NarrowingExceedsAuthority)));
+    }
+
+    /// v0.1 polish pass 2 boundary: `NarrowCapabilities { drop:
+    /// CapabilitySet::empty() }` is a legal no-op against any
+    /// source set (the empty set is a subset of every set).
+    /// The chain entry is still recorded for forensic
+    /// continuity, and the resulting capability set equals the
+    /// source unchanged. This pins the boundary so a future
+    /// refactor doesn't accidentally treat empty-drop as a
+    /// special case that bypasses chain recording.
+    #[test]
+    fn derive_for_narrow_capabilities_empty_drop_is_noop() {
+        use crate::authority::capability::{CapabilityKind, CapabilitySet};
+
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let initial = CapabilitySet::from_kinds([CapabilityKind::ViewPrivate]);
+        let ctx = build_ctx_with_caps(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Did(sample_did()),
+            initial.clone(),
+        );
+
+        let derived = ctx
+            .derive_for(NarrowCapabilities {
+                drop: CapabilitySet::empty(),
+            })
+            .unwrap();
+        // Capabilities unchanged.
+        assert_eq!(derived.capabilities(), &initial);
+        // Chain entry recorded with empty dropped set.
+        let entries = derived.attribution_chain().entries();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].derivation_reason {
+            DerivationReason::NarrowCapabilities { dropped } => {
+                assert!(dropped.is_empty());
+            }
+            other => panic!("expected NarrowCapabilities, got {other:?}"),
+        }
+    }
+
+    /// v0.1 polish pass 2: §4.2's "audit reflects action, not
+    /// intent" discipline — a failed superset-narrowing must
+    /// still emit a DerivedContext audit event with the
+    /// `NarrowingExceedsAuthority` outcome, so forensic analysis
+    /// captures the rejected attempt distinct from
+    /// IllegalNarrowing.
+    #[test]
+    fn derive_for_narrow_capabilities_failed_superset_emits_audit() {
+        use crate::authority::capability::{CapabilityKind, CapabilitySet};
+
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx = build_ctx_with_caps(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Did(sample_did()),
+            CapabilitySet::empty(),
+        );
+
+        let exceeding =
+            CapabilitySet::from_kinds([CapabilityKind::ViewPrivate]);
+        let _ = ctx.derive_for(NarrowCapabilities { drop: exceeding });
+
+        // Exactly one DerivedContext event with the
+        // NarrowingExceedsAuthority outcome.
+        let events = user.captured();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::audit::UserAuditEvent::DerivedContext {
+                narrowing_kind,
+                outcome,
+                ..
+            } => {
+                assert_eq!(
+                    *narrowing_kind,
+                    crate::audit::NarrowingKind::NarrowCapabilities
+                );
+                assert_eq!(
+                    *outcome,
+                    crate::audit::DerivationOutcome::NarrowingExceedsAuthority
+                );
+            }
+            other => panic!(
+                "expected DerivedContext with NarrowingExceedsAuthority, got {other:?}"
+            ),
         }
     }
 
@@ -1241,6 +1502,7 @@ mod tests {
                 mute: &no_oracle,
             },
             chain,
+            crate::authority::capability::CapabilitySet::empty(),
         );
 
         let r = ctx.derive_for(ToAnonymous);

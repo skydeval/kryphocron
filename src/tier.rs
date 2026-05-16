@@ -422,6 +422,7 @@ mod tests {
                 mute: oracle,
             },
             AttributionChain::empty(),
+            crate::authority::capability::CapabilitySet::empty(),
         )
     }
 

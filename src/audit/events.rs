@@ -912,6 +912,16 @@ pub enum DerivationOutcome {
     IllegalNarrowing,
     /// Service-to-service requested without declaration.
     UndeclaredServiceTrust,
+    /// `NarrowCapabilities` requested a drop set that exceeded
+    /// the source context's authorized capability set — the
+    /// narrowing would have referenced authority the caller
+    /// did not hold. The audit emit captures this distinct
+    /// outcome so forensic analysis can separate "narrowed
+    /// illegally" (caller asked to drop authority they never
+    /// had — a programming error or an active probing attempt)
+    /// from `IllegalNarrowing` (structural misuse of the
+    /// derive surface).
+    NarrowingExceedsAuthority,
 }
 
 #[cfg(test)]
