@@ -766,7 +766,8 @@ impl ServiceTrustDeclaration {
 /// `AuthContext::capabilities` set to `CapabilitySet::empty()`.
 /// JWT scope strings are operator-defined free text (typically
 /// NSID-shaped) and do not map structurally to v1's
-/// [`CapabilityKind`] enumeration; projecting scope into the
+/// [`crate::authority::capability::CapabilityKind`] enumeration;
+/// projecting scope into the
 /// capability set would conflate two distinct authority surfaces.
 /// A `Requester::Did` constructed via this path therefore cannot
 /// legally [`AuthContext::derive_for`] a non-empty
