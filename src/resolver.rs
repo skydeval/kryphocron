@@ -126,7 +126,7 @@ pub enum DidResolutionError {
 /// attributable to the request that triggered the cache miss
 /// (or, for invalidation, the operator action). Phase 4d adds
 /// the parameter; the resolver-internal audit-emit sites
-/// previously used a placeholder zero-id (chainlink #41).
+/// previously used a placeholder zero-id (operator-pluggable).
 ///
 /// Phase 4c lands [`DefaultDidResolver`] as a substrate-side
 /// default; operators can substitute their own implementations
@@ -540,7 +540,7 @@ fn parse_did_document(
             // `publicKeyMultibase` or `publicKeyJwk`. For Phase 4c
             // we accept the multibase form (proto-blue's existing
             // shape) and synthesize a KeyId by hashing the public-
-            // key bytes — chainlink for Phase 6 spec polish on the
+            // key bytes — note for spec polish on the
             // KeyId-derivation rule.
             let id = entry
                 .get("id")
@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     // ============================================================
-    // §6.4 / chainlink #47 — trace_id propagation behavioral test.
+    // §6.4 — trace_id propagation behavioral test.
     //
     // Phase 4d Commit 2 threaded trace_id through DidResolver but
     // did not include a behavioral test pinning the audit-emit

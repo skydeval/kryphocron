@@ -481,7 +481,7 @@ pub enum SubstrateAuditEvent {
     // placeholder field types (`PeerOperation`, `InvalidationSource`,
     // `FallbackTrustPolicy`, `PeerTrustDecision`,
     // `PeerTrustConstraints`) are minimal v1 shells and Phase 4 may
-    // refine them — see chainlinks for migration notes.
+    // refine them — see release notes for migration.
     /// DID document for a verified principal changed between
     /// cache-loaded and current resolution. §7.3 / §6.4.
     DidDocumentRotated {

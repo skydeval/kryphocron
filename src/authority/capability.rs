@@ -16,12 +16,14 @@
 //! capability marker types ([`crate::authority::v1::ViewPrivate`]
 //! et al.) implement the class trait their kind belongs to.
 //!
-//! Phase 1 ships the v1 marker types hand-written rather than
+//! v0.1 ships the v1 marker types hand-written rather than
 //! macro-generated. The macro-based "single source of truth"
-//! property §4.3 commits via [`capability!`] is held in Phase 1
-//! by the sealed [`OracleResultsForCapability`] trait: only the
+//! property §4.3 commits via `capability!` is held in v0.1 by
+//! the sealed [`OracleResultsForCapability`] trait: only the
 //! hand-written `*OracleResults` structs the crate ships
-//! implement it. See CHAINLINKS #4.
+//! implement it. A macro-based generator can replace the
+//! hand-written declarations without changing the public
+//! surface.
 
 use std::time::Duration;
 

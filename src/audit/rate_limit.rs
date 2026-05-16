@@ -24,10 +24,11 @@ pub struct TokenBucket {
 
 /// Two-tier per-issuer rate limiter (§4.9).
 ///
-/// Phase 1 ships the struct shape; the
+/// v0.1 ships the struct shape; the
 /// `ConcurrentLruCache<Did, TokenBucket>` backing the
 /// recently-active per-DID tier is operator-supplied through a
-/// trait surface that Phase 4 commits. See CHAINLINKS #10.
+/// trait surface (operator-pluggable backing-store concrete
+/// types are out of crate scope).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct IssuanceRateLimiter {

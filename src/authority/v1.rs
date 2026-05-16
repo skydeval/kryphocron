@@ -4,9 +4,12 @@
 
 //! Hand-written v1 capability marker types (§4.3).
 //!
-//! Phase 1 hand-writes the capability declarations the §4.3
+//! v0.1 hand-writes the capability declarations the §4.3
 //! `capability!` / `compose_capability!` macros would generate.
-//! See CHAINLINKS #4 for the macro deferral.
+//! The sealed-trait pattern in [`crate::authority::capability`]
+//! preserves the §4.3 "single source of truth" property while
+//! the macro pipeline is operator-pluggable rather than
+//! crate-mandatory.
 //!
 //! Each capability:
 //!
@@ -168,11 +171,10 @@ impl IssuancePolicy for ViewPrivate {
         _target: &ResourceId,
         _oracle_results: &ViewPrivateOracleResults,
     ) -> Result<(), DenialReason> {
-        // v0.1: permissive predicate. The bind pipeline
-        // consults the block oracle at stage 2 and (per v0.2
-        // chainlink) the audience oracle at stage 3; predicate-
-        // level audience/ownership refinement lands alongside
-        // those.
+        // v0.1: permissive predicate. The bind pipeline consults
+        // the block oracle at stage 2; v0.2 adds the audience
+        // oracle and predicate-level audience/ownership
+        // refinement.
         Ok(())
     }
 }

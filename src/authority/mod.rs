@@ -215,7 +215,7 @@ where
 /// is also bind-time. The v0.1 jurisdiction model is "any
 /// Service requester is admissible at the chokepoint"; the
 /// bind-time predicate refines it once the operator-managed
-/// moderator-role surface lands. See chainlink for v0.2
+/// moderator-role surface lands. See note for v0.2
 /// jurisdiction model.
 ///
 /// `ModeratorRead` bind separately emits two audit events per
@@ -381,7 +381,7 @@ pub(crate) fn check_stage_0_deprecation(
                         // grace install a `DeprecatedWriteDuringGrace`
                         // emission on top of bind's own audit emit
                         // (Phase 7d ships the gate; the grace-window
-                        // audit shim is a v0.2 chainlink).
+                        // audit shim is a v0.2 enrichment).
                         Ok(())
                     }
                 }

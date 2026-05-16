@@ -156,10 +156,10 @@ impl SinkPanicGuard {
 /// sink in a `TerminatedSinkGuard` so a panicked sink doesn't
 /// continue running against corrupt internal state.
 ///
-/// Phase 1 ships the [`UserAuditSink`] wrapper; parallel
-/// wrappers for the other three channel sinks land in Phase 4
-/// (mechanical parallel). The pattern is identical — see
-/// CHAINLINKS #9.
+/// v0.1 ships the [`UserAuditSink`] wrapper. Parallel wrappers
+/// for the other three channel sinks (channel, substrate,
+/// moderation) follow an identical mechanical pattern and ship
+/// alongside their per-class sink wiring.
 pub struct TerminatedSinkGuard<S> {
     inner: S,
     terminated: AtomicBool,

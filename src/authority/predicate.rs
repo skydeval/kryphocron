@@ -310,11 +310,10 @@ pub enum AuthDenial {
 
 /// Semantic-version triplet used in deprecation state (§5.6).
 ///
-/// Re-exported from `kryphocron-lexicons` (Phase 2) so the
-/// `KRYPHOCRON_LEXICON_REGISTRY` constant and Phase 1's
-/// `AuthDenial::WriteToDeprecatedLexicon` use the same shape.
-/// Phase 6 decides whether to swap for the `semver` crate. See
-/// CHAINLINKS #5.
+/// Re-exported from `kryphocron-lexicons` so the
+/// `KRYPHOCRON_LEXICON_REGISTRY` constant and
+/// `AuthDenial::WriteToDeprecatedLexicon` use the same shape
+/// without a duplicate type definition.
 pub use kryphocron_lexicons::SemVer;
 
 /// Predicate-time evaluation context (§4.3 `PredicateContext`).

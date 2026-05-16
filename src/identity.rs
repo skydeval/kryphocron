@@ -122,7 +122,7 @@ pub struct PublicKey {
 /// `accepted_algorithms` will see verification fail with
 /// [`crate::verification::JwtVerificationError::UnsupportedAlgorithm`]
 /// at the signature-dispatch step. A later sub-phase will add the
-/// `p256` / `k256` crate dependencies; chainlinks track the work.
+/// `p256` / `k256` crate dependencies; tracked alongside the surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SignatureAlgorithm {

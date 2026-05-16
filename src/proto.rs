@@ -4,12 +4,11 @@
 
 //! Re-exports of validated AT Protocol primitive types.
 //!
-//! Phase 1 shipped these as **local placeholders** (CHAINLINKS #3).
-//! Phase 2 (§5 lexicon strategy) closes that chainlink: the real
-//! validated newtypes live in `proto-blue-syntax` /
+//! The real validated newtypes live in `proto-blue-syntax` /
 //! `proto-blue-lex-data`, re-exported here through
 //! [`kryphocron-lexicons`](::kryphocron_lexicons) so the kryphocron
-//! crate has a single canonical home for these identifiers.
+//! crate has a single canonical home for these identifiers (§5
+//! lexicon strategy).
 //!
 //! ## Why re-export through `kryphocron-lexicons`
 //!

@@ -60,18 +60,12 @@ pub struct AuthContext<'a> {
     _no_clone: PhantomData<*const ()>,
 }
 
-// Manually implement Send + Sync — the *const () makes AuthContext
-// !Send + !Sync by default. The contained references are Send+Sync,
-// so we restore them explicitly. The *const () is purely for !Clone.
-//
-// Safety: all fields are themselves Send + Sync; the *const ()
-// marker carries no data and is purely a trait-impl signal.
-//
-// Phase 1 ships this without unsafe; the crate forbids unsafe
-// globally. Phase 4 will revisit if performance auditing requires
-// it, but the type itself does not need Send/Sync for Phase 1's
-// scope — the AuthContext is process-local and used inside a
-// single bind path. See CHAINLINKS #7.
+// The *const () marker makes AuthContext !Send + !Sync by
+// default, which is the substrate's discipline: AuthContext is
+// process-local and used inside a single bind path. Manual Send +
+// Sync impls are NOT shipped — operators that need to flow context
+// across async boundaries pass references or rebuild via
+// derive_for.
 
 impl<'a> AuthContext<'a> {
     /// Crate-internal constructor. Reserved for the

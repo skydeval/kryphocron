@@ -464,7 +464,7 @@ impl<'a> ParsedJwt<'a> {
 
         // `aud`. JWT standard allows a string or array; ATProto
         // convention uses a single string DID. v1 accepts only the
-        // string form — array support is a chainlinked extension
+        // string form — array support is a future-extension
         // for the broader-ATProto-compatibility roll-out.
         let aud_str = p
             .get("aud")
@@ -476,7 +476,7 @@ impl<'a> ParsedJwt<'a> {
             // `got` field — the JWT `aud` claim is a DID string,
             // not a ServiceIdentity, so we synthesize one with
             // zero key material to fit the §7.2 error variant
-            // shape. See chainlink for the shape-vs-reality
+            // shape. See note for the shape-vs-reality
             // mismatch.
             let got_placeholder = ServiceIdentity::new_internal(
                 aud_did,
@@ -676,7 +676,7 @@ fn kid_to_hex(kid: &KeyId) -> String {
 ///
 /// Ed25519 is fully implemented in Phase 4a. ES256 / ES256K stub
 /// with `UnsupportedAlgorithm` until a later sub-phase commits
-/// the `p256` / `k256` crate dependencies; chainlinks track the
+/// the `p256` / `k256` crate dependencies; tracked alongside
 /// work.
 fn verify_signature(
     signing_input: &[u8],
@@ -984,7 +984,7 @@ pub enum ClaimVerificationError {
         /// Clock skew tolerated.
         skew: Duration,
     },
-    /// Audience mismatch. Per Phase 4a chainlink #27, the `got`
+    /// Audience mismatch. Per Phase 4a note, the `got`
     /// field carries the claimed-audience DID directly (no
     /// synthetic `ServiceIdentity` placeholder).
     #[error("claim wrong audience")]
@@ -1148,7 +1148,7 @@ pub async fn verify_capability_claim(
         return Err(ClaimVerificationError::UnsupportedAlgorithm(signature.algorithm));
     }
 
-    // 6. Audience equality. Per Phase 4a chainlink #27, the `got`
+    // 6. Audience equality. Per Phase 4a note, the `got`
     //    field carries the claimed DID directly (not a synthetic
     //    placeholder ServiceIdentity).
     if audience.service_did() != local_audience.service_did() {
@@ -1362,7 +1362,7 @@ fn select_signing_key_for_claim(
     expected_key_id: KeyId,
     algorithm: SignatureAlgorithm,
 ) -> Result<PublicKey, ClaimVerificationError> {
-    // Phase 4c (resolves chainlink #35): walk both the current
+    // Phase 4c: walk both the current
     // verification_methods AND the document's rotation_history.
     // §4.8 W12 commits rotation-tolerant verification — a claim
     // signed under a previously-active key still verifies if the
@@ -1404,7 +1404,7 @@ fn verify_claim_signature(
                 .map_err(|_| ClaimVerificationError::SignatureInvalid)
         }
         SignatureAlgorithm::Es256 | SignatureAlgorithm::Es256K => {
-            // Phase 4a chainlink #26: ES256/ES256K primitives
+            // Phase 4a note: ES256/ES256K primitives
             // ship in a later sub-phase. Phase 4b keeps the same
             // stub posture for capability-claim verification.
             Err(ClaimVerificationError::UnsupportedAlgorithm(algorithm))
@@ -3277,7 +3277,7 @@ mod tests {
         .unwrap_err();
         match err {
             ClaimVerificationError::WrongAudience { got, .. } => {
-                // Phase 4a chainlink #27: `got` is a Did, not a
+                // Phase 4a note: `got` is a Did, not a
                 // synthetic ServiceIdentity placeholder.
                 assert_eq!(got.as_str(), "did:web:audience.example");
             }
@@ -3568,7 +3568,7 @@ mod tests {
         ));
     }
 
-    /// §4.8 W12 / chainlink #35 (Phase 4c): a claim signed by a
+    /// §4.8 W12 (Phase 4c): a claim signed by a
     /// key that has been rotated out — present in the resolver's
     /// `rotation_history`, absent from `verification_methods` —
     /// still verifies. Phase 4b's exact-match-only logic would
@@ -3911,7 +3911,7 @@ mod tests {
     }
 
     // ============================================================
-    // §7.5 / chainlink #45 — VerifiedSyncHello scope accessor split.
+    // §7.5 — VerifiedSyncHello scope accessor split.
     // ============================================================
 
     fn fresh_verified_sync_hello(time_window: Option<crate::wire::SyncTimeWindow>) -> VerifiedSyncHello {
@@ -4354,7 +4354,7 @@ mod tests {
     }
 
     // ============================================================
-    // §7.5 / chainlink #46 — SyncHandshakeVerificationError
+    // §7.5 — SyncHandshakeVerificationError
     // variant test coverage round-out.
     // ============================================================
 

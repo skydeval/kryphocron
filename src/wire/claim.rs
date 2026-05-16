@@ -107,9 +107,9 @@ impl CapabilityClaim {
     ///
     /// The constructed claim's `origin` is
     /// [`ClaimOrigin::SelfOriginated`]. Delegated-from-upstream
-    /// construction (`ClaimOrigin::DelegatedFromUpstream`) lands
-    /// in Phase 4e alongside the receipt-signing path; see
-    /// chainlinks.
+    /// construction (`ClaimOrigin::DelegatedFromUpstream`) is
+    /// produced via [`CapabilityClaim::new_delegated`] using a
+    /// pre-built receipt chain.
     ///
     /// # Errors
     ///

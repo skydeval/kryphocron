@@ -807,7 +807,7 @@ fn verify_signature(
                 .map_err(|_| TrustDeclarationError::SignatureInvalid)
         }
         SignatureAlgorithm::Es256 | SignatureAlgorithm::Es256K => {
-            // Phase 4a chainlink #26: ECDSA primitives stub here
+            // Phase 4a note: ECDSA primitives stub here
             // too. Trust declarations with ES256/ES256K signatures
             // surface as SignatureInvalid until the broader
             // ECDSA roll-out lands.

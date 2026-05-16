@@ -78,7 +78,7 @@
 //!   (no dedicated reborrow-failed variant; reuses success-path
 //!   variant with non-Success outcome).
 //! - Past window (moderation): silent at the audit layer (no
-//!   suitable variant; v0.2 chainlink for emit symmetry).
+//!   suitable variant; v0.2 enrichment for emit symmetry).
 //!
 //! ## V0.1 audit-detail gaps
 //!
@@ -102,7 +102,7 @@
 //!
 //! All four gaps share the same shape ("the typed Subject
 //! doesn't expose its fields generically; need a sealed
-//! per-class extraction trait") and chainlink to v0.2.
+//! per-class extraction trait") and enrichment in v0.2.
 //!
 //! ## Module-level `#![allow(dead_code)]` (Phase 7d C9)
 //!
@@ -646,8 +646,7 @@ impl<E: Endpoint> ChannelProof<E> {
     ///   (`equalize_timing_target_for` is `<C: UserCapability>`-bounded).
     ///   The §4.6 timing channel for channel-class bind is
     ///   structurally narrower (no oracle latency to mask); v0.1
-    ///   defers a per-class equalization helper to a v0.2
-    ///   chainlink.
+    ///   defers a per-class equalization helper to v0.2.
     ///
     /// `session_digest` for the audit event is computed via
     /// [`crate::SessionDigest::compute`] using the
@@ -696,7 +695,7 @@ impl<E: Endpoint> ChannelProof<E> {
         // sealed trait.
         //
         // For 7d we punt on the trait surface and use an unsafe-
-        // free approach: add the sealed trait as a v0.2 chainlink;
+        // free approach: add the sealed trait as a v0.2 enrichment;
         // ship the audit event with a placeholder peer + session
         // digest derived from the proof's recorded Did + a
         // synthesized session id for v0.1.
@@ -713,7 +712,7 @@ impl<E: Endpoint> ChannelProof<E> {
         let now = std::time::SystemTime::now();
 
         // v0.1: synthesize a peer ServiceIdentity from the proof's
-        // recorded Did. v0.2 chainlink: extract real peer from
+        // recorded Did. v0.2 enrichment: extract real peer from
         // Subject via a sealed `ChannelSubjectShape` trait.
         let peer_placeholder = crate::identity::ServiceIdentity::new_internal(
             proof_requester_did.clone(),
@@ -724,7 +723,7 @@ impl<E: Endpoint> ChannelProof<E> {
             },
             None,
         );
-        // v0.1: synthesize a session id placeholder. v0.2 chainlink:
+        // v0.1: synthesize a session id placeholder. v0.2 enrichment:
         // extract real session_id from Subject via the same sealed
         // trait above.
         let session_id_placeholder =
@@ -928,7 +927,7 @@ impl<S: SubstrateScope> SubstrateProof<S> {
     /// V0.1 audit-detail gap: scope_repr ships with placeholder
     /// `ScopeKind::Shard` regardless of the actual ScopeSelector
     /// variant. Real extraction needs a sealed `HasScopeKind`
-    /// trait paralleling HasResourceLocation — v0.2 chainlink.
+    /// trait paralleling HasResourceLocation — v0.2 enrichment.
     ///
     /// # Errors
     ///
@@ -960,7 +959,7 @@ impl<S: SubstrateScope> SubstrateProof<S> {
         let now = std::time::SystemTime::now();
 
         // V0.1 placeholder: ScopeKind::Shard regardless of variant.
-        // v0.2 chainlink: introduce HasScopeKind sealed trait.
+        // v0.2 enrichment: introduce HasScopeKind sealed trait.
         let scope_repr = crate::target::TargetRepresentation::structural_only(
             crate::target::StructuralRepresentation::Scope {
                 kind: crate::target::ScopeKind::Shard,
@@ -1210,7 +1209,7 @@ impl<C: ModerationCapability> ModerationProof<C> {
         // Subject. To extract its `case: ModerationCaseId` field
         // generically we'd need another sealed trait
         // (HasModerationCase). v0.1 ships with a placeholder
-        // ModerationCaseId per the same v0.2 chainlink as
+        // ModerationCaseId per the same v0.2 enrichment as
         // channel/substrate's per-class data extraction.
         let case = crate::authority::ModerationCaseId::from_bytes([0u8; 16]);
 
@@ -1383,7 +1382,7 @@ impl<'p, C: ModerationCapability> BoundModerationProof<'p, C> {
     /// [`BindFailureReason::Expired`] without an audit emit. v1's
     /// audit vocabulary has no ModerationReborrowFailed variant
     /// (unlike user/channel which have ReborrowFailed /
-    /// ChannelReborrowFailed). v0.2 chainlink: introduce a
+    /// ChannelReborrowFailed). v0.2 enrichment: introduce a
     /// dedicated variant or a generic reborrow-failed shape.
     pub async fn reborrow<'r>(
         &'r self,
@@ -2820,7 +2819,7 @@ mod moderation_bind_tests {
 
     /// §4.3 reborrow: past MAX_AGE returns Expired. v1's audit
     /// vocabulary has no ModerationReborrowFailed variant — the
-    /// failure is silent at the audit layer (v0.2 chainlink).
+    /// failure is silent at the audit layer (v0.2 enrichment).
     #[tokio::test]
     async fn reborrow_returns_expired_past_max_age_silently() {
         let fixture = BindFixture::new();
@@ -2844,7 +2843,7 @@ mod moderation_bind_tests {
         assert_eq!(
             fixture.moderation.captured().len(),
             0,
-            "moderation reborrow miss is silent at the audit layer (v0.2 chainlink for emit)"
+            "moderation reborrow miss is silent at the audit layer (v0.2 enrichment for emit)"
         );
     }
 
