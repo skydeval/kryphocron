@@ -70,15 +70,18 @@ kryphocron = "0.1"
 
 A minimal substrate-side integration sketch:
 
-```rust
+```rust,ignore
 use kryphocron::{
     AuditSinks, NoEncryption, OracleSet, TraceId,
+    authority::{NoInspectionNotifications, issue_user, v1::ViewPrivate},
     verification::verify_jwt,
 };
 
 // At substrate startup, install audit sinks, oracles, the DID
-// resolver, and (optionally) an encryption resolver set:
+// resolver, the deployment correlation key, the inspection-
+// notification queue, and (optionally) an encryption resolver set.
 let resolver_set = NoEncryption;  // v1 default; no encryption.
+let inspection_queue = NoInspectionNotifications;  // no-op default.
 
 // Per-request: verify a JWT, build an AuthContext.
 let trace_id = TraceId::from_bytes(/* fresh per-request */);
@@ -94,12 +97,31 @@ let ctx = kryphocron::ingress::from_xrpc_request(
     verified, trace_id, sinks, oracles,
 );
 
-// Bind capability proofs against ctx; the audit pipeline fires
-// terminal events on every bind, structurally.
+// Issue a capability proof against the requester's context, then
+// bind it against the target. `bind` and `reborrow` are async —
+// the §4.3 pipeline runs inside `composite_audit` which is
+// async, and timing-channel equalization sleeps via tokio.
+let proof = issue_user::<ViewPrivate>(&ctx, target_resource_id)?;
+let bound = proof.bind(&ctx, &target_resource_id).await?;
+
+// `bound` grants access to the subject; the audit pipeline has
+// already fired the terminal CapabilityBound event structurally.
+let subject = bound.subject();
 ```
 
 The substrate's value isn't in the API ergonomics — it's in the
 threat-model invariants the type system enforces.
+
+### Bind API asymmetry
+
+Three of the four `*Proof::bind` methods take `(self, ctx, target)`.
+`ModerationProof::bind` takes a fourth argument:
+`rationale: ModeratorRationale` (a length-bounded operator-declared
+string, mandatory for every moderation action per §6.5). Operators
+writing generic bind-dispatch code need to handle this asymmetry —
+the rationale is bind-time input, not issuance-time, matching
+operator workflows where the moderator commits a rationale at
+the moment of action.
 
 ## Design discipline
 
@@ -130,12 +152,78 @@ Five organizing principles:
 
 ## Status
 
-**v0.1.0** ships the type architecture, lexicon strategy (via
-the companion `kryphocron-lexicons` crate), audit event
-vocabulary, inter-service auth (JWT verification, capability
-claims, trust declarations + DID resolver, sync handshake
-protocol, delegation receipts + chain rehydration), and
-encryption hook surfaces.
+**v0.1.0** ships the kryphocron substrate's authority discipline
+end-to-end:
+
+- **§4 type architecture** — tier-aware envelopes, sealed
+  capability proofs (no struct-literal construction outside the
+  crate), `AuthContext` with attribution-chain rehydration from
+  upstream delegation.
+- **§4.1 tier-aware visibility** — `tier::visible_to(tier, ctx)`
+  predicate.
+- **§4.2 scope-narrowing derivation** — `AuthContext::derive_for`
+  with three legal narrowings (drop-to-anonymous,
+  narrow-capabilities, service-to-service); audit emits a
+  `DerivedContext` event on every attempt (success and failure).
+- **§4.3 capability issuance** — `issue_user`, `issue_channel`,
+  `issue_substrate`, `issue_moderation` chokepoints with
+  per-class requester-authority enforcement.
+- **§4.3 bind + reborrow** — async pipelines across all four
+  capability classes: pre-checks → stage 0 deprecation gate
+  (write-semantics user-class + moderation) → stage 2 oracle
+  consultation (user-class) → stage 5 predicate (user-class) →
+  audit emit via `composite_audit` → stage 6 timing equalization
+  (user-class) → return.
+- **§4.6 timing-channel equalization** — `equalize_timing` +
+  `equalize_timing_target_for::<C>` via tokio.
+- **§4.9 composite-audit machinery** — class-priority commit
+  order (substrate → moderation → user → channel), rollback
+  fan-out to already-committed sinks, fallback-sink escalation
+  with `catch_unwind` panic catchment.
+- **§5 lexicon strategy** — closed-namespace registry via the
+  companion `kryphocron-lexicons` crate; `Tier::from_nsid`
+  consults the build-time-authoritative
+  `KRYPHOCRON_LEXICON_REGISTRY`.
+- **§6 audit event vocabulary** — 30+ variants across user,
+  channel, substrate, moderation classes; encrypted-layer split
+  via `TargetRepresentation::structural_only` /
+  `TargetRepresentation::with_sensitive`.
+- **§6.7 inspection-notification queue** — moderation-class fan-
+  out alongside the composite-audit emission; outside rollback
+  semantics per the "notifications are diagnostic, not
+  authoritative" discipline.
+- **§7 inter-service auth** — JWT verification (Ed25519 default;
+  ECDSA recognized but not v1-shipped), `CapabilityClaim` wire
+  format with W11/W12/W13 monotonicity invariants, trust
+  declarations, DID resolution + rotation evidence, three-message
+  sync handshake protocol, delegation receipts + chain
+  rehydration.
+- **§8 encryption hook surfaces** — `AuditEncryptionResolver`,
+  `RecordEncryptionResolver` trait shapes; v1 default is
+  `NoEncryption` (no-op resolver set), operator plug-ins fill
+  in real algorithm support.
+
+### v0.1 enrichment posture
+
+The audit pipeline is wired end-to-end. A few audit-event
+payload fields ship with placeholder data in v0.1 pending
+sealed per-class extraction traits in v0.2:
+
+- Channel-class `peer ServiceIdentity` and `session_id`.
+- Substrate-class `scope_repr`.
+- Moderation-class `case ModerationCaseId`.
+
+User-class oracle consultations consult only the universal
+block-vs-resource-owner query in v0.1 (multi-query consultations
+land alongside a per-capability oracle-results-builder in v0.2).
+`AuthContext::derive_for(NarrowCapabilities)` ships
+recording-only — the `AuthContext` gains a capabilities field in
+v0.2 for structural superset enforcement.
+`tier::visible_to` is tier-only in v0.1; an audience-aware
+overload lands in v0.2.
+Moderation-class reborrow miss is silent at the audit layer in
+v0.1 (no fitting variant in v1's audit vocabulary); v0.2 adds
+the variant.
 
 Wire-format-touching changes are reserved for a future v0.2 or
 v1.0 cycle. v0.1.x patches are non-breaking only.
