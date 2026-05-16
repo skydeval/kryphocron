@@ -136,9 +136,16 @@ impl<'a> AuthContext<'a> {
     /// [`ServiceToService`]. Sub-contexts inherit [`TraceId`] and
     /// extend [`AttributionChain`].
     ///
-    /// **Phase 7d C2 status**: [`ToAnonymous`] and
-    /// [`NarrowCapabilities`] are wired. [`ServiceToService`] +
-    /// audit emit for all three narrowings land in C3.
+    /// Emits [`crate::audit::UserAuditEvent::DerivedContext`] on
+    /// every derivation attempt (success and failure) per §4.2's
+    /// "audit reflects action, not intent" discipline. The audit
+    /// emit is **fire-and-forget**: if the user-class sink rejects
+    /// the event, derive_for still returns its result (the
+    /// forensic trail is degraded but the runtime correctness
+    /// isn't compromised). Operators relying on derivation audit
+    /// for compliance install reliable sinks. The emit is **NOT**
+    /// routed through [`crate::audit::composite_audit`] — derivation
+    /// is single-event single-sink.
     ///
     /// The `+ 'static` bound on `N` enables internal dispatch via
     /// [`std::any::Any`] downcast. v1's three [`Narrowing`] impls
@@ -147,7 +154,9 @@ impl<'a> AuthContext<'a> {
     ///
     /// # Errors
     ///
-    /// See [`DeriveError`].
+    /// See [`DeriveError`]. Failure paths emit a matching
+    /// [`crate::audit::DerivationOutcome`] variant before
+    /// returning.
     pub fn derive_for<N: Narrowing + 'static>(
         &self,
         narrowing: N,
@@ -159,11 +168,12 @@ impl<'a> AuthContext<'a> {
         // (only the three crate-ship impls exist); the unreachable
         // arm covers a future v0.X variant addition that forgets
         // to extend this match.
-        let (new_requester, derivation_reason) =
+        let (new_requester, derivation_reason, narrowing_kind) =
             if narrowing_any.is::<ToAnonymous>() {
                 (
                     Requester::Anonymous,
                     DerivationReason::DropPrivilegeToAnonymous,
+                    crate::audit::NarrowingKind::ToAnonymous,
                 )
             } else if let Some(narrow) = narrowing_any.downcast_ref::<NarrowCapabilities>() {
                 // NarrowCapabilities records the dropped capabilities
@@ -179,11 +189,83 @@ impl<'a> AuthContext<'a> {
                     DerivationReason::NarrowCapabilities {
                         dropped: narrow.drop.clone(),
                     },
+                    crate::audit::NarrowingKind::NarrowCapabilities,
                 )
-            } else if narrowing_any.is::<ServiceToService>() {
-                // C3 wires this. C2 returns IllegalNarrowing as a
-                // placeholder so the dispatch shape is exhaustive.
-                return Err(DeriveError::IllegalNarrowing);
+            } else if let Some(svc_to_svc) =
+                narrowing_any.downcast_ref::<ServiceToService>()
+            {
+                // ServiceToService verification (Phase 7e C3):
+                // 1. Current ctx.requester must be Service —
+                //    otherwise this is structurally illegal
+                //    (Did → Service requires a trust declaration
+                //    which only a Service can hold).
+                let current_svc = match &self.requester {
+                    Requester::Service(s) => s.clone(),
+                    _ => {
+                        let to = Requester::Service(svc_to_svc.target.clone());
+                        emit_derived_context(
+                            self,
+                            to,
+                            crate::audit::NarrowingKind::ServiceToService,
+                            crate::audit::DerivationOutcome::IllegalNarrowing,
+                            now,
+                        );
+                        return Err(DeriveError::IllegalNarrowing);
+                    }
+                };
+                // 2. Trust declaration's `from_service` must
+                //    match the current Service requester.
+                if &current_svc != svc_to_svc.trust_declaration.from_service() {
+                    let to = Requester::Service(svc_to_svc.target.clone());
+                    emit_derived_context(
+                        self,
+                        to,
+                        crate::audit::NarrowingKind::ServiceToService,
+                        crate::audit::DerivationOutcome::IllegalNarrowing,
+                        now,
+                    );
+                    return Err(DeriveError::IllegalNarrowing);
+                }
+                // 3. Trust declaration's `to_service` must match
+                //    the narrowing's target.
+                if &svc_to_svc.target != svc_to_svc.trust_declaration.to_service() {
+                    let to = Requester::Service(svc_to_svc.target.clone());
+                    emit_derived_context(
+                        self,
+                        to,
+                        crate::audit::NarrowingKind::ServiceToService,
+                        crate::audit::DerivationOutcome::IllegalNarrowing,
+                        now,
+                    );
+                    return Err(DeriveError::IllegalNarrowing);
+                }
+                // 4. Trust declaration validity window must cover
+                //    `now`. Re-check at derive time even though
+                //    verify_trust_declaration already checked at
+                //    receive time — declarations may have expired
+                //    between verification and derivation.
+                if now < svc_to_svc.trust_declaration.issued_at()
+                    || now >= svc_to_svc.trust_declaration.expires_at()
+                {
+                    let to = Requester::Service(svc_to_svc.target.clone());
+                    emit_derived_context(
+                        self,
+                        to,
+                        crate::audit::NarrowingKind::ServiceToService,
+                        crate::audit::DerivationOutcome::UndeclaredServiceTrust,
+                        now,
+                    );
+                    return Err(DeriveError::UndeclaredServiceTrust);
+                }
+                (
+                    Requester::Service(svc_to_svc.target.clone()),
+                    DerivationReason::ServiceToServiceDelegation {
+                        trust_declaration_id: *svc_to_svc
+                            .trust_declaration
+                            .declaration_id(),
+                    },
+                    crate::audit::NarrowingKind::ServiceToService,
+                )
             } else {
                 unreachable!(
                     "Narrowing is sealed; only ToAnonymous / NarrowCapabilities / ServiceToService impl it"
@@ -193,15 +275,32 @@ impl<'a> AuthContext<'a> {
         // Extend the attribution chain with a hop recording the
         // source requester + derivation reason + timestamp.
         let mut new_chain = self.attribution_chain.clone();
-        new_chain.try_push(AttributionEntry {
+        if let Err(e) = new_chain.try_push(AttributionEntry {
             requester: self.requester.clone(),
             derivation_reason,
             derived_at: now,
             key_id_used: None,
-        })?;
+        }) {
+            // ChainTooDeep — emit failure outcome and propagate.
+            emit_derived_context(
+                self,
+                new_requester,
+                narrowing_kind,
+                crate::audit::DerivationOutcome::ChainTooDeep,
+                now,
+            );
+            return Err(e);
+        }
 
-        // Build the narrowed sub-context. Inherits trace_id, audit
-        // sinks, oracle set verbatim — only requester + chain change.
+        // All checks passed — emit Success outcome and return.
+        emit_derived_context(
+            self,
+            new_requester.clone(),
+            narrowing_kind,
+            crate::audit::DerivationOutcome::Success,
+            now,
+        );
+
         Ok(AuthContext::new_internal(
             new_requester,
             self.trace_id,
@@ -210,6 +309,28 @@ impl<'a> AuthContext<'a> {
             new_chain,
         ))
     }
+}
+
+/// §4.2 derivation audit-emit helper. Fire-and-forget: sink
+/// errors are discarded so derive_for surfaces the derivation
+/// outcome (not the audit-infrastructure outcome) to the caller.
+fn emit_derived_context(
+    ctx: &AuthContext<'_>,
+    to: Requester,
+    narrowing_kind: crate::audit::NarrowingKind,
+    outcome: crate::audit::DerivationOutcome,
+    at: SystemTime,
+) {
+    let event = crate::audit::UserAuditEvent::DerivedContext {
+        trace_id: ctx.trace_id,
+        from: ctx.requester.clone(),
+        to,
+        narrowing_kind,
+        outcome,
+        at,
+    };
+    // Fire-and-forget: discard the sink result.
+    let _ = ctx.audit.user.record(event);
 }
 
 /// Resolved requester identity (§4.2).
@@ -773,7 +894,6 @@ mod tests {
                     captured: Mutex::new(Vec::new()),
                 }
             }
-            #[allow(dead_code)] // C3 consumes this.
             pub fn captured(&self) -> Vec<UserAuditEvent> {
                 self.captured.lock().unwrap().clone()
             }
@@ -832,7 +952,6 @@ mod tests {
 
         /// User sink that always fails (for fire-and-forget tests
         /// in C3).
-        #[allow(dead_code)] // C3 consumes this.
         pub(super) struct FailingUserSink;
         impl UserAuditSink for FailingUserSink {
             fn record(&self, _: UserAuditEvent) -> Result<(), AuditError> {
@@ -1134,62 +1253,342 @@ mod tests {
         assert!(matches!(r, Err(DeriveError::ChainTooDeep)));
     }
 
-    /// Phase 7e C2 placeholder: ServiceToService returns
-    /// IllegalNarrowing pending C3 wiring. Pin the placeholder
-    /// behavior so C3's update is detectable.
+    // -------- C3 — ServiceToService + DerivedContext audit emit --------
+
+    fn make_service(did_str: &str) -> crate::identity::ServiceIdentity {
+        crate::identity::ServiceIdentity::new_internal(
+            Did::new(did_str).unwrap(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    /// Build a placeholder verified ServiceTrustDeclaration. Direct
+    /// crate-internal construction (we're in src/ingress.rs so the
+    /// pub(crate) fields are reachable). verify_trust_declaration
+    /// requires a real signature path which is out of scope for
+    /// derive_for tests; what derive_for actually checks is the
+    /// from/to/window invariants — not the signature.
+    fn make_trust_declaration(
+        from: crate::identity::ServiceIdentity,
+        to: crate::identity::ServiceIdentity,
+        issued_at: SystemTime,
+        expires_at: SystemTime,
+    ) -> ServiceTrustDeclaration {
+        ServiceTrustDeclaration {
+            declaration_id: TrustDeclarationId::from_bytes([0xAB; 16]),
+            from_service: from,
+            to_service: to,
+            capabilities: crate::authority::capability::CapabilitySet::empty(),
+            resource_scope: crate::wire::ResourceScope::Resource(
+                crate::authority::ResourceId::new(
+                    sample_did(),
+                    crate::Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+                    crate::proto::Rkey::new("3jzfcijpj2z2a").unwrap(),
+                ),
+            ),
+            issued_at,
+            expires_at,
+            trust_root: crate::trust::TrustRootIdentity {
+                root_key_id: crate::identity::KeyId::from_bytes([0u8; 32]),
+                root_key: crate::identity::PublicKey {
+                    algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                    bytes: [0u8; 32],
+                },
+            },
+            signature: crate::trust::TrustRootSignature {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 64],
+            },
+            _private: PhantomData,
+        }
+    }
+
+    /// §4.2 / §7.7 happy path: Service A derives to Service B
+    /// using a valid trust declaration.
     #[test]
-    fn derive_for_service_to_service_returns_illegal_narrowing_in_c2() {
+    fn derive_for_service_to_service_happy() {
         let user = CapturingUserSink::new();
         let no_sink = NoSink;
         let no_oracle = NoOracle;
         let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
-        let svc = sample_service();
+        let svc_a = make_service("did:plc:phase7e-svc-a");
+        let svc_b = make_service("did:plc:phase7e-svc-b");
         let ctx = build_ctx(
             &user,
             &no_sink,
             &no_oracle,
             &ck,
-            Requester::Service(svc.clone()),
+            Requester::Service(svc_a.clone()),
         );
 
-        // Construct a placeholder ServiceTrustDeclaration. Using
-        // direct field construction (crate-internal access) since
-        // verify_trust_declaration requires a real signature path
-        // that's out of scope here.
+        let now = SystemTime::now();
+        let decl = make_trust_declaration(
+            svc_a.clone(),
+            svc_b.clone(),
+            now - std::time::Duration::from_secs(60),
+            now + std::time::Duration::from_secs(86400),
+        );
         let sts = ServiceToService {
-            target: svc.clone(),
-            trust_declaration: ServiceTrustDeclaration {
-                declaration_id: TrustDeclarationId::from_bytes([0u8; 16]),
-                from_service: svc.clone(),
-                to_service: svc.clone(),
-                capabilities: crate::authority::capability::CapabilitySet::empty(),
-                resource_scope: crate::wire::ResourceScope::Resource(
-                    crate::authority::ResourceId::new(
-                        sample_did(),
-                        crate::Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
-                        crate::proto::Rkey::new("3jzfcijpj2z2a").unwrap(),
-                    ),
-                ),
-                issued_at: SystemTime::UNIX_EPOCH,
-                expires_at: SystemTime::UNIX_EPOCH
-                    + std::time::Duration::from_secs(86400 * 365),
-                trust_root: crate::trust::TrustRootIdentity {
-                    root_key_id: crate::identity::KeyId::from_bytes([0u8; 32]),
-                    root_key: crate::identity::PublicKey {
-                        algorithm: crate::identity::SignatureAlgorithm::Ed25519,
-                        bytes: [0u8; 32],
-                    },
-                },
-                signature: crate::trust::TrustRootSignature {
-                    algorithm: crate::identity::SignatureAlgorithm::Ed25519,
-                    bytes: [0u8; 64],
-                },
-                _private: PhantomData,
-            },
+            target: svc_b.clone(),
+            trust_declaration: decl,
+        };
+
+        let derived = ctx.derive_for(sts).expect("happy path should succeed");
+        match derived.requester() {
+            Requester::Service(s) => assert_eq!(s, &svc_b),
+            other => panic!("expected Service(B), got {other:?}"),
+        }
+        let entries = derived.attribution_chain().entries();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].derivation_reason {
+            DerivationReason::ServiceToServiceDelegation { trust_declaration_id } => {
+                assert_eq!(trust_declaration_id.as_bytes(), &[0xAB; 16]);
+            }
+            other => panic!("expected ServiceToServiceDelegation, got {other:?}"),
+        }
+    }
+
+    /// §4.2 IllegalNarrowing: ServiceToService from a Did context
+    /// is rejected (only Service can hold a trust declaration).
+    #[test]
+    fn derive_for_service_to_service_from_did_rejected() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc_a = make_service("did:plc:phase7e-svc-a");
+        let svc_b = make_service("did:plc:phase7e-svc-b");
+        let ctx = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Did(sample_did()),
+        );
+
+        let now = SystemTime::now();
+        let decl = make_trust_declaration(
+            svc_a,
+            svc_b.clone(),
+            now - std::time::Duration::from_secs(60),
+            now + std::time::Duration::from_secs(86400),
+        );
+        let sts = ServiceToService {
+            target: svc_b,
+            trust_declaration: decl,
         };
         assert!(matches!(
             ctx.derive_for(sts),
             Err(DeriveError::IllegalNarrowing)
         ));
+    }
+
+    /// §4.2 IllegalNarrowing: trust declaration's from_service
+    /// must match the current Service requester. Mismatch → reject.
+    #[test]
+    fn derive_for_service_to_service_from_service_mismatch_rejected() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc_a = make_service("did:plc:phase7e-svc-a");
+        let svc_b = make_service("did:plc:phase7e-svc-b");
+        let svc_c = make_service("did:plc:phase7e-svc-c");
+        let ctx = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Service(svc_a),
+        );
+
+        let now = SystemTime::now();
+        let decl = make_trust_declaration(
+            svc_b, // from
+            svc_c.clone(),
+            now - std::time::Duration::from_secs(60),
+            now + std::time::Duration::from_secs(86400),
+        );
+        let sts = ServiceToService {
+            target: svc_c,
+            trust_declaration: decl,
+        };
+        assert!(matches!(
+            ctx.derive_for(sts),
+            Err(DeriveError::IllegalNarrowing)
+        ));
+    }
+
+    /// §4.2 UndeclaredServiceTrust: trust declaration past its
+    /// expires_at is rejected even if other invariants hold. Pin
+    /// the validity-window re-check at derive time (declarations
+    /// may have expired between verify_trust_declaration and
+    /// derive_for).
+    #[test]
+    fn derive_for_service_to_service_expired_declaration_rejected() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc_a = make_service("did:plc:phase7e-svc-a");
+        let svc_b = make_service("did:plc:phase7e-svc-b");
+        let ctx = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Service(svc_a.clone()),
+        );
+
+        let now = SystemTime::now();
+        let decl = make_trust_declaration(
+            svc_a,
+            svc_b.clone(),
+            now - std::time::Duration::from_secs(7200),
+            now - std::time::Duration::from_secs(3600),
+        );
+        let sts = ServiceToService {
+            target: svc_b,
+            trust_declaration: decl,
+        };
+        assert!(matches!(
+            ctx.derive_for(sts),
+            Err(DeriveError::UndeclaredServiceTrust)
+        ));
+    }
+
+    /// §4.2 audit emit: every derivation attempt emits exactly
+    /// one DerivedContext event. Verify Success path for all three
+    /// narrowings.
+    #[test]
+    fn derive_for_emits_derived_context_on_success() {
+        use crate::audit::{DerivationOutcome, NarrowingKind, UserAuditEvent};
+
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc_a = make_service("did:plc:phase7e-emit-a");
+        let svc_b = make_service("did:plc:phase7e-emit-b");
+        let ctx = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Service(svc_a.clone()),
+        );
+
+        let _ = ctx.derive_for(ToAnonymous).unwrap();
+        let _ = ctx
+            .derive_for(NarrowCapabilities {
+                drop: crate::authority::capability::CapabilitySet::empty(),
+            })
+            .unwrap();
+        let now = SystemTime::now();
+        let decl = make_trust_declaration(
+            svc_a,
+            svc_b.clone(),
+            now - std::time::Duration::from_secs(60),
+            now + std::time::Duration::from_secs(86400),
+        );
+        let _ = ctx
+            .derive_for(ServiceToService {
+                target: svc_b,
+                trust_declaration: decl,
+            })
+            .unwrap();
+
+        let captured = user.captured();
+        assert_eq!(captured.len(), 3, "one DerivedContext per derive_for call");
+        let kinds: Vec<NarrowingKind> = captured
+            .iter()
+            .map(|e| match e {
+                UserAuditEvent::DerivedContext { narrowing_kind, .. } => *narrowing_kind,
+                other => panic!("expected DerivedContext, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                NarrowingKind::ToAnonymous,
+                NarrowingKind::NarrowCapabilities,
+                NarrowingKind::ServiceToService,
+            ],
+        );
+        for event in &captured {
+            match event {
+                UserAuditEvent::DerivedContext { outcome, .. } => {
+                    assert_eq!(*outcome, DerivationOutcome::Success);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// §4.2 audit emit on failure: failed derivations emit a
+    /// DerivedContext with the matching DerivationOutcome variant.
+    #[test]
+    fn derive_for_emits_derived_context_on_failure() {
+        use crate::audit::{DerivationOutcome, UserAuditEvent};
+
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc_a = make_service("did:plc:phase7e-fail-a");
+        let svc_b = make_service("did:plc:phase7e-fail-b");
+        let ctx = build_ctx(&user, &no_sink, &no_oracle, &ck, Requester::Anonymous);
+
+        let now = SystemTime::now();
+        let decl = make_trust_declaration(
+            svc_a,
+            svc_b.clone(),
+            now - std::time::Duration::from_secs(60),
+            now + std::time::Duration::from_secs(86400),
+        );
+        let _ = ctx.derive_for(ServiceToService {
+            target: svc_b,
+            trust_declaration: decl,
+        });
+
+        let captured = user.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            UserAuditEvent::DerivedContext { outcome, .. } => {
+                assert_eq!(*outcome, DerivationOutcome::IllegalNarrowing);
+            }
+            other => panic!("expected DerivedContext, got {other:?}"),
+        }
+    }
+
+    /// §4.2 fire-and-forget: if the user sink rejects the
+    /// DerivedContext event, derive_for still returns Ok with the
+    /// new context. Audit infrastructure failure does not block
+    /// runtime correctness.
+    #[test]
+    fn derive_for_audit_emit_failure_does_not_block_derivation() {
+        let failing_user = FailingUserSink;
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx = build_ctx(
+            &failing_user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Did(sample_did()),
+        );
+        let derived = ctx.derive_for(ToAnonymous);
+        assert!(
+            derived.is_ok(),
+            "audit emit failure should not block derivation"
+        );
+        let derived = derived.unwrap();
+        assert!(matches!(derived.requester(), Requester::Anonymous));
     }
 }
