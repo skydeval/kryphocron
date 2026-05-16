@@ -623,13 +623,12 @@ fn parse_alg_header(
 /// Failing to find a match returns
 /// [`JwtVerificationError::IssuerKeyNotInDocument`].
 ///
-/// `kid` matching uses byte-equality on the lowercase hex
-/// rendering of the [`KeyId`] (`KeyId` is 32 bytes; the JWT `kid`
-/// is operator-supplied free text but ATProto convention uses the
-/// hex rendering or a full DID-fragment URI). Phase 4a accepts
-/// both: if the hint exactly matches the hex-rendered key id, or
-/// the hint *ends with* the hex-rendered key id (the
-/// `did:plc:...#<keyid>` URI shape), the match succeeds.
+/// `kid` matching is anchored: byte-equality on the lowercase hex
+/// rendering of the [`KeyId`], OR an exact match against the
+/// `#`-delimited fragment of a DID URL (`did:plc:...#<keyid>`).
+/// The `#` delimiter is the anchor — a bare suffix match is
+/// rejected so two keys whose hex IDs share a tail cannot
+/// collide when the shorter id is the hint.
 fn select_signing_key(
     document: &crate::resolver::DidDocument,
     kid_hint: Option<&str>,
@@ -641,10 +640,9 @@ fn select_signing_key(
     }
 
     if let Some(hint) = kid_hint {
-        // Try exact / suffix match first.
         for (kid, key) in methods {
             let kid_hex = kid_to_hex(kid);
-            if hint == kid_hex || hint.ends_with(&kid_hex) {
+            if kid_matches(hint, &kid_hex) {
                 if key.algorithm == algorithm {
                     return Ok(*key);
                 }
@@ -662,6 +660,25 @@ fn select_signing_key(
         }
     }
     Err(JwtVerificationError::IssuerKeyNotInDocument)
+}
+
+/// Anchored `kid`-hint match.
+///
+/// Returns true iff `hint` is byte-equal to `hex_id` (the
+/// lowercase hex rendering of a [`KeyId`]) OR `hint` is a DID URL
+/// whose `#`-delimited fragment equals `hex_id`. Bare suffix
+/// matches (e.g. `"prefixdeadbeef"` against `"deadbeef"`) are
+/// rejected — the `#` anchor eliminates the collision surface a
+/// raw `ends_with` would carry between distinct keys sharing a
+/// hex-id tail.
+fn kid_matches(hint: &str, hex_id: &str) -> bool {
+    if hint == hex_id {
+        return true;
+    }
+    if let Some((_, fragment)) = hint.rsplit_once('#') {
+        return fragment == hex_id;
+    }
+    false
 }
 
 fn kid_to_hex(kid: &KeyId) -> String {
@@ -2659,6 +2676,37 @@ mod tests {
         let c = JwtVerificationConfig::default();
         assert_eq!(c.max_clock_skew, Duration::from_secs(30));
         assert_eq!(c.max_validity_window, Duration::from_secs(3600));
+    }
+
+    // ============================================================
+    // §7.2 kid-matching tightening (v0.1 polish).
+    // ============================================================
+
+    #[test]
+    fn kid_exact_match() {
+        // Byte-equal hex id matches.
+        assert!(kid_matches("deadbeef", "deadbeef"));
+    }
+
+    #[test]
+    fn kid_fragment_match() {
+        // DID URL with `#`-delimited fragment equals the hex id.
+        assert!(kid_matches("did:plc:abc123#deadbeef", "deadbeef"));
+        // Web DID + fragment shape also matches.
+        assert!(kid_matches("did:web:example.com#deadbeef", "deadbeef"));
+    }
+
+    #[test]
+    fn kid_suffix_no_longer_matches() {
+        // Regression pin: the previous `ends_with` shape would have
+        // accepted "prefixdeadbeef" as a match for "deadbeef".
+        // Anchored matching rejects it — only `==` or `#`-fragment
+        // matches succeed.
+        assert!(!kid_matches("prefixdeadbeef", "deadbeef"));
+        // A bare hex prefix collision is also rejected.
+        assert!(!kid_matches("aabbccdeadbeef", "deadbeef"));
+        // An empty fragment after `#` does not silently match.
+        assert!(!kid_matches("did:plc:abc#", "deadbeef"));
     }
 
     // ============================================================
