@@ -14,9 +14,12 @@
 //! [`crate::verification::VerifiedCapabilityClaim`] type and
 //! constructor.
 //!
-//! [`crate::verification::VerifiedHandshake`] /
-//! [`crate::verification::VerifiedSyncMessage`] (§7.5) remain
-//! Phase-4d-stubbed.
+//! [`crate::verification::VerifiedSyncMessage`] (§7.5) carries
+//! a verified post-handshake sync-channel message; the
+//! three-message handshake establishment evidence ships as
+//! [`crate::verification::VerifiedSyncHello`],
+//! [`crate::verification::VerifiedSyncAccept`], and
+//! [`crate::verification::VerifiedSyncEstablished`] (Phase 4d).
 //!
 //! See §7.2 for the JWT verification flow, §7.5 for the
 //! sync-handshake protocol.
@@ -151,39 +154,6 @@ impl VerifiedJwt {
     #[must_use]
     pub fn algorithm(&self) -> SignatureAlgorithm {
         self.algorithm
-    }
-}
-
-/// Verified sync-channel handshake evidence (§7.5).
-///
-/// Constructible only via the handshake-verification path
-/// (Phase 4). Phase 1 ships only the type shape so
-/// [`crate::ingress::from_sync_channel_handshake`] compiles.
-#[derive(Debug, Clone)]
-pub struct VerifiedHandshake {
-    peer: ServiceIdentity,
-    session_id: crate::identity::SessionId,
-    handshake_at: SystemTime,
-    _private: PhantomData<sealed::Token>,
-}
-
-impl VerifiedHandshake {
-    /// Borrow the peer identity.
-    #[must_use]
-    pub fn peer(&self) -> &ServiceIdentity {
-        &self.peer
-    }
-
-    /// Return the session id issued at handshake.
-    #[must_use]
-    pub fn session_id(&self) -> crate::identity::SessionId {
-        self.session_id
-    }
-
-    /// Return the handshake timestamp.
-    #[must_use]
-    pub fn handshake_at(&self) -> SystemTime {
-        self.handshake_at
     }
 }
 

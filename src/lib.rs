@@ -33,9 +33,15 @@
 //! - [`audit`] pipeline traits, sink types, composite-audit
 //!   rollback machinery, and the [`audit::FallbackAuditSink`]
 //!   contract (§4.9).
-//! - [`verification`] submodule shapes — [`verification::VerifiedJwt`],
-//!   [`verification::VerifiedHandshake`] — that ingress depends on
-//!   (§7.2, §7.5; surface only in Phase 1).
+//! - [`verification`] submodule — [`verification::VerifiedJwt`],
+//!   [`verification::VerifiedCapabilityClaim`],
+//!   [`verification::VerifiedSyncMessage`], and the three-message
+//!   sync-handshake evidence types
+//!   ([`verification::VerifiedSyncHello`],
+//!   [`verification::VerifiedSyncAccept`],
+//!   [`verification::VerifiedSyncEstablished`]) — the only path
+//!   that produces verified evidence the [`ingress`] submodule
+//!   accepts (§7.2, §7.5).
 //! - [`resolver`] trait surfaces for DID resolution and federation-
 //!   peer trust (§7.3, §7.7; surface only in Phase 1).
 //! - [`encryption`] hook-trait surfaces and opaque key-id types
@@ -130,9 +136,11 @@ pub mod trust;
 pub mod tier;
 
 /// §7.2 JWT / handshake / claim verification. The only path that
-/// produces [`verification::VerifiedJwt`] and
-/// [`verification::VerifiedHandshake`] values; downstream code
-/// that takes one of those types knows verification ran.
+/// produces [`verification::VerifiedJwt`],
+/// [`verification::VerifiedCapabilityClaim`],
+/// [`verification::VerifiedSyncMessage`], and the three-message
+/// sync-handshake evidence values; downstream code that takes one
+/// of those types knows verification ran.
 pub mod verification;
 
 // Phase-1 internal areas that span §4 but don't carry their own

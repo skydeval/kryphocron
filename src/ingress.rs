@@ -7,12 +7,12 @@
 //! [`AuthContext`] is the in-process authentication context the
 //! substrate carries through every authorization decision. It is
 //! constructed only via the `ingress` submodule functions
-//! (`from_xrpc_request`, `from_sync_channel_handshake`,
-//! `anonymous_for_public_read`), each of which accepts a
-//! verified-evidence type. Code outside the crate cannot construct
-//! an [`AuthContext`] via struct-literal syntax because every
-//! field is private and the type carries a `PhantomData<*const ()>`
-//! to forbid `Clone`.
+//! (`from_xrpc_request`, `from_service_request`,
+//! `from_sync_channel_message`, `anonymous_for_public_read`),
+//! each of which accepts a verified-evidence type. Code outside
+//! the crate cannot construct an [`AuthContext`] via
+//! struct-literal syntax because every field is private and the
+//! type carries a `PhantomData<*const ()>` to forbid `Clone`.
 //!
 //! Sub-context derivation uses [`AuthContext::derive_for`] over a
 //! sealed [`Narrowing`] trait — only three [`Narrowing`] impls
@@ -77,9 +77,8 @@ impl<'a> AuthContext<'a> {
     /// Crate-internal constructor. Reserved for the
     /// [`crate::ingress`] entry-point functions
     /// (`from_xrpc_request`, `from_service_request`,
-    /// `from_sync_channel_message`, `from_sync_channel_handshake`,
-    /// `anonymous_for_public_read`) that turn a verified-evidence
-    /// type into an [`AuthContext`].
+    /// `from_sync_channel_message`, `anonymous_for_public_read`)
+    /// that turn a verified-evidence type into an [`AuthContext`].
     #[must_use]
     pub(crate) fn new_internal(
         requester: Requester,
@@ -754,20 +753,6 @@ pub fn from_service_request<'a>(
         oracles,
         chain,
     )
-}
-
-/// Construct [`AuthContext`] from a verified sync-channel
-/// handshake (§4.2).
-///
-/// **Phase 1 stub.** Phase 4 wires.
-#[must_use]
-pub fn from_sync_channel_handshake<'a>(
-    _evidence: crate::verification::VerifiedHandshake,
-    _trace_id: TraceId,
-    _sinks: AuditSinks<'a>,
-    _oracles: OracleSet<'a>,
-) -> AuthContext<'a> {
-    unimplemented!("§4.2 ingress::from_sync_channel_handshake: Phase 4 wires");
 }
 
 /// Construct [`AuthContext`] from a verified post-handshake
