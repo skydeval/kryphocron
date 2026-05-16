@@ -800,13 +800,28 @@ pub fn from_sync_channel_message<'a>(
 /// Construct an anonymous [`AuthContext`] for public-read paths
 /// (§4.2).
 ///
-/// **Phase 1 stub.** Phase 4 wires.
+/// The resulting context's [`Requester`] is
+/// [`Requester::Anonymous`]; the attribution chain is empty.
+/// Used for public-read code paths where the substrate processes
+/// records visible at [`crate::Tier::Public`] without requiring
+/// authenticated identity.
+///
+/// `trace_id` is supplied by the caller — typically a per-request
+/// fresh value from the dispatcher's request-id generator. The
+/// crate does not generate trace ids internally.
 #[must_use]
 pub fn anonymous_for_public_read<'a>(
-    _sinks: AuditSinks<'a>,
-    _oracles: OracleSet<'a>,
+    trace_id: TraceId,
+    sinks: AuditSinks<'a>,
+    oracles: OracleSet<'a>,
 ) -> AuthContext<'a> {
-    unimplemented!("§4.2 ingress::anonymous_for_public_read: Phase 4 wires");
+    AuthContext::new_internal(
+        Requester::Anonymous,
+        trace_id,
+        sinks,
+        oracles,
+        AttributionChain::empty(),
+    )
 }
 
 #[cfg(test)]
@@ -1575,5 +1590,47 @@ mod tests {
         );
         let derived = derived.unwrap();
         assert!(matches!(derived.requester(), Requester::Anonymous));
+    }
+
+    /// §4.2 anonymous_for_public_read constructor (Phase 7f
+    /// Bucket D2): produces an AuthContext with
+    /// Requester::Anonymous, empty attribution chain, and the
+    /// caller-supplied trace_id / sinks / oracles passed through
+    /// verbatim.
+    #[test]
+    fn anonymous_for_public_read_constructs_anonymous_context() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let trace_id = crate::identity::TraceId::from_bytes([0xAA; 16]);
+
+        let ctx = anonymous_for_public_read(
+            trace_id,
+            AuditSinks {
+                user: &user,
+                channel: &no_sink,
+                substrate: &no_sink,
+                moderation: &no_sink,
+                fallback: &no_sink,
+                inspection_queue: &no_sink,
+                correlation_key: &ck,
+            },
+            OracleSet {
+                block: &no_oracle,
+                audience: &no_oracle,
+                mute: &no_oracle,
+            },
+        );
+
+        assert!(matches!(ctx.requester(), Requester::Anonymous));
+        assert_eq!(ctx.trace_id(), trace_id);
+        assert_eq!(
+            ctx.attribution_chain().entries().len(),
+            0,
+            "anonymous context starts with empty chain"
+        );
+        // Constructor doesn't fire any audit events.
+        assert_eq!(user.captured().len(), 0);
     }
 }
