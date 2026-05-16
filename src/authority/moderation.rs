@@ -141,7 +141,7 @@ pub enum InspectionKind {
 /// **Inspection emission is OUTSIDE composite-audit rollback
 /// semantics** (§6.7's "notifications are diagnostic, not
 /// authoritative"): bind first commits the
-/// [`crate::audit::ModerationAuditEvent`] via [`crate::composite_audit`],
+/// [`crate::audit::ModerationAuditEvent`] via [`crate::audit::composite_audit`],
 /// then enqueues the matching inspection notification. If the
 /// audit commit succeeds but the inspection enqueue fails, the
 /// audit stands; the operator's queue implementation surfaces

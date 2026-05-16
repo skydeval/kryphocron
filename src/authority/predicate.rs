@@ -197,21 +197,21 @@ pub enum BindError {
 
 /// Phase 7d: surface `composite_audit` failures as bind errors.
 ///
-/// Bind paths run their pipeline inside [`crate::composite_audit`]
+/// Bind paths run their pipeline inside [`crate::audit::composite_audit`]
 /// (§4.9) and need a `From<CompositeAuditError>` impl on
 /// [`BindError`] so the `?` operator propagates audit-machinery
 /// failures into the bind-error channel.
 ///
 /// Mapping:
-/// - [`CompositeAuditError::SinkCommitFailed`] →
+/// - [`crate::audit::CompositeAuditError::SinkCommitFailed`] →
 ///   [`BindError::AuditUnavailable`] (a sink rejected the event).
-/// - [`CompositeAuditError::RollbackDispatchFailed`] →
+/// - [`crate::audit::CompositeAuditError::RollbackDispatchFailed`] →
 ///   [`BindError::AuditUnavailable`] (rollback dispatch failed
 ///   after a commit failure; same surface).
-/// - [`CompositeAuditError::InconsistencyUnrecoverable`] →
+/// - [`crate::audit::CompositeAuditError::InconsistencyUnrecoverable`] →
 ///   [`BindError::AuditPanicked`] (the fallback sink itself
 ///   panicked — last-resort variant).
-/// - [`CompositeAuditError::TrackerFull`] →
+/// - [`crate::audit::CompositeAuditError::TrackerFull`] →
 ///   [`BindError::AuditUnavailable`] (reserved per-process
 ///   tracker full; same surface).
 impl From<crate::audit::CompositeAuditError> for BindError {

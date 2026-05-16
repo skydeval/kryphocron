@@ -45,8 +45,8 @@ use crate::sealed;
 ///    `target_repr: TargetRepresentation::structural_only(StructuralRepresentation::Resource { did, nsid })`,
 ///    which needs both pieces.
 ///
-/// **Sealed** via the crate-private [`crate::sealed::Sealed`]
-/// supertrait — external types cannot impl this trait.
+/// **Sealed** via a crate-private supertrait — external types
+/// cannot impl this trait.
 pub trait HasResourceLocation: sealed::Sealed {
     /// Borrow the owner DID of the resource this subject names.
     fn resource_did(&self) -> &Did;

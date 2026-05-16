@@ -2,16 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! §4.3 capability proof types — four parallel families.
-//!
-//! Phase 4e (resolves CHAINLINKS #11): `dead_code` allowed at
-//! module level because the proof types are public surface for
-//! downstream substrates that bind / hold / consume proofs;
-//! the kryphocron crate itself constructs them but does not
-//! consume their fields directly. Phase 4f / Phase 5 wire
-//! the consuming code paths.
-#![allow(dead_code)]
-
+//! §4.3 capability proof types — four parallel families with
+//! wired bind + reborrow pipelines (Phase 7d).
 //!
 //! Each capability class has a triple:
 //!
@@ -31,11 +23,100 @@
 //! - `bind` consumes `self` so move semantics foreclose
 //!   double-emission of the terminal audit event.
 //!
-//! ## Phase 1 status
+//! ## Bind pipeline (§4.3)
 //!
-//! `bind` and `reborrow` carry the right type signature and emit
-//! a `todo!()` body. Phase 4 wires the §4.3 pipeline + audit-sink
-//! dispatch; Phase 1 ships only the type architecture.
+//! Each `*Proof::bind` is `async fn` (the §4.3 pipeline runs
+//! inside [`crate::audit::composite_audit`] which is async). The general
+//! shape:
+//!
+//! 1. **Pre-checks** (no audit emit): target match, context
+//!    match, expiry. Caller errors fail fast via
+//!    [`BindError::TargetMismatch`] / [`BindError::ContextMismatch`]
+//!    / [`BindError::Expired`].
+//! 2. **Stage 0 — DeprecationGate** (Write-semantics user-class +
+//!    moderation-class): consults
+//!    [`crate::KRYPHOCRON_LEXICON_REGISTRY`] for the subject's
+//!    NSID via [`crate::HasResourceLocation`]. Channel and
+//!    substrate skip (their subjects carry no NSID).
+//! 3. **Stage 2 — BlockConsultation** (user-class only): consults
+//!    [`crate::oracle::BlockOracle`] for the universal
+//!    `RequesterVsResourceOwner` query. Multi-query consultations
+//!    defer to a v0.2 per-capability oracle-results-builder
+//!    trait. Channel / substrate / moderation skip — their
+//!    capability traits don't declare `ORACLE_CONSULTATIONS`.
+//! 4. **Stage 5 — Predicate** (user-class only): invokes
+//!    [`crate::IssuancePolicy::capability_predicate`] with
+//!    default-initialized oracle results (v0.1 stub per the
+//!    stage-2 gap above).
+//! 5. **Stage 5' — Audit emit**: emits the class-discriminating
+//!    `*Bound` variant on success or `*IssuanceDenied` on stage
+//!    failure via [`crate::audit::composite_audit`]. The op closure
+//!    always returns `Ok(BindFlow::*)` so denial events get
+//!    committed (composite_audit drops queued events on `Err`
+//!    return); the bind body unpacks `BindFlow` outside the
+//!    closure to surface [`BindError::DeniedAtPipeline`].
+//! 6. **Stage 6 — Timing equalization** (user-class only): post-
+//!    emit, sleeps until `equalize_timing_target_for::<C>`
+//!    elapses (closes the §4.6 timing-channel gap).
+//! 7. **Inspection-queue emit (moderation only,
+//!    post-composite-audit)**: on success, fans an
+//!    [`crate::InspectionNotification`] to the resource owner's
+//!    queue. **OUTSIDE composite-rollback semantics** per §6.7.
+//!
+//! ## Reborrow pipeline (§4.3)
+//!
+//! Each `Bound*Proof::reborrow` is `async fn`. Re-checks expiry
+//! against the capability's `MAX_AGE`. Per §4.3 reborrow does
+//! **NOT** re-run oracle consultations or the capability
+//! predicate — operators wanting fresh policy checks call `bind`
+//! again on a fresh proof.
+//!
+//! - Inside window: silent success.
+//! - Past window (user/channel): emits `ReborrowFailed` /
+//!   `ChannelReborrowFailed`.
+//! - Past window (substrate): emits `ScopeBound{outcome: Expired}`
+//!   (no dedicated reborrow-failed variant; reuses success-path
+//!   variant with non-Success outcome).
+//! - Past window (moderation): silent at the audit layer (no
+//!   suitable variant; v0.2 chainlink for emit symmetry).
+//!
+//! ## V0.1 audit-detail gaps
+//!
+//! Some audit-event fields ship as placeholders pending v0.2
+//! sealed-trait infrastructure for generic data extraction from
+//! the typed `Subject` / `OracleResults`:
+//!
+//! - User-class oracle consultations: only the universal
+//!   `RequesterVsResourceOwner` block query is consulted; multi-
+//!   query consultations defer to a v0.2 per-capability
+//!   oracle-results-builder.
+//! - Channel-class peer + session_id: synthesized from the
+//!   proof's recorded Did + zero placeholders. Real extraction
+//!   needs a sealed `ChannelSubjectShape` trait.
+//! - Substrate-class scope_repr: ships with placeholder
+//!   `ScopeKind::Shard`. Real extraction needs a sealed
+//!   `HasScopeKind` trait.
+//! - Moderation-class case: ships with placeholder
+//!   `ModerationCaseId([0; 16])`. Real extraction needs a sealed
+//!   `HasModerationCase` trait.
+//!
+//! All four gaps share the same shape ("the typed Subject
+//! doesn't expose its fields generically; need a sealed
+//! per-class extraction trait") and chainlink to v0.2.
+//!
+//! ## Module-level `#![allow(dead_code)]` (Phase 7d C9)
+//!
+//! Phase 4e CHAINLINKS #11 added the module-level allow because
+//! the proof types' fields were unconsumed (Phase 1 only shipped
+//! the type architecture). 7d wires bind+reborrow but the
+//! `issuer: AuthorityId` and `capability_kind: CapabilityKind`
+//! fields on each `*Proof` remain unread inside the crate —
+//! they're forensic-correlation data stored for future
+//! `Bound*Proof::issuer()` and `Bound*Proof::capability_kind()`
+//! accessor methods that v0.2 will ship for substrate code that
+//! holds bound proofs across operations. The allow stays until
+//! those accessors land.
+#![allow(dead_code)]
 
 use core::marker::PhantomData;
 use std::time::{Duration, Instant};
@@ -54,7 +135,7 @@ use crate::sealed;
 // Phase 7d §4.3 bind/reborrow shared helpers + BindFlow.
 // ============================================================
 
-/// §4.3 bind-pipeline outcome carried via [`crate::composite_audit`]'s
+/// §4.3 bind-pipeline outcome carried via [`crate::audit::composite_audit`]'s
 /// `R` channel.
 ///
 /// Bind paths run their pipeline inside `composite_audit` and need
@@ -200,7 +281,7 @@ impl<C: UserCapability> UserProof<C> {
     /// Bind the proof against a target.
     ///
     /// Consumes `self`. Emits exactly one terminal audit event
-    /// per §4.3 / §4.9 A1 invariant via [`crate::composite_audit`].
+    /// per §4.3 / §4.9 A1 invariant via [`crate::audit::composite_audit`].
     /// On success returns [`BoundUserProof`]; on any non-success
     /// outcome the audit emit fires first and `Err(BindError)` is
     /// returned.
@@ -1073,11 +1154,11 @@ impl<C: ModerationCapability> ModerationProof<C> {
     /// - **Stage 5 — Audit emit**: emits the class-discriminating
     ///   variant via composite_audit:
     ///   [`crate::audit::ModerationAuditEvent::ModeratorInspected`]
-    ///   for [`crate::ModeratorRead`],
+    ///   for [`crate::authority::v1::ModeratorRead`],
     ///   [`crate::audit::ModerationAuditEvent::ModeratorTookDown`]
-    ///   for [`crate::ModeratorTakedown`],
+    ///   for [`crate::authority::v1::ModeratorTakedown`],
     ///   [`crate::audit::ModerationAuditEvent::ModeratorRestored`]
-    ///   for [`crate::ModeratorRestore`]. Each carries
+    ///   for [`crate::authority::v1::ModeratorRestore`]. Each carries
     ///   `outcome: BindOutcomeRepr::Success` (where applicable).
     /// - **Inspection-queue emit (post-composite-audit)**: after
     ///   the audit commits, fans an
