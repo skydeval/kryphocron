@@ -1061,18 +1061,213 @@ impl<C: ModerationCapability> ModerationProof<C> {
         }
     }
 
-    /// Bind. Phase 1 stub.
-    pub fn bind<'p>(
+    /// Bind the moderation proof against a target.
+    ///
+    /// Consumes `self`. Pipeline (Phase 7d v0.1):
+    /// - **Pre-checks** (no audit): target match, context match,
+    ///   expiry.
+    /// - **Stage 0 — DeprecationGate**: consults
+    ///   [`crate::KRYPHOCRON_LEXICON_REGISTRY`] for the moderation
+    ///   subject's NSID (via [`crate::HasResourceLocation`]).
+    ///   Moderation operations on deprecated lexicons fail closed.
+    /// - **Stage 5 — Audit emit**: emits the class-discriminating
+    ///   variant via composite_audit:
+    ///   [`crate::audit::ModerationAuditEvent::ModeratorInspected`]
+    ///   for [`crate::ModeratorRead`],
+    ///   [`crate::audit::ModerationAuditEvent::ModeratorTookDown`]
+    ///   for [`crate::ModeratorTakedown`],
+    ///   [`crate::audit::ModerationAuditEvent::ModeratorRestored`]
+    ///   for [`crate::ModeratorRestore`]. Each carries
+    ///   `outcome: BindOutcomeRepr::Success` (where applicable).
+    /// - **Inspection-queue emit (post-composite-audit)**: after
+    ///   the audit commits, fans an
+    ///   [`crate::InspectionNotification`] to the resource owner's
+    ///   queue via [`crate::ingress::AuditSinks::inspection_queue`].
+    ///   **Outside composite-rollback semantics** per §6.7
+    ///   ("notifications are diagnostic, not authoritative") — if
+    ///   the audit commit succeeds but the inspection enqueue
+    ///   fails, the audit stands.
+    ///
+    /// `rationale` is the moderator-declared rationale (§6.5
+    /// round-1 patch F2 length-bounded). It surfaces in both the
+    /// audit event and the inspection notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns precondition errors without audit emit.
+    /// [`BindError::DeniedAtPipeline`] for stage failures.
+    /// [`BindError::AuditUnavailable`] / [`BindError::AuditPanicked`]
+    /// on audit-machinery failure.
+    pub async fn bind<'p>(
         self,
-        _ctx: &AuthContext<'_>,
-        _target: &<C as ModerationCapability>::Subject,
+        ctx: &AuthContext<'_>,
+        target: &<C as ModerationCapability>::Subject,
+        rationale: crate::audit::ModeratorRationale,
     ) -> Result<BoundModerationProof<'p, C>, BindError>
     where
         Self: 'p,
+        <C as ModerationCapability>::Subject:
+            PartialEq + crate::authority::HasResourceLocation,
     {
-        unimplemented!("§4.3 ModerationProof::bind: Phase 4");
+        precheck_target_match(&self.subject, target)?;
+        precheck_context_match(&self.requester, ctx)?;
+        precheck_expired(self.issued_at, C::MAX_AGE)?;
+
+        let trace_id = self.trace_id;
+        let moderator_did = self.requester.clone();
+        let now = std::time::SystemTime::now();
+        let target_did = target.resource_did().clone();
+        let target_nsid = target.resource_nsid().clone();
+        let target_repr = crate::target::TargetRepresentation::structural_only(
+            crate::target::StructuralRepresentation::Resource {
+                did: target_did.clone(),
+                nsid: target_nsid.clone(),
+            },
+        );
+
+        // ModerationSubject is the only v1 ModerationCapability
+        // Subject. To extract its `case: ModerationCaseId` field
+        // generically we'd need another sealed trait
+        // (HasModerationCase). v0.1 ships with a placeholder
+        // ModerationCaseId per the same v0.2 chainlink as
+        // channel/substrate's per-class data extraction.
+        let case = crate::authority::ModerationCaseId::from_bytes([0u8; 16]);
+
+        let kind = C::KIND;
+        let rationale_for_audit = rationale.clone();
+        let rationale_for_notification = rationale;
+        let target_repr_for_notification = target_repr.clone();
+        let moderator_for_audit = moderator_did.clone();
+
+        let pipeline_result: Result<BindFlow, BindError> =
+            crate::audit::composite_audit(trace_id, ctx.audit(), async |scope| {
+                // Stage 0: deprecation gate. Moderation ops on a
+                // deprecated lexicon fail closed (regardless of
+                // moderation kind — read/takedown/restore).
+                if let Err(reason) = crate::authority::check_stage_0_deprecation(
+                    &target_nsid,
+                    now_unix_seconds(),
+                ) {
+                    let event = crate::audit::ModerationAuditEvent::ModerationIssuanceDenied {
+                        trace_id,
+                        moderator: moderator_for_audit.clone(),
+                        capability: kind,
+                        reason: reason.clone(),
+                        at: now,
+                    };
+                    scope.emit_moderation(event);
+                    return Ok(BindFlow::DeniedAtPipeline {
+                        stage: PipelineStage::DeprecationGate,
+                        reason,
+                    });
+                }
+
+                // Stage 5: emit class-discriminating success event.
+                // The C: ModerationCapability trait bound restricts
+                // KIND to ModeratorRead / ModeratorTakedown /
+                // ModeratorRestore. The fourth arm is unreachable
+                // by construction; if a future ModerationCapability
+                // adds a new KIND variant it must also add a match
+                // arm here (catch-all panic surfaces the gap).
+                let event = match kind {
+                    crate::authority::CapabilityKind::ModeratorRead => {
+                        crate::audit::ModerationAuditEvent::ModeratorInspected {
+                            trace_id,
+                            moderator: moderator_for_audit,
+                            case,
+                            target_repr: target_repr.clone(),
+                            rationale: rationale_for_audit,
+                            at: now,
+                        }
+                    }
+                    crate::authority::CapabilityKind::ModeratorTakedown => {
+                        crate::audit::ModerationAuditEvent::ModeratorTookDown {
+                            trace_id,
+                            moderator: moderator_for_audit,
+                            case,
+                            target_repr: target_repr.clone(),
+                            outcome: crate::authority::BindOutcomeRepr::Success,
+                            rationale: rationale_for_audit,
+                            at: now,
+                        }
+                    }
+                    crate::authority::CapabilityKind::ModeratorRestore => {
+                        crate::audit::ModerationAuditEvent::ModeratorRestored {
+                            trace_id,
+                            moderator: moderator_for_audit,
+                            case,
+                            target_repr: target_repr.clone(),
+                            outcome: crate::authority::BindOutcomeRepr::Success,
+                            rationale: rationale_for_audit,
+                            at: now,
+                        }
+                    }
+                    other => unreachable!(
+                        "non-moderation capability kind {other:?} reached ModerationProof::bind"
+                    ),
+                };
+                scope.emit_moderation(event);
+                Ok(BindFlow::Success)
+            })
+            .await;
+
+        // Inspection-queue emit (post-composite-audit, OUTSIDE
+        // composite-rollback semantics per §6.7). Only fires on a
+        // successful bind — denial paths skip the notification.
+        if matches!(pipeline_result, Ok(BindFlow::Success)) {
+            let inspection_kind = match kind {
+                crate::authority::CapabilityKind::ModeratorRead => {
+                    crate::authority::InspectionKind::ModeratorRead {
+                        case,
+                        rationale: rationale_for_notification,
+                    }
+                }
+                crate::authority::CapabilityKind::ModeratorTakedown => {
+                    crate::authority::InspectionKind::Takedown {
+                        case,
+                        rationale: rationale_for_notification,
+                    }
+                }
+                crate::authority::CapabilityKind::ModeratorRestore => {
+                    crate::authority::InspectionKind::Restore {
+                        case,
+                        rationale: rationale_for_notification,
+                    }
+                }
+                other => unreachable!(
+                    "non-moderation capability kind {other:?} reached inspection-kind dispatch"
+                ),
+            };
+            let mut notification_id_bytes = [0u8; 16];
+            getrandom::getrandom(&mut notification_id_bytes)
+                .expect("§6.7 notification-id init: OS CSPRNG unavailable");
+            let notification = crate::authority::InspectionNotification {
+                notification_id: crate::authority::NotificationId::from_bytes(
+                    notification_id_bytes,
+                ),
+                trace_id,
+                kind: inspection_kind,
+                target_repr: target_repr_for_notification,
+                at: now,
+            };
+            ctx.audit()
+                .inspection_queue
+                .enqueue(&target_did, notification);
+        }
+
+        match pipeline_result {
+            Ok(BindFlow::Success) => Ok(BoundModerationProof {
+                proof: self,
+                _life: PhantomData,
+            }),
+            Ok(BindFlow::DeniedAtPipeline { stage, reason }) => {
+                Err(BindError::DeniedAtPipeline { stage, reason })
+            }
+            Err(bind_err) => Err(bind_err),
+        }
     }
 }
+
 
 /// Bound moderation-class proof.
 #[must_use]
@@ -1097,12 +1292,26 @@ impl<'p, C: ModerationCapability> BoundModerationProof<'p, C> {
         self.proof.trace_id
     }
 
-    /// Reborrow. Phase 1 stub.
-    pub fn reborrow<'r>(
+    /// Re-derive a moderation borrow.
+    ///
+    /// Re-checks expiry against
+    /// [`ModerationCapability::MAX_AGE`]. Successful reborrow is
+    /// silent.
+    ///
+    /// **V0.1 audit gap**: on miss, returns
+    /// [`BindFailureReason::Expired`] without an audit emit. v1's
+    /// audit vocabulary has no ModerationReborrowFailed variant
+    /// (unlike user/channel which have ReborrowFailed /
+    /// ChannelReborrowFailed). v0.2 chainlink: introduce a
+    /// dedicated variant or a generic reborrow-failed shape.
+    pub async fn reborrow<'r>(
         &'r self,
         _ctx: &AuthContext<'_>,
     ) -> Result<ModerationProofRef<'r, C>, BindFailureReason> {
-        unimplemented!("§4.3 BoundModerationProof::reborrow: Phase 4");
+        if self.proof.issued_at.elapsed() <= C::MAX_AGE {
+            return Ok(ModerationProofRef { proof: &self.proof });
+        }
+        Err(BindFailureReason::Expired)
     }
 }
 
@@ -2305,6 +2514,264 @@ mod substrate_bind_tests {
         assert_eq!(
             CapabilityKind::ScanShard.class(),
             CapabilityClass::Substrate
+        );
+    }
+}
+
+// ========================================================
+// Phase 7d C7 — ModerationProof::bind + BoundModerationProof::reborrow tests.
+// ========================================================
+
+#[cfg(test)]
+mod moderation_bind_tests {
+    use super::bind_test_fixtures::*;
+    use super::*;
+    use crate::audit::{ModerationAuditEvent, ModeratorRationale};
+    use crate::authority::v1::{ModeratorRead, ModeratorTakedown};
+    use crate::authority::{
+        issue_moderation, BindOutcomeRepr, CapabilityClass, CapabilityKind, InspectionKind,
+    };
+    use std::time::Duration;
+
+    fn sample_moderation_subject() -> crate::authority::ModerationSubject {
+        crate::authority::ModerationSubject {
+            resource: sample_resource_id(),
+            case: crate::authority::ModerationCaseId::from_bytes([0u8; 16]),
+        }
+    }
+
+    fn sample_service_identity() -> crate::identity::ServiceIdentity {
+        crate::identity::ServiceIdentity::new_internal(
+            sample_did(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    fn sample_rationale() -> ModeratorRationale {
+        ModeratorRationale::Declared(
+            crate::audit::BoundedString::<{ crate::audit::MAX_RATIONALE_LEN }>::new(
+                "v0.1 test rationale",
+            )
+            .unwrap(),
+        )
+    }
+
+    fn issue_modread_for(
+        ctx: &AuthContext<'_>,
+        subject: crate::authority::ModerationSubject,
+    ) -> ModerationProof<ModeratorRead> {
+        match issue_moderation::<ModeratorRead>(ctx, subject) {
+            Ok(p) => p,
+            Err(_) => panic!("issuance prerequisite failed"),
+        }
+    }
+
+    /// §4.3 + §6.7 happy path: ModeratorRead bind with Service
+    /// requester returns Ok(BoundModerationProof). One
+    /// ModeratorInspected event captured AND one inspection
+    /// notification enqueued (dual-emit per §6.7).
+    #[tokio::test]
+    async fn bind_moderator_read_succeeds_and_dual_emits() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let proof = issue_modread_for(&ctx, sample_moderation_subject());
+
+        let r = proof
+            .bind(&ctx, &sample_moderation_subject(), sample_rationale())
+            .await;
+        assert!(r.is_ok());
+
+        // Audit emission
+        let captured_audit = fixture.moderation.captured();
+        assert_eq!(captured_audit.len(), 1);
+        match &captured_audit[0] {
+            ModerationAuditEvent::ModeratorInspected { rationale, .. } => {
+                assert!(matches!(rationale, ModeratorRationale::Declared(_)));
+            }
+            other => panic!("expected ModeratorInspected, got {other:?}"),
+        }
+
+        // Inspection-queue emission (separate channel per §6.7)
+        let captured_notifications = fixture.inspection.captured();
+        assert_eq!(
+            captured_notifications.len(),
+            1,
+            "ModeratorRead bind enqueues one InspectionNotification"
+        );
+        let (_owner, notification) = &captured_notifications[0];
+        match &notification.kind {
+            InspectionKind::ModeratorRead { rationale, .. } => {
+                assert!(matches!(rationale, ModeratorRationale::Declared(_)));
+            }
+            other => panic!("expected InspectionKind::ModeratorRead, got {other:?}"),
+        }
+        // The trace_id is shared between the audit event and the
+        // inspection notification (§6.7 correlation discipline).
+        assert_eq!(
+            notification.trace_id,
+            match &captured_audit[0] {
+                ModerationAuditEvent::ModeratorInspected { trace_id, .. } => *trace_id,
+                _ => panic!("unreachable"),
+            },
+            "audit event and inspection notification share trace_id"
+        );
+    }
+
+    /// §6.5: ModeratorTakedown bind emits the ModeratorTookDown
+    /// variant (not ModeratorInspected) — the kind dispatch maps
+    /// to the right audit shape.
+    #[tokio::test]
+    async fn bind_moderator_takedown_emits_took_down_variant() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let proof = match issue_moderation::<ModeratorTakedown>(&ctx, sample_moderation_subject()) {
+            Ok(p) => p,
+            Err(_) => panic!("issuance prerequisite failed"),
+        };
+
+        let r = proof
+            .bind(&ctx, &sample_moderation_subject(), sample_rationale())
+            .await;
+        assert!(r.is_ok());
+
+        let captured = fixture.moderation.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            ModerationAuditEvent::ModeratorTookDown { outcome, .. } => {
+                assert!(matches!(outcome, BindOutcomeRepr::Success));
+            }
+            other => panic!("expected ModeratorTookDown, got {other:?}"),
+        }
+
+        // Inspection notification: Takedown variant
+        let captured_notifications = fixture.inspection.captured();
+        assert_eq!(captured_notifications.len(), 1);
+        match &captured_notifications[0].1.kind {
+            InspectionKind::Takedown { .. } => {}
+            other => panic!("expected InspectionKind::Takedown, got {other:?}"),
+        }
+    }
+
+    /// §4.3 precondition: target ≠ proof.subject → TargetMismatch
+    /// (no audit emit, no inspection emit).
+    #[tokio::test]
+    async fn bind_rejects_target_mismatch_at_precondition() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let proof = issue_modread_for(&ctx, sample_moderation_subject());
+
+        let different_target = crate::authority::ModerationSubject {
+            resource: sample_resource_id(),
+            case: crate::authority::ModerationCaseId::from_bytes([0xFF; 16]),
+        };
+        let r = proof
+            .bind(&ctx, &different_target, sample_rationale())
+            .await;
+        assert!(matches!(r, Err(BindError::TargetMismatch)));
+        assert_eq!(fixture.moderation.captured().len(), 0);
+        assert_eq!(
+            fixture.inspection.captured().len(),
+            0,
+            "precondition failure emits NEITHER audit NOR inspection"
+        );
+    }
+
+    /// §6.7: denial paths skip the inspection-queue emit (only
+    /// successful binds notify the resource owner).
+    #[tokio::test]
+    async fn denial_path_skips_inspection_emit() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let proof = issue_modread_for(&ctx, sample_moderation_subject());
+
+        // Force denial via context mismatch
+        let svc_b = crate::identity::ServiceIdentity::new_internal(
+            sample_did_other(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        );
+        let ctx_b = fixture.build_ctx(Requester::Service(svc_b));
+        let r = proof
+            .bind(&ctx_b, &sample_moderation_subject(), sample_rationale())
+            .await;
+        assert!(matches!(r, Err(BindError::ContextMismatch)));
+        // Both audit and inspection are silent on precondition
+        // failure (and on stage-0 denial, though we can't trigger
+        // that with v1's all-Active registry).
+        assert_eq!(fixture.moderation.captured().len(), 0);
+        assert_eq!(fixture.inspection.captured().len(), 0);
+    }
+
+    /// §4.3 reborrow: moderation bound proof inside MAX_AGE
+    /// re-derives silent ProofRef.
+    #[tokio::test]
+    async fn reborrow_succeeds_within_max_age() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+        let proof = issue_modread_for(&ctx, sample_moderation_subject());
+
+        let bound = match proof
+            .bind(&ctx, &sample_moderation_subject(), sample_rationale())
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => panic!("bind prerequisite failed"),
+        };
+        let captured_after_bind = fixture.moderation.captured().len();
+
+        let r = bound.reborrow(&ctx).await;
+        assert!(r.is_ok());
+        assert_eq!(
+            fixture.moderation.captured().len(),
+            captured_after_bind,
+            "successful reborrow is silent"
+        );
+    }
+
+    /// §4.3 reborrow: past MAX_AGE returns Expired. v1's audit
+    /// vocabulary has no ModerationReborrowFailed variant — the
+    /// failure is silent at the audit layer (v0.2 chainlink).
+    #[tokio::test]
+    async fn reborrow_returns_expired_past_max_age_silently() {
+        let fixture = BindFixture::new();
+        let ctx = fixture.build_ctx(Requester::Service(sample_service_identity()));
+
+        // ModeratorRead MAX_AGE = 30s; backdate 60s.
+        let backdated = ModerationProof::<ModeratorRead>::new_internal(
+            sample_did(),
+            sample_moderation_subject(),
+            Instant::now() - Duration::from_secs(60),
+            AuthorityId::from_bytes([0u8; 16]),
+            TraceId::from_bytes([0xCD; 16]),
+        );
+        let bound = BoundModerationProof {
+            proof: backdated,
+            _life: PhantomData,
+        };
+
+        let r = bound.reborrow(&ctx).await;
+        assert!(matches!(r, Err(BindFailureReason::Expired)));
+        assert_eq!(
+            fixture.moderation.captured().len(),
+            0,
+            "moderation reborrow miss is silent at the audit layer (v0.2 chainlink for emit)"
+        );
+    }
+
+    #[test]
+    fn moderation_class_discriminator_pinned() {
+        assert_eq!(
+            CapabilityKind::ModeratorRead.class(),
+            CapabilityClass::Moderation
         );
     }
 }
