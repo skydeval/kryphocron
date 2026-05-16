@@ -93,13 +93,28 @@ impl CompositeOpId {
 /// Number of shards in the composite-id tracker (§4.9).
 ///
 /// Compile-time constant; not operator-tunable at runtime in v1.
+///
+/// **Reserved for v0.2+ per-process collision-detection
+/// tracker.** Not consumed by [`composite_audit`] in v0.1; the
+/// v0.1 `composite_op_id` collision bound is the 2⁻⁶⁴
+/// birthday-bound bet on 16 bytes from CSPRNG. The constant
+/// ships now so the v0.2 tracker's shape is reserved without a
+/// public-surface bump.
 pub const TRACKER_SHARDS: usize = 16;
 
 /// Default grace window for the composite-id tracker (§4.9).
+///
+/// **Reserved for v0.2+ per-process collision-detection
+/// tracker.** See [`TRACKER_SHARDS`] for the broader posture.
+/// Not consumed by [`composite_audit`] in v0.1.
 pub const TRACKER_GRACE_WINDOW_DEFAULT: Duration = Duration::from_millis(100);
 
 /// Hard cap on grace-window configuration (§4.9). Configurations
 /// exceeding this are rejected at config-load time.
+///
+/// **Reserved for v0.2+ per-process collision-detection
+/// tracker.** See [`TRACKER_SHARDS`] for the broader posture.
+/// Not consumed by [`composite_audit`] in v0.1.
 pub const TRACKER_GRACE_WINDOW_MAX: Duration = Duration::from_secs(1);
 
 /// Composite-audit scope tracked across a multi-sink operation
@@ -485,6 +500,51 @@ pub(in crate::audit::composite) fn emit_rollback_marker(
 ///     OpSpecific(String),
 /// }
 /// ```
+///
+/// # Emitting denial events
+///
+/// The op closure's `Err(e)` path **drops queued events without
+/// rollback** (scenario 2 above). This is correct behavior — an
+/// error before commit means no sink ever saw the events, so
+/// there is nothing to roll back. But it also means an op
+/// closure that returns `Err` to signal an application-level
+/// denial will **lose** any denial event it queued.
+///
+/// For business-level denials that must commit their audit
+/// emit, route the denial through the op's `Ok(R)` return
+/// channel using a sum type — not `Err`. The
+/// [`crate::authority`] bind pipeline uses this exact pattern:
+///
+/// ```text
+/// enum BindOutcome<P> {
+///     Success(P),
+///     Denied { stage, reason },
+/// }
+///
+/// let outcome: Result<BindOutcome<_>, MyError> = composite_audit(
+///     trace_id,
+///     sinks,
+///     async |scope| {
+///         if denial_predicate_fails {
+///             // Queue the denial event BEFORE returning Ok(Denied).
+///             // The Ok path commits queued events to sinks.
+///             scope.emit_user(denial_event);
+///             return Ok(BindOutcome::Denied { stage, reason });
+///         }
+///         // ... happy path ...
+///         scope.emit_user(success_event);
+///         Ok(BindOutcome::Success(bound_proof))
+///     },
+/// ).await;
+/// ```
+///
+/// Returning `Err(MyError::Denied)` from the op closure would
+/// drop the queued denial event — that path is reserved for
+/// infrastructure failures (the op cannot construct an audit
+/// event due to system state, etc.), not for application-level
+/// denials. Operators writing custom composite ops should keep
+/// this rule in mind: **`Err` drops events; commit-or-deny
+/// outcomes flow through `Ok`**.
 ///
 /// # Errors
 ///

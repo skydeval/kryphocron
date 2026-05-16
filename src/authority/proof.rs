@@ -156,10 +156,37 @@ enum BindFlow {
     },
 }
 
+// ============================================================
+// Pre-check timing-bypass invariant (§4.3 / §4.6).
+//
+// The three `precheck_*` functions below run on the fail-fast
+// fast path that precedes `composite_audit` and `equalize_timing`
+// in the bind pipeline. They MUST consult only data the caller
+// already supplied (the proof itself, the target argument, the
+// AuthContext's resolved requester, the clock). If a future
+// revision needs to consult secret state (resource-owner allow
+// lists, audience membership, encrypted-record subject DIDs,
+// any oracle whose freshness or shape depends on data the
+// caller did not supply), it MUST move into the post-
+// equalization portion of the pipeline — otherwise its
+// per-input latency variance leaks the secret through the
+// §4.6 timing channel.
+//
+// This is the same invariant the §4.3 stage-numbering
+// discipline encodes: stage 1 (requester authority) and
+// stage 4 (target match) consult caller-supplied evidence;
+// stage 2 (subject ownership), stage 3 (audience), stage 5
+// (oracle consultation) require equalization because they
+// touch substrate-side state.
+// ============================================================
+
 /// §4.3 precheck: the proof's `subject` must equal the bind-call
 /// `target`. Fail-fast precondition; runs before composite_audit
 /// and emits no audit (a target mismatch is a caller error, not a
 /// pipeline denial).
+///
+/// **Timing-bypass invariant:** see the module-level note above
+/// the precheck block — must not consult secret state.
 fn precheck_target_match<S: PartialEq>(
     proof_subject: &S,
     target: &S,
@@ -176,6 +203,9 @@ fn precheck_target_match<S: PartialEq>(
 /// never match a Did-bearing proof; both Did and Service requesters
 /// project to a [`Did`] for comparison
 /// ([`crate::identity::ServiceIdentity::service_did`]).
+///
+/// **Timing-bypass invariant:** see the module-level note above
+/// the precheck block — must not consult secret state.
 fn precheck_context_match(
     proof_requester: &Did,
     ctx: &AuthContext<'_>,
@@ -196,6 +226,9 @@ fn precheck_context_match(
 /// `max_age` since `issued_at`. Operators can shorten `max_age`
 /// below the capability's compile-time `MAX_AGE`; we take the
 /// caller's value verbatim.
+///
+/// **Timing-bypass invariant:** see the module-level note above
+/// the precheck block — must not consult secret state.
 fn precheck_expired(issued_at: Instant, max_age: Duration) -> Result<(), BindError> {
     if issued_at.elapsed() > max_age {
         Err(BindError::Expired)
