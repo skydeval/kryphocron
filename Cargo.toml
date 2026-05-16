@@ -176,9 +176,15 @@ rust_2024_compatibility = { level = "warn", priority = -1 }
 all = { level = "warn", priority = -1 }
 pedantic = { level = "allow", priority = -1 }
 
-# Allow phase-stub patterns explicitly.
-todo = "allow"
-unimplemented = "allow"
+# Phase-stub patterns are now disallowed: v0.1 ships whole, with
+# no remaining `todo!()` / `unimplemented!()` in production code.
+# Denying these lints makes a stray placeholder in a future patch
+# a hard build failure rather than a silent compile. Test-fixture
+# panics with explicit messages (e.g.
+# `panic!("test fixture: should be unreachable")`) remain
+# permitted — they describe a structural invariant, not a stub.
+todo = "deny"
+unimplemented = "deny"
 
 # §4-committed shapes carry large fields (ServiceIdentity holds key
 # material + rotation evidence; DenialReason and AuthDenial carry

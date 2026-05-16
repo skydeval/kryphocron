@@ -925,7 +925,10 @@ mod tests {
                 _deadline: Instant,
                 _trace_id: TraceId,
             ) -> Result<DidDocument, DidResolutionError> {
-                unimplemented!()
+                // Test fixture: the test only exercises
+                // `supported_methods` (trait default). If this
+                // body is reached, the test is wrong.
+                panic!("BareImpl::resolve should never be reached in this test")
             }
             async fn invalidate(&self, _did: &Did, _trace_id: TraceId) {}
         }
