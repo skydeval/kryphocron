@@ -133,26 +133,82 @@ impl<'a> AuthContext<'a> {
     ///
     /// Three legal transitions, expressed as the three [`Narrowing`]
     /// impl types: [`ToAnonymous`], [`NarrowCapabilities`], and
-    /// [`ServiceToService`]. `Did → Service` is runtime-rejected
-    /// per §4.2 (`UndeclaredServiceTrust` if attempted via
-    /// [`ServiceToService`] without a trust declaration).
+    /// [`ServiceToService`]. Sub-contexts inherit [`TraceId`] and
+    /// extend [`AttributionChain`].
     ///
-    /// Sub-contexts inherit [`TraceId`] and extend
-    /// [`AttributionChain`]. Failures audit.
+    /// **Phase 7d C2 status**: [`ToAnonymous`] and
+    /// [`NarrowCapabilities`] are wired. [`ServiceToService`] +
+    /// audit emit for all three narrowings land in C3.
     ///
-    /// **Phase 1 stub.** Phase 4 wires the chain-extension and
-    /// audit-emit logic.
+    /// The `+ 'static` bound on `N` enables internal dispatch via
+    /// [`std::any::Any`] downcast. v1's three [`Narrowing`] impls
+    /// (all owned data, no references) already satisfy this; the
+    /// bound is structurally non-breaking.
     ///
     /// # Errors
     ///
     /// See [`DeriveError`].
-    pub fn derive_for<N: Narrowing>(
+    pub fn derive_for<N: Narrowing + 'static>(
         &self,
-        _narrowing: N,
+        narrowing: N,
     ) -> Result<AuthContext<'_>, DeriveError> {
-        unimplemented!(
-            "§4.2 AuthContext::derive_for: Phase 4 wires chain-extension + audit emit"
-        );
+        let now = SystemTime::now();
+        let narrowing_any = &narrowing as &dyn std::any::Any;
+
+        // Dispatch on the narrowing variant. Narrowing is sealed
+        // (only the three crate-ship impls exist); the unreachable
+        // arm covers a future v0.X variant addition that forgets
+        // to extend this match.
+        let (new_requester, derivation_reason) =
+            if narrowing_any.is::<ToAnonymous>() {
+                (
+                    Requester::Anonymous,
+                    DerivationReason::DropPrivilegeToAnonymous,
+                )
+            } else if let Some(narrow) = narrowing_any.downcast_ref::<NarrowCapabilities>() {
+                // NarrowCapabilities records the dropped capabilities
+                // in the chain entry. **V0.1 gap**: AuthContext does
+                // not carry a `capabilities: CapabilitySet` field, so
+                // the "dropped is a subset of current" structural check
+                // is not enforceable at this layer. The narrowing
+                // succeeds and the chain entry preserves the forensic
+                // trail. v0.2 may add a capabilities field +
+                // structural superset check.
+                (
+                    self.requester.clone(),
+                    DerivationReason::NarrowCapabilities {
+                        dropped: narrow.drop.clone(),
+                    },
+                )
+            } else if narrowing_any.is::<ServiceToService>() {
+                // C3 wires this. C2 returns IllegalNarrowing as a
+                // placeholder so the dispatch shape is exhaustive.
+                return Err(DeriveError::IllegalNarrowing);
+            } else {
+                unreachable!(
+                    "Narrowing is sealed; only ToAnonymous / NarrowCapabilities / ServiceToService impl it"
+                )
+            };
+
+        // Extend the attribution chain with a hop recording the
+        // source requester + derivation reason + timestamp.
+        let mut new_chain = self.attribution_chain.clone();
+        new_chain.try_push(AttributionEntry {
+            requester: self.requester.clone(),
+            derivation_reason,
+            derived_at: now,
+            key_id_used: None,
+        })?;
+
+        // Build the narrowed sub-context. Inherits trace_id, audit
+        // sinks, oracle set verbatim — only requester + chain change.
+        Ok(AuthContext::new_internal(
+            new_requester,
+            self.trace_id,
+            self.audit,
+            self.oracles,
+            new_chain,
+        ))
     }
 }
 
@@ -693,5 +749,447 @@ mod tests {
             key_id_used: None,
         });
         assert!(matches!(r, Err(DeriveError::ChainTooDeep)));
+    }
+
+    // ====================================================
+    // Phase 7e C2-C3 — derive_for tests.
+    // ====================================================
+
+    mod derive_for_fixture {
+        use crate::audit::*;
+        use crate::authority::moderation::InspectionNotificationQueueImpl;
+        use crate::oracle::*;
+        use std::sync::Mutex;
+        use std::time::{Duration, SystemTime};
+
+        /// Capturing user sink for verifying DerivedContext audit
+        /// emits in C3.
+        pub(super) struct CapturingUserSink {
+            captured: Mutex<Vec<UserAuditEvent>>,
+        }
+        impl CapturingUserSink {
+            pub fn new() -> Self {
+                CapturingUserSink {
+                    captured: Mutex::new(Vec::new()),
+                }
+            }
+            #[allow(dead_code)] // C3 consumes this.
+            pub fn captured(&self) -> Vec<UserAuditEvent> {
+                self.captured.lock().unwrap().clone()
+            }
+        }
+        impl UserAuditSink for CapturingUserSink {
+            fn record(&self, event: UserAuditEvent) -> Result<(), AuditError> {
+                self.captured.lock().unwrap().push(event);
+                Ok(())
+            }
+        }
+
+        pub(super) struct NoSink;
+        impl ChannelAuditSink for NoSink {
+            fn record(&self, _: ChannelAuditEvent) -> Result<(), AuditError> {
+                Ok(())
+            }
+        }
+        impl SubstrateAuditSink for NoSink {
+            fn record(&self, _: SubstrateAuditEvent) -> Result<(), AuditError> {
+                Ok(())
+            }
+        }
+        impl ModerationAuditSink for NoSink {
+            fn record(&self, _: ModerationAuditEvent) -> Result<(), AuditError> {
+                Ok(())
+            }
+        }
+        impl FallbackAuditSink for NoSink {
+            fn record_panic(
+                &self,
+                _: SinkKind,
+                _: crate::identity::TraceId,
+                _: crate::authority::CapabilityKind,
+                _: SystemTime,
+            ) {
+            }
+            fn record_composite_failure(
+                &self,
+                _: crate::identity::TraceId,
+                _: CompositeOpId,
+                _: &[SinkKind],
+                _: &[SinkKind],
+                _: SystemTime,
+            ) {
+            }
+            fn record_event(&self, _: FallbackAuditEvent) {}
+        }
+        impl InspectionNotificationQueueImpl for NoSink {
+            fn enqueue(
+                &self,
+                _: &crate::proto::Did,
+                _: crate::authority::InspectionNotification,
+            ) {
+            }
+        }
+
+        /// User sink that always fails (for fire-and-forget tests
+        /// in C3).
+        #[allow(dead_code)] // C3 consumes this.
+        pub(super) struct FailingUserSink;
+        impl UserAuditSink for FailingUserSink {
+            fn record(&self, _: UserAuditEvent) -> Result<(), AuditError> {
+                Err(AuditError::Unavailable)
+            }
+        }
+
+        pub(super) struct NoOracle;
+        impl BlockOracle for NoOracle {
+            fn block_state(
+                &self,
+                _: &crate::proto::Did,
+                _: &crate::proto::Did,
+            ) -> BlockState {
+                BlockState::None
+            }
+            fn last_synced_at(&self) -> SystemTime {
+                SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(&self, _: BlockOracleQuery) -> Duration {
+                Duration::ZERO
+            }
+        }
+        impl AudienceOracle for NoOracle {
+            fn audience_state(
+                &self,
+                _: &crate::proto::Did,
+                _: &crate::authority::ResourceId,
+            ) -> AudienceState {
+                AudienceState::NoAudienceConfigured
+            }
+            fn last_synced_at(&self) -> SystemTime {
+                SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(&self, _: AudienceOracleQuery) -> Duration {
+                Duration::ZERO
+            }
+        }
+        impl MuteOracle for NoOracle {
+            fn mute_state(
+                &self,
+                _: &crate::proto::Did,
+                _: &crate::proto::Did,
+            ) -> MuteState {
+                MuteState::None
+            }
+            fn last_synced_at(&self) -> SystemTime {
+                SystemTime::UNIX_EPOCH
+            }
+            fn data_freshness_bound(&self) -> Duration {
+                Duration::from_secs(60)
+            }
+            fn worst_case_latency_for(&self, _: MuteOracleQuery) -> Duration {
+                Duration::ZERO
+            }
+        }
+    }
+
+    use derive_for_fixture::*;
+
+    fn sample_did() -> Did {
+        Did::new("did:plc:phase7e-derive").unwrap()
+    }
+
+    fn sample_service() -> crate::identity::ServiceIdentity {
+        crate::identity::ServiceIdentity::new_internal(
+            sample_did(),
+            crate::identity::KeyId::from_bytes([0u8; 32]),
+            crate::identity::PublicKey {
+                algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                bytes: [0u8; 32],
+            },
+            None,
+        )
+    }
+
+    fn build_ctx<'a>(
+        user_sink: &'a dyn UserAuditSink,
+        no_sink: &'a NoSink,
+        no_oracle: &'a NoOracle,
+        correlation_key: &'a crate::identity::CorrelationKey,
+        requester: Requester,
+    ) -> AuthContext<'a> {
+        AuthContext::new_internal(
+            requester,
+            crate::identity::TraceId::from_bytes([0xEE; 16]),
+            AuditSinks {
+                user: user_sink,
+                channel: no_sink,
+                substrate: no_sink,
+                moderation: no_sink,
+                fallback: no_sink,
+                inspection_queue: no_sink,
+                correlation_key,
+            },
+            OracleSet {
+                block: no_oracle,
+                audience: no_oracle,
+                mute: no_oracle,
+            },
+            AttributionChain::empty(),
+        )
+    }
+
+    /// §4.2 ToAnonymous from a Did context: new ctx is Anonymous,
+    /// chain extended by 1 with DropPrivilegeToAnonymous.
+    #[test]
+    fn derive_for_to_anonymous_from_did() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Did(sample_did()),
+        );
+
+        let derived = ctx.derive_for(ToAnonymous).expect("ToAnonymous should succeed");
+        assert!(matches!(derived.requester(), Requester::Anonymous));
+        assert_eq!(derived.attribution_chain().entries().len(), 1);
+        match &derived.attribution_chain().entries()[0].derivation_reason {
+            DerivationReason::DropPrivilegeToAnonymous => {}
+            other => panic!("expected DropPrivilegeToAnonymous, got {other:?}"),
+        }
+        // Audit emit lands in C3; C2 leaves the user sink empty.
+    }
+
+    /// §4.2 ToAnonymous from a Service context: new ctx is
+    /// Anonymous; chain records the source Service.
+    #[test]
+    fn derive_for_to_anonymous_from_service() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc = sample_service();
+        let ctx = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Service(svc.clone()),
+        );
+
+        let derived = ctx.derive_for(ToAnonymous).unwrap();
+        assert!(matches!(derived.requester(), Requester::Anonymous));
+        let entries = derived.attribution_chain().entries();
+        assert_eq!(entries.len(), 1);
+        // Source requester captured (Service)
+        assert!(matches!(&entries[0].requester, Requester::Service(_)));
+    }
+
+    /// §4.2 ToAnonymous from already-Anonymous: idempotent
+    /// happy-path. Chain still grows by 1 (the derivation hop is
+    /// recorded regardless of whether requester actually changed).
+    #[test]
+    fn derive_for_to_anonymous_from_anonymous() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx = build_ctx(&user, &no_sink, &no_oracle, &ck, Requester::Anonymous);
+
+        let derived = ctx.derive_for(ToAnonymous).unwrap();
+        assert!(matches!(derived.requester(), Requester::Anonymous));
+        assert_eq!(derived.attribution_chain().entries().len(), 1);
+    }
+
+    /// §4.2 NarrowCapabilities from a Did context: requester
+    /// unchanged, chain records the dropped capabilities.
+    #[test]
+    fn derive_for_narrow_capabilities() {
+        use crate::authority::capability::{CapabilityKind, CapabilitySet};
+
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let did = sample_did();
+        let ctx = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Did(did.clone()),
+        );
+
+        let dropped = CapabilitySet::from_kinds([CapabilityKind::EditPrivatePost]);
+        let derived = ctx
+            .derive_for(NarrowCapabilities {
+                drop: dropped.clone(),
+            })
+            .unwrap();
+
+        // Requester unchanged
+        match derived.requester() {
+            Requester::Did(d) => assert_eq!(d, &did),
+            other => panic!("expected Did(unchanged), got {other:?}"),
+        }
+        // Chain records the dropped capabilities
+        let entries = derived.attribution_chain().entries();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].derivation_reason {
+            DerivationReason::NarrowCapabilities { dropped: d } => {
+                assert_eq!(d, &dropped);
+            }
+            other => panic!("expected NarrowCapabilities, got {other:?}"),
+        }
+    }
+
+    /// §4.2 attribution chain monotonicity: derive_for preserves
+    /// existing entries and appends a new one. No mutation of
+    /// previous entries.
+    #[test]
+    fn derive_for_preserves_attribution_chain() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let ctx_a = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Did(sample_did()),
+        );
+        let ctx_b = ctx_a.derive_for(ToAnonymous).unwrap();
+        // Now ctx_b has a chain of 1. Derive again from ctx_b.
+        let ctx_c = ctx_b.derive_for(ToAnonymous).unwrap();
+        let entries = ctx_c.attribution_chain().entries();
+        assert_eq!(entries.len(), 2, "chain extends, doesn't replace");
+        assert!(matches!(
+            entries[0].derivation_reason,
+            DerivationReason::DropPrivilegeToAnonymous
+        ));
+        assert!(matches!(
+            entries[1].derivation_reason,
+            DerivationReason::DropPrivilegeToAnonymous
+        ));
+        // ctx_b's source requester was Did
+        assert!(matches!(entries[0].requester, Requester::Did(_)));
+        // ctx_c's source requester was Anonymous (after ctx_b's
+        // ToAnonymous derivation)
+        assert!(matches!(entries[1].requester, Requester::Anonymous));
+    }
+
+    /// §4.2 ChainTooDeep: filling the chain to MAX_CHAIN_DEPTH
+    /// then attempting another derivation returns ChainTooDeep
+    /// from try_push (propagated via `?`).
+    #[test]
+    fn derive_for_returns_chain_too_deep_at_max() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+
+        // Build a context whose chain is already at MAX_CHAIN_DEPTH.
+        let mut chain = AttributionChain::empty();
+        for _ in 0..MAX_CHAIN_DEPTH {
+            chain
+                .try_push(AttributionEntry {
+                    requester: Requester::Anonymous,
+                    derivation_reason: DerivationReason::DropPrivilegeToAnonymous,
+                    derived_at: SystemTime::UNIX_EPOCH,
+                    key_id_used: None,
+                })
+                .unwrap();
+        }
+        let ctx = AuthContext::new_internal(
+            Requester::Did(sample_did()),
+            crate::identity::TraceId::from_bytes([0u8; 16]),
+            AuditSinks {
+                user: &user,
+                channel: &no_sink,
+                substrate: &no_sink,
+                moderation: &no_sink,
+                fallback: &no_sink,
+                inspection_queue: &no_sink,
+                correlation_key: &ck,
+            },
+            OracleSet {
+                block: &no_oracle,
+                audience: &no_oracle,
+                mute: &no_oracle,
+            },
+            chain,
+        );
+
+        let r = ctx.derive_for(ToAnonymous);
+        assert!(matches!(r, Err(DeriveError::ChainTooDeep)));
+    }
+
+    /// Phase 7e C2 placeholder: ServiceToService returns
+    /// IllegalNarrowing pending C3 wiring. Pin the placeholder
+    /// behavior so C3's update is detectable.
+    #[test]
+    fn derive_for_service_to_service_returns_illegal_narrowing_in_c2() {
+        let user = CapturingUserSink::new();
+        let no_sink = NoSink;
+        let no_oracle = NoOracle;
+        let ck = crate::identity::CorrelationKey::from_bytes([0u8; 32]);
+        let svc = sample_service();
+        let ctx = build_ctx(
+            &user,
+            &no_sink,
+            &no_oracle,
+            &ck,
+            Requester::Service(svc.clone()),
+        );
+
+        // Construct a placeholder ServiceTrustDeclaration. Using
+        // direct field construction (crate-internal access) since
+        // verify_trust_declaration requires a real signature path
+        // that's out of scope here.
+        let sts = ServiceToService {
+            target: svc.clone(),
+            trust_declaration: ServiceTrustDeclaration {
+                declaration_id: TrustDeclarationId::from_bytes([0u8; 16]),
+                from_service: svc.clone(),
+                to_service: svc.clone(),
+                capabilities: crate::authority::capability::CapabilitySet::empty(),
+                resource_scope: crate::wire::ResourceScope::Resource(
+                    crate::authority::ResourceId::new(
+                        sample_did(),
+                        crate::Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+                        crate::proto::Rkey::new("3jzfcijpj2z2a").unwrap(),
+                    ),
+                ),
+                issued_at: SystemTime::UNIX_EPOCH,
+                expires_at: SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(86400 * 365),
+                trust_root: crate::trust::TrustRootIdentity {
+                    root_key_id: crate::identity::KeyId::from_bytes([0u8; 32]),
+                    root_key: crate::identity::PublicKey {
+                        algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                        bytes: [0u8; 32],
+                    },
+                },
+                signature: crate::trust::TrustRootSignature {
+                    algorithm: crate::identity::SignatureAlgorithm::Ed25519,
+                    bytes: [0u8; 64],
+                },
+                _private: PhantomData,
+            },
+        };
+        assert!(matches!(
+            ctx.derive_for(sts),
+            Err(DeriveError::IllegalNarrowing)
+        ));
     }
 }
