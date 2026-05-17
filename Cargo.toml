@@ -9,6 +9,7 @@ keywords = ["atproto", "substrate", "privacy", "bluesky", "federation"]
 categories = ["authentication", "cryptography", "data-structures"]
 authors = ["skydeval <skydeval@mail.nearhorizon.app>"]
 repository = "https://github.com/skydeval/kryphocron"
+homepage = "https://github.com/skydeval/kryphocron"
 readme = "README.md"
 
 # License: MPL-2.0 (file-level copyleft) per §9.8. Per-file
