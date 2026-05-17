@@ -876,6 +876,7 @@ mod tests {
             scope_repr: sample_target_repr(),
             capability: crate::authority::capability::CapabilityKind::ScanShard,
             outcome: BindOutcomeRepr::Success,
+            payload_completeness: crate::audit::PayloadCompleteness::PartialV01,
             at: std::time::SystemTime::UNIX_EPOCH,
         }
     }
@@ -889,6 +890,7 @@ mod tests {
             rationale: ModeratorRationale::Declared(
                 BoundedString::<MAX_RATIONALE_LEN>::new("test").unwrap(),
             ),
+            payload_completeness: crate::audit::PayloadCompleteness::PartialV01,
             at: std::time::SystemTime::UNIX_EPOCH,
         }
     }

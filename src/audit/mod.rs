@@ -111,8 +111,8 @@ pub use self::events::{
     BatchRejectionReason, ChannelAuditEvent, ChannelCloseCause, DeprecationEventDetail,
     DerivationOutcome, FallbackAuditEvent, FallbackTrustPolicy, InvalidationSource,
     ModerationAuditEvent, ModeratorRationale, NarrowingKind, OracleFreshnessState,
-    PeerOperation, PeerTrustConstraints, PeerTrustDecision, RateLimitBucket,
-    SubstrateAuditEvent, SyncPerspective, UserAuditEvent, MAX_RATIONALE_LEN,
+    PayloadCompleteness, PeerOperation, PeerTrustConstraints, PeerTrustDecision,
+    RateLimitBucket, SubstrateAuditEvent, SyncPerspective, UserAuditEvent, MAX_RATIONALE_LEN,
 };
 pub use self::rate_limit::{IssuanceRateLimiter, TokenBucket};
 pub use self::sinks::{

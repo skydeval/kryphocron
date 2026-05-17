@@ -773,6 +773,7 @@ impl<E: Endpoint> ChannelProof<E> {
                     session_digest,
                     endpoint: E::KIND,
                     outcome: crate::authority::BindOutcomeRepr::Success,
+                    payload_completeness: crate::audit::PayloadCompleteness::PartialV01,
                     at: now,
                 };
                 scope.emit_channel(event);
@@ -862,6 +863,7 @@ impl<'p, E: Endpoint> BoundChannelProof<'p, E> {
                     session_digest,
                     endpoint: E::KIND,
                     reason: BindFailureReason::Expired,
+                    payload_completeness: crate::audit::PayloadCompleteness::PartialV01,
                     at: now,
                 };
                 scope.emit_channel(event);
@@ -1006,6 +1008,7 @@ impl<S: SubstrateScope> SubstrateProof<S> {
                     scope_repr,
                     capability: S::KIND,
                     outcome: crate::authority::BindOutcomeRepr::Success,
+                    payload_completeness: crate::audit::PayloadCompleteness::PartialV01,
                     at: now,
                 };
                 scope.emit_substrate(event);
@@ -1096,6 +1099,7 @@ impl<'p, S: SubstrateScope> BoundSubstrateProof<'p, S> {
                         issued_at: self.proof.issued_at,
                         max_age: S::MAX_AGE,
                     },
+                    payload_completeness: crate::audit::PayloadCompleteness::PartialV01,
                     at: now,
                 };
                 scope.emit_substrate(event);
@@ -1287,6 +1291,8 @@ impl<C: ModerationCapability> ModerationProof<C> {
                             case,
                             target_repr: target_repr.clone(),
                             rationale: rationale_for_audit,
+                            payload_completeness:
+                                crate::audit::PayloadCompleteness::PartialV01,
                             at: now,
                         }
                     }
@@ -1298,6 +1304,8 @@ impl<C: ModerationCapability> ModerationProof<C> {
                             target_repr: target_repr.clone(),
                             outcome: crate::authority::BindOutcomeRepr::Success,
                             rationale: rationale_for_audit,
+                            payload_completeness:
+                                crate::audit::PayloadCompleteness::PartialV01,
                             at: now,
                         }
                     }
@@ -1309,6 +1317,8 @@ impl<C: ModerationCapability> ModerationProof<C> {
                             target_repr: target_repr.clone(),
                             outcome: crate::authority::BindOutcomeRepr::Success,
                             rationale: rationale_for_audit,
+                            payload_completeness:
+                                crate::audit::PayloadCompleteness::PartialV01,
                             at: now,
                         }
                     }

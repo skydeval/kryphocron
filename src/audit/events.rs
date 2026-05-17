@@ -26,6 +26,58 @@ use super::bounded_string::BoundedString;
 use super::composite::CompositeOpId;
 use super::sinks::SinkKind;
 
+/// Discriminator for audit-event payload completeness in v0.1.
+///
+/// A handful of v0.1 audit-event variants ship payload fields
+/// populated with placeholder data pending the v0.2 sealed
+/// per-class extraction traits:
+///
+/// - [`ChannelAuditEvent::ChannelBound`] and
+///   [`ChannelAuditEvent::ChannelReborrowFailed`]'s `peer` /
+///   `session_digest` fields are extracted in v0.1 from the
+///   AuthContext rather than from the typed channel subject (the
+///   v0.2 `HasChannelPeer` / `HasSessionId` traits will lift the
+///   real values).
+/// - [`SubstrateAuditEvent::ScopeBound`]'s `scope_repr` field
+///   ships a `ScopeKind::Shard` default in v0.1 regardless of the
+///   actual scope variant (the v0.2 `HasScopeKind` trait will
+///   discriminate).
+/// - [`ModerationAuditEvent::ModeratorInspected`],
+///   [`ModerationAuditEvent::ModeratorTookDown`], and
+///   [`ModerationAuditEvent::ModeratorRestored`]'s `case` field
+///   ships a zeroed [`crate::authority::ModerationCaseId`] in v0.1
+///   (the v0.2 `HasModerationCase` trait will lift the real case
+///   id from the moderation subject).
+///
+/// The discriminator is a programmatic signal operators can
+/// branch on when consuming audit streams. An operator building
+/// a dashboard around `peer` in v0.1 would silently get garbage;
+/// observing `payload_completeness == PartialV01` lets them gate
+/// dashboard panels until v0.2 lands and the fields flip to
+/// `Full`.
+///
+/// **v0.2 migration path.** v0.2 ships the sealed per-class
+/// extraction traits. The affected audit-event construction
+/// sites populate the previously-placeholder fields with real
+/// values and flip `payload_completeness` to
+/// [`PayloadCompleteness::Full`]. Consumers branching on
+/// `PartialV01` in v0.1 observe the flip and know their
+/// dashboards now have real data — no silent semantic change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "audit-serde-json", derive(serde::Serialize, serde::Deserialize))]
+pub enum PayloadCompleteness {
+    /// All payload fields populated with real values extracted
+    /// from the typed subject. v0.2+ behavior.
+    Full,
+    /// One or more payload fields ship with placeholder data in
+    /// v0.1. See the rustdoc on the specific audit-event variant
+    /// for which fields are placeholders. v0.2 lands the sealed
+    /// per-class extraction traits that populate these fields
+    /// with real values and flip this discriminator to `Full`.
+    PartialV01,
+}
+
 /// User-class audit events (§6.2).
 ///
 /// Emitted to the [`crate::audit::UserAuditSink`]. One event per
@@ -146,13 +198,27 @@ pub enum ChannelAuditEvent {
         /// Forensic trace id (§6.1).
         trace_id: TraceId,
         /// Peer service identity.
+        ///
+        /// **v0.1 placeholder.** Populated from the bind-time
+        /// AuthContext rather than the typed channel subject's
+        /// peer. v0.2 lifts the real value via the
+        /// `HasChannelPeer` sealed extraction trait. Check
+        /// `payload_completeness` to detect v0.1 placeholder
+        /// values.
         peer: ServiceIdentity,
         /// Keyed-Blake3 session digest (§4.4).
+        ///
+        /// **v0.1 placeholder.** Computed from a zeroed session id
+        /// in v0.1; the real value lands when v0.2's
+        /// `HasSessionId` extraction trait ships.
         session_digest: SessionDigest,
         /// Channel-class endpoint capability.
         endpoint: CapabilityKind,
         /// Outcome of the bind (§4.3 [`BindOutcomeRepr`]).
         outcome: BindOutcomeRepr,
+        /// Discriminator for v0.1 placeholder fields. See
+        /// [`PayloadCompleteness`].
+        payload_completeness: PayloadCompleteness,
         /// Emission wallclock (§6.1).
         at: SystemTime,
     },
@@ -177,13 +243,22 @@ pub enum ChannelAuditEvent {
         /// Forensic trace id (§6.1).
         trace_id: TraceId,
         /// Peer service identity.
+        ///
+        /// **v0.1 placeholder.** Same disclosure as
+        /// [`ChannelAuditEvent::ChannelBound::peer`].
         peer: ServiceIdentity,
         /// Keyed-Blake3 session digest.
+        ///
+        /// **v0.1 placeholder.** Same disclosure as
+        /// [`ChannelAuditEvent::ChannelBound::session_digest`].
         session_digest: SessionDigest,
         /// Channel-class endpoint capability.
         endpoint: CapabilityKind,
         /// Reborrow-specific failure reason.
         reason: BindFailureReason,
+        /// Discriminator for v0.1 placeholder fields. See
+        /// [`PayloadCompleteness`].
+        payload_completeness: PayloadCompleteness,
         /// Emission wallclock (§6.1).
         at: SystemTime,
     },
@@ -356,11 +431,20 @@ pub enum SubstrateAuditEvent {
         service: ServiceIdentity,
         /// Subject representation for the scope (§4.4
         /// [`crate::ScopeKind`] backs the structural layer).
+        ///
+        /// **v0.1 placeholder.** Populated with a `ScopeKind::Shard`
+        /// default in v0.1 regardless of the actual scope variant.
+        /// v0.2 lifts the real value via the `HasScopeKind` sealed
+        /// extraction trait. Check `payload_completeness` to detect
+        /// v0.1 placeholder values.
         scope_repr: TargetRepresentation,
         /// Substrate-class capability that was bound.
         capability: CapabilityKind,
         /// Outcome of the bind (§4.3 [`BindOutcomeRepr`]).
         outcome: BindOutcomeRepr,
+        /// Discriminator for v0.1 placeholder fields. See
+        /// [`PayloadCompleteness`].
+        payload_completeness: PayloadCompleteness,
         /// Emission wallclock (§6.1).
         at: SystemTime,
     },
@@ -729,12 +813,21 @@ pub enum ModerationAuditEvent {
         /// Moderator DID.
         moderator: Did,
         /// Moderation case identifier.
+        ///
+        /// **v0.1 placeholder.** Ships as a zeroed
+        /// [`ModerationCaseId`] in v0.1; v0.2 lifts the real
+        /// value via the `HasModerationCase` sealed extraction
+        /// trait. Check `payload_completeness` to detect v0.1
+        /// placeholder values.
         case: ModerationCaseId,
         /// Subject representation (§4.4).
         target_repr: TargetRepresentation,
         /// Moderator-declared rationale (length-bounded per
         /// round-1 patch F2).
         rationale: ModeratorRationale,
+        /// Discriminator for v0.1 placeholder fields. See
+        /// [`PayloadCompleteness`].
+        payload_completeness: PayloadCompleteness,
         /// Emission wallclock (§6.1).
         at: SystemTime,
     },
@@ -745,6 +838,9 @@ pub enum ModerationAuditEvent {
         /// Moderator DID.
         moderator: Did,
         /// Moderation case identifier.
+        ///
+        /// **v0.1 placeholder.** Same disclosure as
+        /// [`ModerationAuditEvent::ModeratorInspected::case`].
         case: ModerationCaseId,
         /// Subject representation (§4.4).
         target_repr: TargetRepresentation,
@@ -752,6 +848,9 @@ pub enum ModerationAuditEvent {
         outcome: BindOutcomeRepr,
         /// Moderator-declared rationale.
         rationale: ModeratorRationale,
+        /// Discriminator for v0.1 placeholder fields. See
+        /// [`PayloadCompleteness`].
+        payload_completeness: PayloadCompleteness,
         /// Emission wallclock (§6.1).
         at: SystemTime,
     },
@@ -764,6 +863,9 @@ pub enum ModerationAuditEvent {
         /// Moderator DID.
         moderator: Did,
         /// Moderation case identifier.
+        ///
+        /// **v0.1 placeholder.** Same disclosure as
+        /// [`ModerationAuditEvent::ModeratorInspected::case`].
         case: ModerationCaseId,
         /// Subject representation (§4.4).
         target_repr: TargetRepresentation,
@@ -771,6 +873,9 @@ pub enum ModerationAuditEvent {
         outcome: BindOutcomeRepr,
         /// Moderator-declared rationale.
         rationale: ModeratorRationale,
+        /// Discriminator for v0.1 placeholder fields. See
+        /// [`PayloadCompleteness`].
+        payload_completeness: PayloadCompleteness,
         /// Emission wallclock (§6.1).
         at: SystemTime,
     },
@@ -1109,6 +1214,7 @@ mod tests {
             session_digest: digest,
             endpoint,
             outcome: BindOutcomeRepr::Success,
+            payload_completeness: PayloadCompleteness::PartialV01,
             at,
         };
         let denied = ChannelAuditEvent::ChannelIssuanceDenied {
@@ -1124,6 +1230,7 @@ mod tests {
             session_digest: digest,
             endpoint,
             reason: BindFailureReason::AuditUnavailable,
+            payload_completeness: PayloadCompleteness::PartialV01,
             at,
         };
         let batch = ChannelAuditEvent::SyncBatchRejected {
@@ -1246,6 +1353,7 @@ mod tests {
             scope_repr: target.clone(),
             capability: cap,
             outcome: BindOutcomeRepr::Success,
+            payload_completeness: PayloadCompleteness::PartialV01,
             at,
         };
         let denied = SubstrateAuditEvent::ScopeIssuanceDenied {
@@ -1494,6 +1602,7 @@ mod tests {
             case,
             target_repr: target.clone(),
             rationale: rationale.clone(),
+            payload_completeness: PayloadCompleteness::PartialV01,
             at,
         };
         let took_down = ModerationAuditEvent::ModeratorTookDown {
@@ -1503,6 +1612,7 @@ mod tests {
             target_repr: target.clone(),
             outcome: BindOutcomeRepr::Success,
             rationale: rationale.clone(),
+            payload_completeness: PayloadCompleteness::PartialV01,
             at,
         };
         let restored = ModerationAuditEvent::ModeratorRestored {
@@ -1512,6 +1622,7 @@ mod tests {
             target_repr: target,
             outcome: BindOutcomeRepr::Success,
             rationale,
+            payload_completeness: PayloadCompleteness::PartialV01,
             at,
         };
         let denied = ModerationAuditEvent::ModerationIssuanceDenied {
@@ -1624,5 +1735,163 @@ mod tests {
         // Inline-cap = 4: a four-element SmallVec lives on the
         // stack rather than the heap.
         assert!(!four.spilled());
+    }
+
+    // ============================================================
+    // PayloadCompleteness discriminator
+    // ============================================================
+
+    /// v0.1: the two committed `PayloadCompleteness` variants are
+    /// `Full` and `PartialV01`. The enum is `#[non_exhaustive]`
+    /// so v0.2+ may add finer discrimination (e.g.,
+    /// per-class-partial) without breaking consumers that only
+    /// branch on `PartialV01`.
+    #[test]
+    fn payload_completeness_v1_variant_set_pinned() {
+        let _full = PayloadCompleteness::Full;
+        let _partial = PayloadCompleteness::PartialV01;
+        assert_ne!(PayloadCompleteness::Full, PayloadCompleteness::PartialV01);
+    }
+
+    /// Every v0.1 audit-event variant that ships placeholder
+    /// payload data sets `payload_completeness: PartialV01` at
+    /// construction. v0.2 flips the value to `Full` when the
+    /// sealed extraction traits land; that flip is the
+    /// programmatic signal consumers gate on.
+    #[test]
+    fn channel_bound_construction_sets_partial_v01() {
+        let event = ChannelAuditEvent::ChannelBound {
+            trace_id: sample_trace_id(),
+            peer: sample_service_identity(),
+            session_digest: sample_session_digest(),
+            endpoint: CapabilityKind::EmitToSyncChannel,
+            outcome: BindOutcomeRepr::Success,
+            payload_completeness: PayloadCompleteness::PartialV01,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        match event {
+            ChannelAuditEvent::ChannelBound { payload_completeness, .. } => {
+                assert_eq!(payload_completeness, PayloadCompleteness::PartialV01);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn channel_reborrow_failed_construction_sets_partial_v01() {
+        let event = ChannelAuditEvent::ChannelReborrowFailed {
+            trace_id: sample_trace_id(),
+            peer: sample_service_identity(),
+            session_digest: sample_session_digest(),
+            endpoint: CapabilityKind::EmitToSyncChannel,
+            reason: BindFailureReason::Expired,
+            payload_completeness: PayloadCompleteness::PartialV01,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        match event {
+            ChannelAuditEvent::ChannelReborrowFailed { payload_completeness, .. } => {
+                assert_eq!(payload_completeness, PayloadCompleteness::PartialV01);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn scope_bound_construction_sets_partial_v01() {
+        let event = SubstrateAuditEvent::ScopeBound {
+            trace_id: sample_trace_id(),
+            service: sample_service_identity(),
+            scope_repr: sample_target_repr(),
+            capability: CapabilityKind::ScanShard,
+            outcome: BindOutcomeRepr::Success,
+            payload_completeness: PayloadCompleteness::PartialV01,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        match event {
+            SubstrateAuditEvent::ScopeBound { payload_completeness, .. } => {
+                assert_eq!(payload_completeness, PayloadCompleteness::PartialV01);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn moderator_inspected_construction_sets_partial_v01() {
+        let event = ModerationAuditEvent::ModeratorInspected {
+            trace_id: sample_trace_id(),
+            moderator: sample_did(),
+            case: sample_case(),
+            target_repr: sample_target_repr(),
+            rationale: sample_rationale(),
+            payload_completeness: PayloadCompleteness::PartialV01,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        match event {
+            ModerationAuditEvent::ModeratorInspected { payload_completeness, .. } => {
+                assert_eq!(payload_completeness, PayloadCompleteness::PartialV01);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn moderator_took_down_construction_sets_partial_v01() {
+        let event = ModerationAuditEvent::ModeratorTookDown {
+            trace_id: sample_trace_id(),
+            moderator: sample_did(),
+            case: sample_case(),
+            target_repr: sample_target_repr(),
+            outcome: BindOutcomeRepr::Success,
+            rationale: sample_rationale(),
+            payload_completeness: PayloadCompleteness::PartialV01,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        match event {
+            ModerationAuditEvent::ModeratorTookDown { payload_completeness, .. } => {
+                assert_eq!(payload_completeness, PayloadCompleteness::PartialV01);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn moderator_restored_construction_sets_partial_v01() {
+        let event = ModerationAuditEvent::ModeratorRestored {
+            trace_id: sample_trace_id(),
+            moderator: sample_did(),
+            case: sample_case(),
+            target_repr: sample_target_repr(),
+            outcome: BindOutcomeRepr::Success,
+            rationale: sample_rationale(),
+            payload_completeness: PayloadCompleteness::PartialV01,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        match event {
+            ModerationAuditEvent::ModeratorRestored { payload_completeness, .. } => {
+                assert_eq!(payload_completeness, PayloadCompleteness::PartialV01);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// `audit-serde-json` round-trip preserves the discriminator.
+    /// Operators consuming the JSON audit stream parse out the
+    /// `payload_completeness` field to gate v0.1-placeholder
+    /// dashboards. The field's serialized representation is the
+    /// variant name as a string per serde's default enum encoding.
+    #[cfg(feature = "audit-serde-json")]
+    #[test]
+    fn payload_completeness_serde_json_round_trip() {
+        let partial = PayloadCompleteness::PartialV01;
+        let s = serde_json::to_string(&partial).expect("serialize");
+        assert_eq!(s, "\"PartialV01\"");
+        let back: PayloadCompleteness = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, PayloadCompleteness::PartialV01);
+
+        let full = PayloadCompleteness::Full;
+        let s = serde_json::to_string(&full).expect("serialize");
+        assert_eq!(s, "\"Full\"");
+        let back: PayloadCompleteness = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, PayloadCompleteness::Full);
     }
 }
