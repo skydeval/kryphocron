@@ -109,6 +109,23 @@ pub struct PublicKey {
     pub bytes: [u8; 32],
 }
 
+impl PublicKey {
+    /// Construct a [`PublicKey`] from an algorithm tag and raw
+    /// key bytes.
+    ///
+    /// Operators implementing a [`crate::resolver::DidResolver`]
+    /// build [`PublicKey`] values from upstream key material. The
+    /// struct is [`#[non_exhaustive]`] so v0.2+ may add fields
+    /// (e.g., curve parameters) when additional
+    /// [`SignatureAlgorithm`] variants ship; consumers using this
+    /// constructor will see additive changes as additive
+    /// arguments.
+    #[must_use]
+    pub const fn new(algorithm: SignatureAlgorithm, bytes: [u8; 32]) -> Self {
+        PublicKey { algorithm, bytes }
+    }
+}
+
 /// Supported signature algorithms.
 ///
 /// Per §7.2 the v1 default JWT allowlist is `Ed25519` only.
@@ -177,6 +194,29 @@ impl ServiceIdentity {
             rotation_evidence,
             _private: core::marker::PhantomData,
         }
+    }
+
+    /// Test-support constructor. Available only with the
+    /// `test-support` feature enabled.
+    ///
+    /// Builds a [`ServiceIdentity`] from raw components, bypassing
+    /// the verification path. Reserved for out-of-crate
+    /// integration tests that need to construct a
+    /// [`crate::Requester::Service`] without standing up the full
+    /// capability-claim verification surface.
+    ///
+    /// See [`crate::AuthContext::new_for_test`] for the matching
+    /// caveat: do not enable the `test-support` feature in
+    /// non-test builds.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn new_for_test(
+        service_did: Did,
+        key_id: KeyId,
+        key_material: PublicKey,
+        rotation_evidence: Option<RotationChain>,
+    ) -> Self {
+        Self::new_internal(service_did, key_id, key_material, rotation_evidence)
     }
 
     /// Borrow the service DID.

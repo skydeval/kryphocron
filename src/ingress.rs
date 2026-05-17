@@ -107,6 +107,44 @@ impl<'a> AuthContext<'a> {
         }
     }
 
+    /// Test-support constructor. Available only with the
+    /// `test-support` feature enabled.
+    ///
+    /// Builds an [`AuthContext`] from raw components, bypassing
+    /// the verified-evidence discipline. Reserved for the crate's
+    /// own out-of-crate integration tests and for downstream
+    /// consumers (operator substrates wiring kryphocron into their
+    /// dispatcher) that need a context value to drive issuance →
+    /// bind → audit pipelines without standing up the full
+    /// verification path.
+    ///
+    /// **Do not enable `test-support` in non-test builds.** The
+    /// feature is `default = []` and the constructor is the
+    /// only escape hatch around the
+    /// "[`AuthContext`] is constructible only from verified
+    /// evidence" property. A production binary that linked this
+    /// path would degrade that invariant to a documentation
+    /// commitment.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn new_for_test(
+        requester: Requester,
+        trace_id: TraceId,
+        audit: AuditSinks<'a>,
+        oracles: OracleSet<'a>,
+        attribution_chain: AttributionChain,
+        capabilities: CapabilitySet,
+    ) -> Self {
+        Self::new_internal(
+            requester,
+            trace_id,
+            audit,
+            oracles,
+            attribution_chain,
+            capabilities,
+        )
+    }
+
     /// Borrow the capability set the context is authorized to
     /// carry (§4.2 / §4.8).
     ///
@@ -462,6 +500,41 @@ pub struct AuditSinks<'a> {
     pub correlation_key: &'a CorrelationKey,
 }
 
+impl<'a> AuditSinks<'a> {
+    /// Construct an [`AuditSinks`] bundle from operator-supplied
+    /// sink references.
+    ///
+    /// Operators wiring kryphocron into their substrate construct
+    /// this once at process startup and pass it into the
+    /// [`crate::ingress`] entry-point functions on every request.
+    /// The struct is [`#[non_exhaustive]`] so v0.2+ may add
+    /// fields; consumers building [`AuditSinks`] via this
+    /// constructor will not see additive changes as breaking
+    /// (the constructor's argument list will grow; existing
+    /// argument positions are stable).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        user: &'a dyn UserAuditSink,
+        channel: &'a dyn ChannelAuditSink,
+        substrate: &'a dyn SubstrateAuditSink,
+        moderation: &'a dyn ModerationAuditSink,
+        fallback: &'a dyn FallbackAuditSink,
+        inspection_queue: &'a dyn InspectionNotificationQueueImpl,
+        correlation_key: &'a CorrelationKey,
+    ) -> Self {
+        AuditSinks {
+            user,
+            channel,
+            substrate,
+            moderation,
+            fallback,
+            inspection_queue,
+            correlation_key,
+        }
+    }
+}
+
 /// Oracle set installed at the substrate process boundary
 /// (§4.2).
 #[derive(Copy, Clone)]
@@ -473,6 +546,24 @@ pub struct OracleSet<'a> {
     pub audience: &'a dyn AudienceOracle,
     /// Mute-state oracle.
     pub mute: &'a dyn MuteOracle,
+}
+
+impl<'a> OracleSet<'a> {
+    /// Construct an [`OracleSet`] bundle from operator-supplied
+    /// oracle references.
+    ///
+    /// Same shape and discipline as [`AuditSinks::new`]: operators
+    /// build this once at startup. The struct is
+    /// [`#[non_exhaustive]`] so v0.2+ may add oracle kinds without
+    /// breaking the constructor surface.
+    #[must_use]
+    pub fn new(
+        block: &'a dyn BlockOracle,
+        audience: &'a dyn AudienceOracle,
+        mute: &'a dyn MuteOracle,
+    ) -> Self {
+        OracleSet { block, audience, mute }
+    }
 }
 
 // ============================================================

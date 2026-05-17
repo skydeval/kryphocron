@@ -136,6 +136,17 @@ tokio = { version = "1", features = ["macros", "rt"] }
 [features]
 default = []
 
+# Integration-test scaffolding. Exposes a minimal set of
+# constructors (`AuthContext::new_for_test`,
+# `ServiceIdentity::new_for_test`) so out-of-crate tests can
+# drive issuance → bind → audit pipelines end-to-end without
+# standing up a full verified-evidence path. Off by default.
+# Downstream crates testing integrations against kryphocron
+# (e.g., the Aurora-Locus federation surface) opt in via
+# `kryphocron = { version = "0.1", features = ["test-support"] }`
+# in their `[dev-dependencies]`.
+test-support = []
+
 # §9.4 / §6.10 `audit-serde-json` feature for operators
 # consuming JSON audit streams. v0.1 ships the audit-event
 # variant set without the transitive `Serialize` / `Deserialize`
