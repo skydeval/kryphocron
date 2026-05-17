@@ -8,6 +8,17 @@ structurally rather than as policy.
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-brightgreen.svg)](https://www.mozilla.org/MPL/2.0/)
 [![Crates.io](https://img.shields.io/crates/v/kryphocron)](https://crates.io/crates/kryphocron)
 
+> **Early access — v0.1.x is the published surface of an
+> in-progress substrate.** The wire-format and audit-event
+> vocabularies are committed (no breaking changes within 0.1.x);
+> the consumer-facing API surface (trait shapes, constructor
+> signatures, accessor ergonomics) may evolve through the 0.x
+> cycle as downstream integrations surface concrete needs. v0.2
+> lands sealed per-class extraction traits that flip a few
+> placeholder audit-payload fields to real values (see
+> [Known limitations in v0.1](#known-limitations-in-v01)).
+> Pin tilde (`~0.1`) or full minor (`0.1`) per your tolerance.
+
 ## What it is
 
 `kryphocron` is the foundational primitives crate for the
@@ -152,7 +163,26 @@ Five organizing principles:
 
 ## Status
 
-**v0.1.0** ships the kryphocron substrate's authority discipline
+**v0.1.0** publishes the kryphocron substrate to three audiences:
+
+- **ATProto-adjacent operators** evaluating whether the
+  substrate's design discipline fits their threat model. The §4
+  type architecture and §6 audit vocabulary are committed; the
+  trait surfaces are stable enough to inform a "would we build
+  on this?" decision.
+- **Downstream integrators** (PDS, AppView, and Graph substrate
+  builders) consuming kryphocron as a dependency. The
+  wire-format and audit-event shapes are committed within 0.1.x;
+  consumer-facing API ergonomics may evolve as integrations
+  surface concrete needs.
+- **Adversarial reviewers** stress-testing the substrate's
+  threat-model commitments. The crate forbids `unsafe`, denies
+  `todo!()` / `unimplemented!()`, and ships with 340+ tests
+  pinning behavior across user, channel, substrate, and
+  moderation classes plus the §4.6 timing-channel equalization
+  surface.
+
+v0.1.0 ships the kryphocron substrate's authority discipline
 end-to-end:
 
 - **§4 type architecture** — tier-aware envelopes, sealed
@@ -213,27 +243,100 @@ end-to-end:
   `NoEncryption` (no-op resolver set), operator plug-ins fill
   in real algorithm support.
 
-### v0.1 enrichment posture
+### Known limitations in v0.1
 
-The audit pipeline is wired end-to-end. A few audit-event
-payload fields ship with placeholder data in v0.1 pending
-sealed per-class extraction traits in v0.2:
+**None of these are security bugs.** They're places where the
+v0.1 surface is narrower than the spec's full v1 commitment, with
+the gap closed in v0.2+ enrichment passes. Each item ships with a
+programmatic signal where operators benefit from one
+(`PayloadCompleteness::PartialV01` on the audit-event variants
+below), and a public README disclosure where they don't.
 
-- Channel-class `peer ServiceIdentity` and `session_id`.
-- Substrate-class `scope_repr`.
-- Moderation-class `case ModerationCaseId`.
+A few audit-event payload fields ship with placeholder data in
+v0.1 pending sealed per-class extraction traits in v0.2:
 
-User-class oracle consultations consult only the universal
-block-vs-resource-owner query in v0.1 (multi-query consultations
-land alongside a per-capability oracle-results-builder in v0.2).
-`tier::visible_to` is tier-only in v0.1; an audience-aware
-overload lands in v0.2.
-Moderation-class reborrow miss is silent at the audit layer in
-v0.1 (no fitting variant in v1's audit vocabulary); v0.2 adds
-the variant.
+- Channel-class `peer ServiceIdentity` and `session_id` on
+  `ChannelBound` / `ChannelReborrowFailed`.
+- Substrate-class `scope_repr` on `ScopeBound`.
+- Moderation-class `case ModerationCaseId` on `ModeratorInspected`
+  / `ModeratorTookDown` / `ModeratorRestored`.
+
+The affected variants carry a `payload_completeness:
+PayloadCompleteness` field. v0.1 sets this to
+`PartialV01`; v0.2 flips it to `Full` when the sealed extraction
+traits land. Operators consuming the audit stream branch on this
+discriminator to gate dashboards or alerting that would otherwise
+silently render placeholder data as real values.
+
+Other v0.2 enrichments:
+
+- User-class oracle consultations consult only the universal
+  block-vs-resource-owner query in v0.1 (multi-query
+  consultations land alongside a per-capability
+  oracle-results-builder in v0.2).
+- `tier::visible_to` is tier-only in v0.1; an audience-aware
+  overload lands in v0.2.
+- Moderation-class reborrow miss is silent at the audit layer in
+  v0.1 (no fitting variant in v1's audit vocabulary); v0.2 adds
+  the variant.
 
 Wire-format-touching changes are reserved for a future v0.2 or
 v1.0 cycle. v0.1.x patches are non-breaking only.
+
+### Closed-namespace lexicon registry
+
+kryphocron's tier classification is closed-namespace: only NSIDs
+in the `tools.kryphocron.*` namespace are known to the substrate's
+registry. `Tier::from_nsid` consults
+`KRYPHOCRON_LEXICON_REGISTRY` (compiled in from the companion
+`kryphocron-lexicons` crate) and returns
+`Err(UnknownNsid::NotRegistered)` for NSIDs outside that
+namespace — including ATProto-ecosystem NSIDs like
+`app.bsky.feed.post` or `com.atproto.repo.strongRef`. **There is
+no default-to-`Tier::Public`** path; unknown NSIDs are a hard
+error, not a permissive fallback.
+
+Operators running kryphocron alongside other ATProto lexicon
+surfaces — for example, a PDS that handles both `app.bsky.*`
+records and `tools.kryphocron.*` records — must be aware that
+kryphocron's tier discipline applies only to its own namespace.
+Non-kryphocron records are not classified by the kryphocron tier
+system; the consuming substrate is responsible for handling
+them per its own discipline (typically a separate
+classification layer, or a routing decision that hands
+non-kryphocron records off before the kryphocron tier check).
+
+This is a deliberate v0.1 design choice. Cross-namespace
+classification (treating `app.bsky.*` records as `Tier::Public`
+by default, sourcing tier from `app.bsky.*` lexicons' own
+metadata, etc.) is reserved for a future release if downstream
+operators surface concrete demand. The current discipline
+foreclose ambiguity: a NSID either is, or isn't, in the
+substrate's trust boundary, with no silent middle ground.
+
+## Feedback and contributing
+
+Three channels, sorted by what you have:
+
+- **Integration pain or substrate-side bug** → open a GitHub
+  issue at <https://github.com/skydeval/kryphocron/issues>.
+  Bug reports against the §4 / §6 / §7 surfaces should include
+  a minimal reproducer (a failing test, a code excerpt) so
+  the issue lands as a concrete fix.
+- **Security issue** → see [SECURITY.md](SECURITY.md). Please
+  don't open a public issue for vulnerabilities; the security
+  policy describes the disclosure path.
+- **Design feedback, threat-model questions, or open questions
+  about v0.2+ direction** → GitHub Discussions on the
+  `skydeval/kryphocron` repo. The substrate's design discipline
+  is exploratory; questions about *why* a particular shape
+  shipped (or didn't) are welcome and inform the v0.2 enrichment
+  passes.
+
+The companion lexicon JSON lives in
+[`kryphocron-lexicons`](https://github.com/skydeval/kryphocron-lexicons);
+suggestions on the lexicon vocabulary itself belong there, not
+here.
 
 ## License
 
