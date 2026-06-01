@@ -114,7 +114,7 @@ getrandom = "~0.2"
 # `KRYPHOCRON_LEXICON_REGISTRY`, and the validated AT-Protocol
 # identifier types (`Did`, `Nsid`, `RecordKey`, `AtUri`, `Cid`,
 # `Datetime`, `Tid`).
-kryphocron-lexicons = { path = "../kryphocron-lexicons", version = "0.1" }
+kryphocron-lexicons = { git = "https://github.com/skydeval/kryphocron-lexicons", branch = "0.2-dev", version = "0.1" }
 
 # §4.6 timing-channel equalization sleep primitive
 # (`tokio::time::sleep` consumed by `crate::timing::equalize_timing`).
