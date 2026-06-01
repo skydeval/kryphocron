@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- `lexicons()` accessor (re-exported from `kryphocron-lexicons`)
+  returning the lexicon document collection for runtime validation,
+  suitable for use with `proto_blue_lexicon::validate_record`.
+  Additive; `KRYPHOCRON_LEXICON_REGISTRY`, `Tier::from_nsid`, and the
+  codegen `tools::*` types are unchanged.
+
 ## [0.1.0] — 2026-05-17
 
 Initial publication release. v0.1 ships the kryphocron substrate's

@@ -231,7 +231,7 @@ pub use proto::{AtUri, BlobRef, Cid, CidError, Datetime, Did, Handle, Nsid, Reco
 // runtime trust anchor for tier classification and deprecation
 // state.
 pub use kryphocron_lexicons::{
-    DeprecationState, LexiconRegistryEntry, KRYPHOCRON_CODEGEN_HASH,
+    lexicons, DeprecationState, LexiconRegistryEntry, KRYPHOCRON_CODEGEN_HASH,
     KRYPHOCRON_LEXICON_REGISTRY,
 };
 pub use target::{
