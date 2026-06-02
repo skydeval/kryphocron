@@ -8,17 +8,6 @@ structurally rather than as policy.
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-brightgreen.svg)](https://www.mozilla.org/MPL/2.0/)
 [![Crates.io](https://img.shields.io/crates/v/kryphocron)](https://crates.io/crates/kryphocron)
 
-> **Early access — v0.1.x is the published surface of an
-> in-progress substrate.** The wire-format and audit-event
-> vocabularies are committed (no breaking changes within 0.1.x);
-> the consumer-facing API surface (trait shapes, constructor
-> signatures, accessor ergonomics) may evolve through the 0.x
-> cycle as downstream integrations surface concrete needs. v0.2
-> lands sealed per-class extraction traits that flip a few
-> placeholder audit-payload fields to real values (see
-> [Known limitations in v0.1](#known-limitations-in-v01)).
-> Pin tilde (`~0.1`) or full minor (`0.1`) per your tolerance.
-
 ## What it is
 
 `kryphocron` is the foundational primitives crate for the
@@ -76,7 +65,7 @@ trait shape and leaves the implementation to operators.
 
 ```toml
 [dependencies]
-kryphocron = "0.1"
+kryphocron = "0.2"
 ```
 
 A minimal substrate-side integration sketch:
@@ -163,7 +152,7 @@ Five organizing principles:
 
 ## Status
 
-**v0.1.0** publishes the kryphocron substrate to three audiences:
+**kryphocron** publishes its substrate primitives to three audiences:
 
 - **ATProto-adjacent operators** evaluating whether the
   substrate's design discipline fits their threat model. The §4
@@ -172,7 +161,7 @@ Five organizing principles:
   on this?" decision.
 - **Downstream integrators** (PDS, AppView, and Graph substrate
   builders) consuming kryphocron as a dependency. The
-  wire-format and audit-event shapes are committed within 0.1.x;
+  wire-format and audit-event shapes are committed within 0.2.x;
   consumer-facing API ergonomics may evolve as integrations
   surface concrete needs.
 - **Adversarial reviewers** stress-testing the substrate's
@@ -182,7 +171,7 @@ Five organizing principles:
   moderation classes plus the §4.6 timing-channel equalization
   surface.
 
-v0.1.0 ships the kryphocron substrate's authority discipline
+kryphocron ships the substrate's authority discipline
 end-to-end:
 
 - **§4 type architecture** — tier-aware envelopes, sealed
@@ -243,17 +232,17 @@ end-to-end:
   `NoEncryption` (no-op resolver set), operator plug-ins fill
   in real algorithm support.
 
-### Known limitations in v0.1
+### Known limitations
 
 **None of these are security bugs.** They're places where the
-v0.1 surface is narrower than the spec's full v1 commitment, with
-the gap closed in v0.2+ enrichment passes. Each item ships with a
-programmatic signal where operators benefit from one
+current surface is narrower than the spec's full v1 commitment,
+with the gap closed in future enrichment passes. Each item ships
+with a programmatic signal where operators benefit from one
 (`PayloadCompleteness::PartialV01` on the audit-event variants
 below), and a public README disclosure where they don't.
 
-A few audit-event payload fields ship with placeholder data in
-v0.1 pending sealed per-class extraction traits in v0.2:
+A few audit-event payload fields ship with placeholder data
+pending sealed per-class extraction traits in v0.3+:
 
 - Channel-class `peer ServiceIdentity` and `session_id` on
   `ChannelBound` / `ChannelReborrowFailed`.
@@ -262,26 +251,26 @@ v0.1 pending sealed per-class extraction traits in v0.2:
   / `ModeratorTookDown` / `ModeratorRestored`.
 
 The affected variants carry a `payload_completeness:
-PayloadCompleteness` field. v0.1 sets this to
-`PartialV01`; v0.2 flips it to `Full` when the sealed extraction
-traits land. Operators consuming the audit stream branch on this
+PayloadCompleteness` field. Current releases set this to
+`PartialV01`; a future release flips it to `Full` when the sealed
+extraction traits land. Operators consuming the audit stream branch on this
 discriminator to gate dashboards or alerting that would otherwise
 silently render placeholder data as real values.
 
-Other v0.2 enrichments:
+Other enrichments deferred to v0.3+:
 
 - User-class oracle consultations consult only the universal
-  block-vs-resource-owner query in v0.1 (multi-query
+  block-vs-resource-owner query (multi-query
   consultations land alongside a per-capability
-  oracle-results-builder in v0.2).
-- `tier::visible_to` is tier-only in v0.1; an audience-aware
-  overload lands in v0.2.
-- Moderation-class reborrow miss is silent at the audit layer in
-  v0.1 (no fitting variant in v1's audit vocabulary); v0.2 adds
+  oracle-results-builder in v0.3+).
+- `tier::visible_to` is tier-only; an audience-aware
+  overload lands in v0.3+.
+- Moderation-class reborrow miss is silent at the audit layer
+  (no fitting variant in v1's audit vocabulary); v0.3+ adds
   the variant.
 
-Wire-format-touching changes are reserved for a future v0.2 or
-v1.0 cycle. v0.1.x patches are non-breaking only.
+Wire-format-touching changes are reserved for a future minor
+cycle or the v1.0 cycle. v0.2.x patches are non-breaking only.
 
 ### Closed-namespace lexicon registry
 
@@ -306,7 +295,7 @@ them per its own discipline (typically a separate
 classification layer, or a routing decision that hands
 non-kryphocron records off before the kryphocron tier check).
 
-This is a deliberate v0.1 design choice. Cross-namespace
+This is a deliberate design choice. Cross-namespace
 classification (treating `app.bsky.*` records as `Tier::Public`
 by default, sourcing tier from `app.bsky.*` lexicons' own
 metadata, etc.) is reserved for a future release if downstream
@@ -327,10 +316,10 @@ Three channels, sorted by what you have:
   don't open a public issue for vulnerabilities; the security
   policy describes the disclosure path.
 - **Design feedback, threat-model questions, or open questions
-  about v0.2+ direction** → GitHub Discussions on the
+  about future direction** → GitHub Discussions on the
   `skydeval/kryphocron` repo. The substrate's design discipline
   is exploratory; questions about *why* a particular shape
-  shipped (or didn't) are welcome and inform the v0.2 enrichment
+  shipped (or didn't) are welcome and inform future enrichment
   passes.
 
 The companion lexicon JSON lives in
