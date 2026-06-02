@@ -143,7 +143,7 @@ default = []
 # drive issuance → bind → audit pipelines end-to-end without
 # standing up a full verified-evidence path. Off by default.
 # Downstream crates testing integrations against kryphocron
-# (e.g., the Aurora-Locus federation surface) opt in via
+# opt in via
 # `kryphocron = { version = "0.1", features = ["test-support"] }`
 # in their `[dev-dependencies]`.
 test-support = []
