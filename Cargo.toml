@@ -211,3 +211,13 @@ too_many_arguments = "allow"
 # (Proof families, Outcome, etc.). Function-level #[must_use] on
 # helpers returning already-must_use types is doubled; clippy
 # flags it correctly — fixes are inline.
+
+# Dev-branch override: consume the local kryphocron-lexicons
+# v0.2.1-dev checkout (sibling on disk) instead of the published
+# 0.2 artifact, so 0.2.1-dev substrate work builds against the
+# corrected lexicon JSONs + regenerated codegen. The main
+# [dependencies] entry above is left unchanged; release-time ship
+# removes this section (one-line revert) and resolves against the
+# published kryphocron-lexicons 0.2.1.
+[patch.crates-io]
+kryphocron-lexicons = { path = "../kryphocron-lexicons" }

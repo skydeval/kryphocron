@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased] — 0.2.1-dev
+
+### Changed
+
+- Bumped the `kryphocron-lexicons` dependency to consume the 0.2.1
+  lexicon-evolution changes: optional `publicCompanion` on
+  `postPrivate`; optional `mode`, optional `members`, and optional
+  `name` on `policy.audience`; and the `postPrivate.audienceList`
+  encoding corrected from a record-def ref to an at-uri string. The
+  regenerated `tools::*` codegen types reflect the new optional fields
+  and relaxed types; `KRYPHOCRON_CODEGEN_HASH` shifts accordingly.
+- No source changes were required in the kryphocron crate. It consumes
+  `kryphocron-lexicons` only for the metadata/identifier surface
+  (`Tier`, `Visibility`, `UnknownNsid`, `SemVer`, `DeprecationState`,
+  `LexiconRegistryEntry`, `KRYPHOCRON_LEXICON_REGISTRY`, the `lexicons()`
+  accessor, and the AT-Protocol identifier types) — not the generated
+  record structs whose shapes changed. Build and full test suite pass
+  against the updated lexicons unchanged.
+- No behavioral changes to substrate APIs, capability vocabulary, oracle
+  traits, or audit-event vocabulary. `EVENT_SCHEMA_VERSION` unchanged at
+  1.0.0.
+
 ## [0.2.0] — 2026-06-02
 
 ### Added

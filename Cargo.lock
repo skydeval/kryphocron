@@ -695,8 +695,6 @@ dependencies = [
 [[package]]
 name = "kryphocron-lexicons"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fc540592bb1c348fa138377cf9ec3600d44f0d1be1c1b0128a514cf0036af51"
 dependencies = [
  "proto-blue-lex-data",
  "proto-blue-lexicon",
