@@ -240,7 +240,7 @@ pub use target::{
 };
 pub use tier::{
     visible_to, HasNsid, MixedTier, PrivateTier, PublicTier, Tier,
-    TierWitness, Tiered, Visibility,
+    TierWitness, Tiered, Visibility, KRYPHOCRON_IMPLEMENTED_NSIDS,
 };
 pub use timing::{
     equalize_timing, equalize_timing_target_for,

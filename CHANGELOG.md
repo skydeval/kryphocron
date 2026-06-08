@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased] — 0.2.1-dev
 
+### Added
+
+- `build.rs` for the kryphocron crate, implementing the §5.4 post-processing
+  step that emits per-record-type `HasNsid` impls (each paired with a
+  `sealed::Sealed` impl) for every NSID in `KRYPHOCRON_LEXICON_REGISTRY`, with
+  the tier taken from the registry entry. Generated into
+  `OUT_DIR/has_nsid_impls.rs` and `include!`d from `src/tier.rs`. Also emits
+  the `KRYPHOCRON_IMPLEMENTED_NSIDS` constant and a compile-time §5.3
+  consistency assertion against `KRYPHOCRON_LEXICON_REGISTRY`; the registry is
+  read at build time via a `[build-dependencies]` on `kryphocron-lexicons`.
+  Closes the gap where the design-specified post-processing build script was
+  never created, leaving the sealed `HasNsid` trait with zero implementors and
+  `Tiered<_, _>` uninhabitable for consumers. `tests/has_nsid_impls.rs`
+  verifies every record type carries the correct NSID and type-level tier.
+
 ### Changed
 
 - Bumped the `kryphocron-lexicons` dependency to consume the 0.2.1
@@ -25,6 +40,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - No behavioral changes to substrate APIs, capability vocabulary, oracle
   traits, or audit-event vocabulary. `EVENT_SCHEMA_VERSION` unchanged at
   1.0.0.
+
+### Docs
+
+- `KRYPHOCRON_CRATE_DESIGN.md` §5.3/§5.4 wording reconciled: per the orphan
+  rule, the `HasNsid` impls and `KRYPHOCRON_IMPLEMENTED_NSIDS` are
+  kryphocron-crate build outputs, while `KRYPHOCRON_LEXICON_REGISTRY` stays in
+  kryphocron-lexicons.
 
 ## [0.2.0] — 2026-06-02
 

@@ -133,6 +133,15 @@ trybuild = "1"
 # `tokio::test` macro with a single-thread runtime — tests
 # don't need the multi-thread scheduler.
 tokio = { version = "1", features = ["macros", "rt"] }
+# Naming the proto-blue-codegen record types (`tools::*::Main`) in the
+# §5.4 `HasNsid`-impl tests.
+kryphocron-lexicons = "0.2"
+
+[build-dependencies]
+# §5.4 post-processing reads `KRYPHOCRON_LEXICON_REGISTRY` (NSID -> tier) to
+# emit the per-record `HasNsid` impls. The `[patch.crates-io]` override below
+# resolves this to the local checkout, same as the normal dependency.
+kryphocron-lexicons = "0.2"
 
 [features]
 default = []
