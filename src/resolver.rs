@@ -70,6 +70,36 @@ pub struct DidDocument {
     pub resolver_cache_max_age: Duration,
 }
 
+impl DidDocument {
+    /// Construct a DID document from its components.
+    ///
+    /// Enables operator-implemented [`DidResolver`]s (and test fixtures) to
+    /// return `DidDocument` values. The struct stays `#[non_exhaustive]`, so
+    /// future field additions remain non-breaking; this constructor takes the
+    /// current field set.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        did: Did,
+        verification_methods: Vec<(KeyId, PublicKey)>,
+        rotation_history: Vec<(KeyId, PublicKey)>,
+        services: Vec<DidService>,
+        also_known_as: Vec<String>,
+        resolved_at: SystemTime,
+        resolver_cache_max_age: Duration,
+    ) -> Self {
+        Self {
+            did,
+            verification_methods,
+            rotation_history,
+            services,
+            also_known_as,
+            resolved_at,
+            resolver_cache_max_age,
+        }
+    }
+}
+
 /// Service endpoint declared by a DID document (§7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -80,6 +110,18 @@ pub struct DidService {
     pub service_type: String,
     /// Endpoint URI.
     pub endpoint: String,
+}
+
+impl DidService {
+    /// Construct a DID service endpoint entry.
+    #[must_use]
+    pub fn new(id: String, service_type: String, endpoint: String) -> Self {
+        Self {
+            id,
+            service_type,
+            endpoint,
+        }
+    }
 }
 
 /// DID resolution failure (§7.3).

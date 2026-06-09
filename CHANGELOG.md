@@ -20,6 +20,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   never created, leaving the sealed `HasNsid` trait with zero implementors and
   `Tiered<_, _>` uninhabitable for consumers. `tests/has_nsid_impls.rs`
   verifies every record type carries the correct NSID and type-level tier.
+- Public `ServiceIdentity::new(service_did, key_id, key_material,
+  rotation_evidence)` (`identity.rs`): consumers can now construct their own
+  service's audience identity at startup for use as `verify_jwt`'s
+  `local_audience`. Adds a public sibling to the `pub(crate)` `new_internal`
+  (the redundant `_private: PhantomData` seal is dropped — the struct's private
+  fields already block external struct literals). Closes the consumer-side gap
+  where the receive-time audience-check requirement
+  (`KRYPHOCRON_CRATE_DESIGN.md:6928`) had no public construction path short of
+  the `test-support`-gated `new_for_test`, which §0.4 excludes from release
+  builds.
+- Public `new(...)` constructors on `DidDocument` and `DidService`
+  (`resolver.rs`): unblocks operator-implemented `DidResolver`s (the design's
+  stated §7.3 extension point) and consumer test fixtures, which must construct
+  the values `DidResolver::resolve` returns. `#[non_exhaustive]` is preserved,
+  so the substrate keeps the freedom to add fields without breaking external
+  consumers. (No `VerificationMethod` constructor: the shipped
+  `verification_methods` field is `Vec<(KeyId, PublicKey)>`, not a struct.)
+- `tests/public_constructors.rs`: integration tests at the external-crate
+  boundary proving the new constructors are reachable by consumers.
 
 ### Changed
 
@@ -47,6 +66,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   rule, the `HasNsid` impls and `KRYPHOCRON_IMPLEMENTED_NSIDS` are
   kryphocron-crate build outputs, while `KRYPHOCRON_LEXICON_REGISTRY` stays in
   kryphocron-lexicons.
+- `KRYPHOCRON_CRATE_DESIGN.md` §7.3 reconciliations: the DID-resolution
+  deadline is `verify_jwt`'s `deadline: Instant` parameter (not a
+  `JwtVerificationConfig::verification_timeout` field), and `DidDocument` /
+  `DidService` ship as `#[non_exhaustive]` with public fields **plus** public
+  `new(...)` constructors — realizing the design's consumer-constructible
+  intent while preserving field-addition freedom.
 
 ## [0.2.0] — 2026-06-02
 
