@@ -60,6 +60,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   traits, or audit-event vocabulary. `EVENT_SCHEMA_VERSION` unchanged at
   1.0.0.
 
+### Fixed
+
+- `AuthContext<'a>` is now `Send + Sync`. Removed the
+  `_no_clone: PhantomData<*const ()>` marker on `ingress.rs` that was meant to
+  forbid `Clone` but, as a side effect of the raw pointer's auto-trait
+  properties, propagated `!Send + !Sync` — making `AuthContext` (and
+  `&AuthContext`) unusable across an `.await` on any executor that requires
+  `Send` futures (multi-thread tokio / axum handlers being the canonical case),
+  which in turn made the substrate's own async `bind` path (§4.6) unusable from
+  such handlers. The type remains `!Clone` because it has no `Clone` impl — the
+  marker was redundant for that purpose. Compile-time `Send + Sync` assertions
+  added next to the type so a future field addition that reintroduced `!Send`
+  fails to compile. No behavioral change. (Sweep confirmed this was the only
+  `PhantomData<*const _>` marker in the crate.)
+
 ### Docs
 
 - `KRYPHOCRON_CRATE_DESIGN.md` §5.3/§5.4 wording reconciled: per the orphan

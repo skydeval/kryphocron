@@ -11,8 +11,8 @@
 //! `from_sync_channel_message`, `anonymous_for_public_read`),
 //! each of which accepts a verified-evidence type. Code outside
 //! the crate cannot construct an [`AuthContext`] via
-//! struct-literal syntax because every field is private and the
-//! type carries a `PhantomData<*const ()>` to forbid `Clone`.
+//! struct-literal syntax because every field is private; the type
+//! also has no `Clone` impl, so a context cannot be duplicated.
 //!
 //! Sub-context derivation uses [`AuthContext::derive_for`] over a
 //! sealed [`Narrowing`] trait — only three [`Narrowing`] impls
@@ -47,10 +47,12 @@ pub const MAX_CHAIN_DEPTH: usize = 8;
 /// and the [`AttributionChain`] reconstructed from upstream
 /// delegation (§4.8).
 ///
-/// **Not `Clone`.** The `_no_clone` marker `PhantomData<*const ()>`
-/// makes the auto-trait analysis exclude `Clone`. Operators that
-/// need to flow context through async boundaries pass references
-/// or rebuild via [`AuthContext::derive_for`].
+/// **Not `Clone`.** `AuthContext` intentionally has no `Clone` impl,
+/// so a context cannot be duplicated. It *is* `Send + Sync` (via its
+/// field types), so it — or `&AuthContext` — may be held across async
+/// boundaries (the async `bind` path, §4.6) on `Send`-requiring
+/// executors such as multi-thread tokio, or rebuilt via
+/// [`AuthContext::derive_for`].
 pub struct AuthContext<'a> {
     requester: Requester,
     trace_id: TraceId,
@@ -71,15 +73,21 @@ pub struct AuthContext<'a> {
     /// subset of this field, otherwise the derivation fails
     /// with [`DeriveError::NarrowingExceedsAuthority`].
     capabilities: CapabilitySet,
-    _no_clone: PhantomData<*const ()>,
 }
 
-// The *const () marker makes AuthContext !Send + !Sync by
-// default, which is the substrate's discipline: AuthContext is
-// process-local and used inside a single bind path. Manual Send +
-// Sync impls are NOT shipped — operators that need to flow context
-// across async boundaries pass references or rebuild via
-// derive_for.
+// AuthContext is `Send + Sync` via its field types (`Requester`,
+// `TraceId`, the `&dyn`-over-`Send + Sync` `AuditSinks` / `OracleSet`,
+// `AttributionChain`, `CapabilitySet`). That is required for the async
+// `bind` path (§4.6) to be usable from `Send`-requiring executors
+// (multi-thread tokio / axum handlers). It is intentionally `!Clone`
+// (no `Clone` impl). The assertions below pin `Send + Sync` so a future
+// field addition that reintroduced `!Send` would fail to compile.
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    let _ = assert_send::<AuthContext<'static>>;
+    let _ = assert_sync::<AuthContext<'static>>;
+};
 
 impl<'a> AuthContext<'a> {
     /// Crate-internal constructor. Reserved for the
@@ -103,7 +111,6 @@ impl<'a> AuthContext<'a> {
             oracles,
             attribution_chain,
             capabilities,
-            _no_clone: PhantomData,
         }
     }
 
