@@ -114,7 +114,7 @@ getrandom = "~0.2"
 # `KRYPHOCRON_LEXICON_REGISTRY`, and the validated AT-Protocol
 # identifier types (`Did`, `Nsid`, `RecordKey`, `AtUri`, `Cid`,
 # `Datetime`, `Tid`).
-kryphocron-lexicons = "0.2"
+kryphocron-lexicons = "0.3"
 
 # §4.6 timing-channel equalization sleep primitive
 # (`tokio::time::sleep` consumed by `crate::timing::equalize_timing`).
@@ -135,13 +135,13 @@ trybuild = "1"
 tokio = { version = "1", features = ["macros", "rt"] }
 # Naming the proto-blue-codegen record types (`tools::*::Main`) in the
 # §5.4 `HasNsid`-impl tests.
-kryphocron-lexicons = "0.2"
+kryphocron-lexicons = "0.3"
 
 [build-dependencies]
 # §5.4 post-processing reads `KRYPHOCRON_LEXICON_REGISTRY` (NSID -> tier) to
 # emit the per-record `HasNsid` impls. The `[patch.crates-io]` override below
 # resolves this to the local checkout, same as the normal dependency.
-kryphocron-lexicons = "0.2"
+kryphocron-lexicons = "0.3"
 
 [features]
 default = []
@@ -221,12 +221,12 @@ too_many_arguments = "allow"
 # helpers returning already-must_use types is doubled; clippy
 # flags it correctly — fixes are inline.
 
-# Dev-branch override: consume the local kryphocron-lexicons
-# v0.2.1-dev checkout (sibling on disk) instead of the published
-# 0.2 artifact, so 0.2.1-dev substrate work builds against the
-# corrected lexicon JSONs + regenerated codegen. The main
-# [dependencies] entry above is left unchanged; release-time ship
-# removes this section (one-line revert) and resolves against the
-# published kryphocron-lexicons 0.2.1.
+# Local 0.3.0-dev override: consume the local kryphocron-lexicons
+# skydeval/0.3.0-dev checkout (sibling on disk), which carries the
+# 0.3.0 codec-field lexicon JSONs + regenerated codegen. The
+# [dependencies] requirement above is already at "0.3", so this
+# path override simply satisfies it from the local checkout until
+# kryphocron-lexicons 0.3.0 is published to crates.io. Remove this
+# section at coordinated-ship time once 0.3.0 is published.
 [patch.crates-io]
 kryphocron-lexicons = { path = "../kryphocron-lexicons" }
