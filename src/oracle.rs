@@ -144,6 +144,10 @@ pub enum OracleKind {
     Audience,
     /// Mute oracle.
     Mute,
+    /// Rotation oracle (§8.3 at-rest content-codec rotation generation).
+    /// Consulted at the encode seam rather than the bind path, but shares
+    /// the §4.5 oracle trait shape and freshness discipline.
+    Rotation,
 }
 
 /// Specific oracle query that produced a result or freshness
@@ -212,9 +216,17 @@ mod tests {
         // Pin the v1 variant set. Adding a new variant breaks the
         // exhaustive match — the test failure is the signal that
         // operator tooling parsing audit events must be updated.
-        for &k in &[OracleKind::Block, OracleKind::Audience, OracleKind::Mute] {
+        for &k in &[
+            OracleKind::Block,
+            OracleKind::Audience,
+            OracleKind::Mute,
+            OracleKind::Rotation,
+        ] {
             match k {
-                OracleKind::Block | OracleKind::Audience | OracleKind::Mute => {}
+                OracleKind::Block
+                | OracleKind::Audience
+                | OracleKind::Mute
+                | OracleKind::Rotation => {}
             }
         }
     }
