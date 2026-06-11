@@ -352,6 +352,24 @@ pub enum CodecError {
         /// Operator-facing detail string.
         detail: String,
     },
+    /// No content codec is installed, but a record carries codec-encoded
+    /// content that needs one to decode. Two scenarios:
+    ///
+    /// 1. **Partial deployment / cross-peer codec skew** — a peer that does
+    ///    not have the codec a record was written under. Cross-codec
+    ///    federation is unsupported in 0.x (rev6 §5.2): such a read fails here.
+    /// 2. **Historical records** — content written before any codec was
+    ///    installed in this deployment.
+    ///
+    /// `stored` is the codec the record was written under (i.e. the one that
+    /// would be needed to decode it). Added by the 0.3.0 implementation cycle
+    /// as a rev6 gap-fill — rev6's enumerated decode errors did not cover the
+    /// no-installed-codec case (additive under `#[non_exhaustive]`).
+    #[error("no codec installed to decode record stored under codec {stored}")]
+    NoCodecInstalled {
+        /// Codec id the stored record was written under.
+        stored: CodecId,
+    },
 }
 
 /// Coarse, plaintext-free classification of a [`CodecError`] for the audit
@@ -369,6 +387,8 @@ pub enum CodecErrorClass {
     DeadlineExceeded,
     /// See [`CodecError::BackendUnavailable`].
     BackendUnavailable,
+    /// See [`CodecError::NoCodecInstalled`].
+    NoCodecInstalled,
 }
 
 impl CodecError {
@@ -383,6 +403,7 @@ impl CodecError {
             }
             CodecError::DeadlineExceeded { .. } => CodecErrorClass::DeadlineExceeded,
             CodecError::BackendUnavailable { .. } => CodecErrorClass::BackendUnavailable,
+            CodecError::NoCodecInstalled { .. } => CodecErrorClass::NoCodecInstalled,
         }
     }
 }

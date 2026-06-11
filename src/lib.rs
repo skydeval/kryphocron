@@ -138,12 +138,17 @@ mod identity;
 /// the v1 capability vocabulary.
 pub mod authority;
 
+/// §8.3 at-rest content encode / decode seams driving an installed
+/// [`encryption::ContentCodec`].
+pub mod at_rest;
+
 /// §4.9 audit pipeline traits, sink types, composite-audit
 /// rollback machinery, fallback sink contract.
 pub mod audit;
 
-/// §8 encryption-hook surfaces. v1 ships only the type vocabulary
-/// and the trait shapes; no implementations.
+/// §8 at-rest hook surfaces: the §8.2 audit-encryption trait surface
+/// (type vocabulary only) and the §8.3 [`encryption::ContentCodec`]
+/// content-codec seam.
 pub mod encryption;
 
 /// §4.2 ingress submodule — constructs [`AuthContext`] values from
@@ -188,6 +193,9 @@ mod wire;
 
 // Crate-root re-exports of the load-bearing public types.
 
+pub use at_rest::{
+    decode_record_content, encode_record_content, RecordContentContext,
+};
 pub use audit::{
     AuditError, ChannelAuditSink, FallbackAuditSink, ModerationAuditSink, SinkKind,
     SinkPanicGuard, SubstrateAuditSink, TerminatedSinkGuard, UserAuditSink,

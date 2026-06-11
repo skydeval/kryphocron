@@ -230,10 +230,14 @@ pub enum UserAuditEvent {
         requester: Did,
         /// Subject representation (§4.4) — structural layer only.
         subject_repr: TargetRepresentation,
-        /// Installed codec id.
-        codec: CodecId,
-        /// Codec id read from the stored record, present on a
-        /// codec-mismatch (`UnknownOrWrongCodec`); `None` otherwise.
+        /// Installed codec id, or `None` when no codec is installed at decode
+        /// time (the `NoCodecInstalled` case — see `stored_codec` for the
+        /// codec the record needed: cross-peer codec skew, or a record written
+        /// before any codec was installed).
+        codec: Option<CodecId>,
+        /// Codec id read from the stored record — present on a codec mismatch
+        /// (`UnknownOrWrongCodec`) or when no codec is installed
+        /// (`NoCodecInstalled`); `None` otherwise.
         stored_codec: Option<CodecId>,
         /// Coarse, plaintext-free error class.
         error_class: CodecErrorClass,
