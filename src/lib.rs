@@ -69,10 +69,11 @@
 //! - [`trust`] service-trust-declaration verification (§7.4).
 //! - [`resolver`] trait surfaces for DID resolution and federation-
 //!   peer trust (§7.3, §7.7).
-//! - [`encryption`] hook-trait surfaces and opaque key-id types
-//!   (§8.2, §8.3; trait surface only — v0.1 ships [`encryption::NoEncryption`]
-//!   as the default no-op resolver set, operator plug-ins fill
-//!   in real algorithm support).
+//! - [`encryption`] at-rest hook surfaces: the §8.2 audit-encryption
+//!   trait surface and opaque key-id types, plus the §8.3
+//!   [`encryption::ContentCodec`] content-codec seam. v0.1 ships
+//!   [`encryption::NoAtRestHooks`] as the default no-op hook set;
+//!   operator plug-ins fill in real codec / encryption support.
 //!
 //! ## Discipline
 //!
@@ -95,7 +96,7 @@
 //!   operator policy (encryption algorithm, oracle backends,
 //!   audit sink storage, inspection-notification queue), the
 //!   crate ships a trait surface + explicit no-op default
-//!   ([`encryption::NoEncryption`],
+//!   ([`encryption::NoAtRestHooks`],
 //!   [`authority::NoInspectionNotifications`]); operators
 //!   install real implementations when their deployment needs
 //!   them.
@@ -203,11 +204,13 @@ pub use authority::{
     SubstrateScope, UserCapability, UserProof, UserProofRef,
 };
 pub use encryption::{
-    produce_sensitive_representation, AuditEncryptionAlgorithm,
-    AuditEncryptionKeyId, AuditEncryptionResolver, EncryptedRecord,
-    EncryptionContext, EncryptionError, EncryptionResolverSet, NoEncryption,
-    RecordEncryptionAlgorithm, RecordEncryptionContext,
-    RecordEncryptionKeyId, RecordEncryptionResolver,
+    produce_sensitive_representation, resolve_rotation_generation, AtRestHooks,
+    AuditEncryptionAlgorithm, AuditEncryptionKeyId, AuditEncryptionResolver,
+    CodecError, CodecErrorClass, CodecId, CodecIdError, ContentCodec,
+    DecodeContext, EncodeContext, EncodedRecord, EncryptionContext,
+    EncryptionError, NoAtRestHooks, NoRotationOracle, RotationContext,
+    RotationGenerationMark, RotationOracle, MAX_CODEC_ID_LEN,
+    MAX_ROTATION_GENERATION_MARK_LEN,
 };
 pub use identity::{
     CorrelationKey, KeyId, PublicKey, RotationChain, RotationEntry,
