@@ -159,6 +159,10 @@ pub mod ingress;
 /// commitments and per-query worst-case latency reporting.
 pub mod oracle;
 
+/// §5.4 / rev6 §4.2 private-record structural validation and the read-side
+/// post-authorization witness ([`read_pipeline::ReadAuthorization`]).
+pub mod read_pipeline;
+
 /// §7.3, §7.7 DID resolution and federation-peer trust trait
 /// surfaces. The crate ships trait shapes; concrete resolvers are
 /// operator territory.
@@ -236,6 +240,10 @@ pub use oracle::{
     MuteOracleQuery, MuteState, OracleKind, OracleQueryKind,
 };
 pub use proto::{AtUri, BlobRef, Cid, CidError, Datetime, Did, Handle, Nsid, RecordKey, Rkey, Tid, UnknownNsid};
+pub use read_pipeline::{
+    validate_record, validate_record_for_read, validate_record_for_write, ReadAuthorization,
+    ReadPipelineStage, RecordValidation,
+};
 
 // §5.3 / §5.4 / §5.6 re-exports from the lexicon companion crate.
 // The lexicon set's compiled-in registry is the substrate's

@@ -40,6 +40,7 @@ use crate::encryption::{
 };
 use crate::identity::TraceId;
 use crate::proto::{AtUri, Did, Nsid, RecordKey};
+use crate::read_pipeline::ReadAuthorization;
 use crate::target::TargetRepresentation;
 
 /// Identity / at-URI / audit context for an at-rest content seam call,
@@ -183,8 +184,10 @@ pub async fn encode_record_content(
 /// [`ContentCodec`], after verifying the stored codec matches, and emitting a
 /// §6.3 audit event on any failure.
 ///
-/// The reader is already authorized upstream (the §4.3 pipeline). `now` is the
-/// emitted event's wallclock.
+/// **Requires the [`ReadAuthorization`] witness** — by type, this cannot be
+/// called before the §4.5 audience-oracle check authorized the read, so the
+/// emitted failure event opens no enumeration channel. The reader recorded is
+/// `authz.reader()`. `now` is the emitted event's wallclock.
 ///
 /// # Errors
 ///
@@ -200,6 +203,7 @@ pub async fn encode_record_content(
 ///
 /// [`ContentCodec`]: crate::encryption::ContentCodec
 pub async fn decode_record_content(
+    authz: &ReadAuthorization,
     hooks: &dyn AtRestHooks,
     user_sink: &dyn UserAuditSink,
     encoded: &EncodedRecord,
@@ -212,7 +216,15 @@ pub async fn decode_record_content(
         let err = CodecError::NoCodecInstalled {
             stored: encoded.codec.clone(),
         };
-        emit_decode_failed(user_sink, ctx, None, Some(encoded.codec.clone()), err.class(), now);
+        emit_decode_failed(
+            user_sink,
+            ctx,
+            authz.reader(),
+            None,
+            Some(encoded.codec.clone()),
+            err.class(),
+            now,
+        );
         return Err(err);
     };
     let installed = codec.codec_id();
@@ -225,6 +237,7 @@ pub async fn decode_record_content(
         emit_decode_failed(
             user_sink,
             ctx,
+            authz.reader(),
             Some(installed),
             Some(encoded.codec.clone()),
             err.class(),
@@ -245,7 +258,7 @@ pub async fn decode_record_content(
     match codec.decode(encoded, &decode_ctx, deadline).await {
         Ok(plaintext) => Ok(plaintext),
         Err(e) => {
-            emit_decode_failed(user_sink, ctx, Some(installed), None, e.class(), now);
+            emit_decode_failed(user_sink, ctx, authz.reader(), Some(installed), None, e.class(), now);
             Err(e)
         }
     }
@@ -271,6 +284,7 @@ fn emit_encode_failed(
 fn emit_decode_failed(
     user_sink: &dyn UserAuditSink,
     ctx: &RecordContentContext,
+    reader: &Did,
     codec: Option<CodecId>,
     stored_codec: Option<CodecId>,
     error_class: CodecErrorClass,
@@ -278,7 +292,7 @@ fn emit_decode_failed(
 ) {
     let _ = user_sink.record(UserAuditEvent::ContentDecodeFailed {
         trace_id: ctx.trace_id,
-        requester: ctx.requester.clone(),
+        requester: reader.clone(),
         subject_repr: ctx.subject_repr.clone(),
         codec,
         stored_codec,
@@ -410,6 +424,10 @@ mod tests {
         Instant::now() + Duration::from_secs(30)
     }
 
+    fn authz() -> ReadAuthorization {
+        ReadAuthorization::new_for_test(Did::new("did:plc:exampleexampleexample").unwrap())
+    }
+
     fn fresh_oracle(mark: &str) -> Arc<dyn RotationOracle> {
         Arc::new(StubOracle {
             generation: Some(RotationGenerationMark::new(mark).unwrap()),
@@ -523,6 +541,7 @@ mod tests {
         let hooks = hooks_with(Ok(vec![]), Ok(b"PLAIN".to_vec()), None);
         let sink = CapturingSink::default();
         let out = decode_record_content(
+            &authz(),
             &hooks,
             &sink,
             &encoded_under(codec_id()),
@@ -541,6 +560,7 @@ mod tests {
         let hooks = hooks_with(Ok(vec![]), Ok(b"PLAIN".to_vec()), None);
         let sink = CapturingSink::default();
         let err = decode_record_content(
+            &authz(),
             &hooks,
             &sink,
             &encoded_under(other_codec_id()),
@@ -568,6 +588,7 @@ mod tests {
         let hooks = hooks_with(Ok(vec![]), Err(CodecError::Malformed { codec: codec_id() }), None);
         let sink = CapturingSink::default();
         let err = decode_record_content(
+            &authz(),
             &hooks,
             &sink,
             &encoded_under(codec_id()),
@@ -593,6 +614,7 @@ mod tests {
         let hooks = StubHooks { codec: None, oracle: None };
         let sink = CapturingSink::default();
         let err = decode_record_content(
+            &authz(),
             &hooks,
             &sink,
             &encoded_under(codec_id()),
