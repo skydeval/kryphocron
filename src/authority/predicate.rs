@@ -129,6 +129,14 @@ pub enum BindOutcomeRepr {
         /// The specific query that was stale.
         query: OracleQueryKind,
         /// Age of the oracle's data at the failed check.
+        ///
+        /// `Duration::ZERO` is the **clock-skew sentinel**: when the
+        /// oracle's `last_synced_at` is future-dated (clock skew, or a
+        /// peer reporting forward time), `duration_since` cannot yield
+        /// an honest age, so the freshness check fails closed and
+        /// reports `ZERO` here rather than a misleading positive age.
+        /// An operator reading the audit log treats `sync_age == 0` on
+        /// an `OracleStale` outcome as "future-dated sync", not "fresh".
         sync_age: Duration,
     },
     /// A pipeline stage denied.

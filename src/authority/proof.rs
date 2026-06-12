@@ -487,16 +487,59 @@ impl<C: UserCapability> UserProof<C> {
                     <<C as UserCapability>::OracleResults as Default>::default();
                 for &query in C::ORACLE_CONSULTATIONS.audience {
                     let Some(resource) = target.resource_id() else {
-                        // A non-record subject that nonetheless declares an
-                        // audience query is a contradiction; leave the
-                        // field at its fail-closed `None` and let the
-                        // stage-5 predicate backstop deny.
-                        continue;
+                        // A capability declaring an audience query with a
+                        // non-`ResourceId` subject is a contradiction. Under
+                        // 0.3.0's capability set this arm is unreachable (every
+                        // audience-declaring cap has a `ResourceId` subject),
+                        // but if a future cap ever fires it, fail closed at the
+                        // §11-committed AudienceConsultation stage rather than
+                        // fall through to the predicate backstop — which would
+                        // surface at PipelineStage::Predicate and route around
+                        // §11's forensic-stage commitment. `NoAudienceConfigured`
+                        // is the morally-equivalent state: no audience could be
+                        // consulted at all. The debug_assert gives a future cap
+                        // author a debug-build panic so this path gets audited.
+                        debug_assert!(
+                            false,
+                            "audience-declaring capability with non-ResourceId \
+                             subject: audit this stage-3 arm for the new capability"
+                        );
+                        let reason = DenialReason::NotInAudience {
+                            query,
+                            state: crate::oracle::AudienceState::NoAudienceConfigured,
+                        };
+                        let event = crate::audit::UserAuditEvent::CapabilityIssuanceDenied {
+                            trace_id,
+                            requester: Requester::Did(proof_requester_did.clone()),
+                            capability: C::KIND,
+                            target_repr: subject_repr.clone(),
+                            reason: reason.clone(),
+                            attribution: attribution.clone(),
+                            at: now,
+                        };
+                        scope.emit_user(event);
+                        return Ok(BindFlow::DeniedAtPipeline {
+                            stage: PipelineStage::AudienceConsultation,
+                            reason,
+                        });
                     };
-                    let sync_age = now
-                        .duration_since(oracles_audience.last_synced_at())
-                        .unwrap_or(Duration::ZERO);
-                    if sync_age > oracles_audience.data_freshness_bound() {
+                    // §4.6 freshness — fail closed on a future-dated
+                    // `last_synced_at` (clock skew, or a peer reporting forward
+                    // time), mirroring the rotation-oracle check in
+                    // `encryption.rs`. `duration_since` errors when the sync is
+                    // in the future; treat that as stale rather than letting a
+                    // bogus zero age pass the bound.
+                    let age = now.duration_since(oracles_audience.last_synced_at());
+                    let stale = match age {
+                        Ok(a) => a > oracles_audience.data_freshness_bound(),
+                        // Future-dated last_synced_at (clock skew): fail closed.
+                        Err(_) => true,
+                    };
+                    if stale {
+                        // Under clock skew there is no honest age; emit ZERO as
+                        // the documented sentinel (see
+                        // `BindOutcomeRepr::OracleStale::sync_age`).
+                        let sync_age = age.unwrap_or(Duration::ZERO);
                         let oracle = crate::oracle::OracleKind::Audience;
                         let query_kind = crate::oracle::OracleQueryKind::Audience(query);
                         let event = crate::audit::UserAuditEvent::CapabilityBound {
@@ -2043,6 +2086,15 @@ mod bind_test_fixtures {
                 freshness_bound: Duration::from_secs(60),
             }
         }
+        /// Sync clock dated one hour into the future — exercises the
+        /// §4.6 clock-skew fail-closed path (`duration_since` errors).
+        pub fn future_dated(state: AudienceState) -> Self {
+            ConfigurableAudienceOracle {
+                state,
+                synced_at: SystemTime::now() + Duration::from_secs(3600),
+                freshness_bound: Duration::from_secs(60),
+            }
+        }
     }
     impl AudienceOracle for ConfigurableAudienceOracle {
         fn audience_state(
@@ -2463,6 +2515,57 @@ mod user_bind_tests {
                         )
                     );
                     assert!(*sync_age > Duration::from_secs(60));
+                }
+                other => panic!("expected OracleStale outcome, got {other:?}"),
+            },
+            other => panic!("expected CapabilityBound, got {other:?}"),
+        }
+    }
+
+    /// §4.6 clock skew: a future-dated `last_synced_at` (the oracle's sync
+    /// clock ahead of ours) has no honest age — `duration_since` errors — and
+    /// must fail closed with `OracleStale`, not be waved through as perfectly
+    /// fresh. Guards the fail-open hazard that
+    /// `duration_since(..).unwrap_or(ZERO)` left: a future sync mapped to age
+    /// 0, trivially under any bound. The emitted `sync_age` is the documented
+    /// `Duration::ZERO` clock-skew sentinel.
+    #[tokio::test]
+    async fn bind_fails_closed_when_audience_oracle_future_dated() {
+        // InAudience + a fresh enough bound would otherwise grant; the sync
+        // clock being an hour ahead is what trips the fail-closed path.
+        let fixture = BindFixture::with_audience(ConfigurableAudienceOracle::future_dated(
+            AudienceState::InAudience,
+        ));
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+
+        let r = proof.bind(&ctx, &sample_resource_id()).await;
+        let Err(err) = r else {
+            panic!("expected Err (OracleStale on future-dated sync), got Ok");
+        };
+        match err {
+            BindError::OracleStale { oracle, query } => {
+                assert_eq!(oracle, OracleKind::Audience);
+                assert_eq!(
+                    query,
+                    OracleQueryKind::Audience(
+                        AudienceOracleQuery::RequesterAgainstResourceAudience
+                    )
+                );
+            }
+            other => panic!("expected OracleStale, got {other:?}"),
+        }
+
+        let captured = fixture.user.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            UserAuditEvent::CapabilityBound { outcome, .. } => match outcome {
+                BindOutcomeRepr::OracleStale { sync_age, .. } => {
+                    assert_eq!(
+                        *sync_age,
+                        Duration::ZERO,
+                        "clock-skew sentinel: future-dated sync reports ZERO age"
+                    );
                 }
                 other => panic!("expected OracleStale outcome, got {other:?}"),
             },

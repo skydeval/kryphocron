@@ -180,16 +180,37 @@ impl BlockOracle for ConfigurableBlockOracle {
     }
 }
 
-struct NoopAudienceOracle;
-impl AudienceOracle for NoopAudienceOracle {
+// Mirrors `ConfigurableBlockOracle` and the lib-test fixture: `state`,
+// `synced_at`, and `freshness_bound` are tunable so e2e cases can drive the
+// §4.3 stage-3 InAudience / denial / stale paths. The default
+// (`fresh_in_audience`) affirms membership with a just-now sync — the
+// success-path oracle for the private user-class bind. (Post-Phase-7 the
+// stage-3 freshness check rejects a `UNIX_EPOCH` sync as ~56 years stale, so
+// the prior `Noop` fixture broke the happy path under `--features
+// test-support`.)
+struct ConfigurableAudienceOracle {
+    state: AudienceState,
+    synced_at: SystemTime,
+    freshness_bound: Duration,
+}
+impl ConfigurableAudienceOracle {
+    fn fresh_in_audience() -> Self {
+        ConfigurableAudienceOracle {
+            state: AudienceState::InAudience,
+            synced_at: SystemTime::now(),
+            freshness_bound: Duration::from_secs(60),
+        }
+    }
+}
+impl AudienceOracle for ConfigurableAudienceOracle {
     fn audience_state(&self, _: &Did, _: &ResourceId) -> AudienceState {
-        AudienceState::NoAudienceConfigured
+        self.state
     }
     fn last_synced_at(&self) -> SystemTime {
-        SystemTime::UNIX_EPOCH
+        self.synced_at
     }
     fn data_freshness_bound(&self) -> Duration {
-        Duration::from_secs(60)
+        self.freshness_bound
     }
     fn worst_case_latency_for(&self, _: AudienceOracleQuery) -> Duration {
         Duration::ZERO
@@ -225,7 +246,7 @@ struct Fixture {
     inspection: CapturingInspectionQueue,
     correlation_key: CorrelationKey,
     block: ConfigurableBlockOracle,
-    audience: NoopAudienceOracle,
+    audience: ConfigurableAudienceOracle,
     mute: NoopMuteOracle,
 }
 
@@ -244,7 +265,7 @@ impl Fixture {
             inspection: CapturingInspectionQueue::new(),
             correlation_key: CorrelationKey::from_bytes([0u8; 32]),
             block: ConfigurableBlockOracle { state },
-            audience: NoopAudienceOracle,
+            audience: ConfigurableAudienceOracle::fresh_in_audience(),
             mute: NoopMuteOracle,
         }
     }

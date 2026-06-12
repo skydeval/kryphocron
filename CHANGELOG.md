@@ -76,7 +76,9 @@ ships as part of 0.3.0.
   bind inline at `PipelineStage::AudienceConsultation`
   (`DenialReason::NotInAudience`, covering both `NotInAudience` and
   `NoAudienceConfigured`); a stale audience oracle (past its
-  `data_freshness_bound`) fails closed via the `OracleStale` outcome.
+  `data_freshness_bound`, **or future-dated from clock skew** — which fails
+  closed rather than reading as fresh) fails closed via the `OracleStale`
+  outcome.
   Previously these binds did not consult the oracle, so the per-capability
   predicates were permissive and `ReadAuthorization` — although
   type-state-correct — carried no actual audience check. The per-capability
