@@ -138,6 +138,13 @@ pub enum RecordValidation {
         /// `mode_is_list` is `true` — the conditional-required rule binds
         /// `members` to list mode only; under any non-list mode this flag
         /// is unconstrained.
+        ///
+        /// Presence is the substrate's only concern: it checks that
+        /// `members` *exists*, not its contents. Interpreting presence —
+        /// typically `Some(non-empty)`; whether `Some([])` (an explicitly
+        /// empty audience) is meaningful is host policy — lives above this
+        /// seam. `ListModeWithoutMembers` fires exactly when this bool is
+        /// `false` under list mode.
         has_members: bool,
     },
 }

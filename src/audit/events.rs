@@ -185,6 +185,11 @@ pub enum UserAuditEvent {
     /// state (installed codec id; freshness-checked rotation hint), not
     /// the codec's return — authoritative by construction. Structural
     /// subject only; no plaintext, no content bytes. §6.2.
+    ///
+    /// Emission is fire-and-forget at the substrate seam
+    /// (`let _ = sink.record(..)`): a failing or unavailable audit sink does
+    /// not block the encode, unlike the §4.3 capability-bind path where
+    /// audit-unavailable is fail-closed (§4.9).
     ContentEncoded {
         /// Forensic trace id (§6.1).
         trace_id: TraceId,
@@ -205,6 +210,11 @@ pub enum UserAuditEvent {
     /// substrate-side validation, or inside the codec — the codec is not
     /// the emitter. `codec` is the installed codec id regardless of
     /// whether the codec was reached. §6.2.
+    ///
+    /// Emission is fire-and-forget at the substrate seam
+    /// (`let _ = sink.record(..)`): a failing or unavailable audit sink does
+    /// not block the encode, unlike the §4.3 capability-bind path where
+    /// audit-unavailable is fail-closed (§4.9).
     ContentEncodeFailed {
         /// Forensic trace id (§6.1).
         trace_id: TraceId,
@@ -223,6 +233,11 @@ pub enum UserAuditEvent {
     /// verification or codec-internal). Emitted by the substrate, only
     /// after authorization, so it opens no enumeration channel to
     /// unauthorized readers. §6.2.
+    ///
+    /// Emission is fire-and-forget at the substrate seam
+    /// (`let _ = sink.record(..)`): a failing or unavailable audit sink does
+    /// not block the decode, unlike the §4.3 capability-bind path where
+    /// audit-unavailable is fail-closed (§4.9).
     ContentDecodeFailed {
         /// Forensic trace id (§6.1).
         trace_id: TraceId,
@@ -719,6 +734,11 @@ pub enum SubstrateAuditEvent {
     /// stamp, or the `mode == "list"` members rule). Carries no content —
     /// only the structural reason. At read time this is emitted after the
     /// §4.3 audience-oracle check, so it opens no enumeration channel. §6.4.
+    ///
+    /// Emission is fire-and-forget at the substrate seam
+    /// (`let _ = sink.record(..)`): a failing or unavailable audit sink does
+    /// not block the rejection, unlike the §4.3 capability-bind path where
+    /// audit-unavailable is fail-closed (§4.9).
     MalformedRecordRejected {
         /// Forensic trace id (§6.1).
         trace_id: TraceId,
