@@ -32,6 +32,7 @@
 use std::time::{Instant, SystemTime};
 
 use smallvec::SmallVec;
+use thiserror::Error;
 
 use crate::audit::{UserAuditEvent, UserAuditSink};
 use crate::encryption::{
@@ -301,6 +302,49 @@ fn emit_decode_failed(
     });
 }
 
+/// Failure from [`validate_at_rest_install`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AtRestInstallError {
+    /// The installed codec declares [`ContentCodec::requires_rotation`] but no
+    /// [`RotationOracle`] is installed.
+    ///
+    /// [`ContentCodec::requires_rotation`]: crate::encryption::ContentCodec::requires_rotation
+    /// [`RotationOracle`]: crate::encryption::RotationOracle
+    #[error("codec {codec} requires a RotationOracle, but none is installed")]
+    CodecRequiresRotation {
+        /// The codec that requires rotation.
+        codec: CodecId,
+    },
+}
+
+/// Install-time validation of an [`AtRestHooks`] set (rev6 §2.4 / §11 #7).
+///
+/// The substrate is library-only, so the *install seam* itself is host-side;
+/// this is the substrate-provided check a host calls at startup and **fails
+/// closed** on error. A codec that declares
+/// [`ContentCodec::requires_rotation`] paired with no [`RotationOracle`] is a
+/// misconfiguration (e.g. an encryption codec whose security model depends on
+/// key rotation, installed without a rotation source).
+///
+/// # Errors
+///
+/// [`AtRestInstallError::CodecRequiresRotation`] when the installed codec
+/// requires rotation but no rotation oracle is installed.
+///
+/// [`ContentCodec::requires_rotation`]: crate::encryption::ContentCodec::requires_rotation
+/// [`RotationOracle`]: crate::encryption::RotationOracle
+pub fn validate_at_rest_install(hooks: &dyn AtRestHooks) -> Result<(), AtRestInstallError> {
+    if let Some(codec) = hooks.content_codec() {
+        if codec.requires_rotation() && hooks.rotation_oracle().is_none() {
+            return Err(AtRestInstallError::CodecRequiresRotation {
+                codec: codec.codec_id(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -321,12 +365,16 @@ mod tests {
         id: CodecId,
         encode: Result<Vec<u8>, CodecError>,
         decode: Result<Vec<u8>, CodecError>,
+        requires_rotation: bool,
     }
 
     #[async_trait]
     impl ContentCodec for StubCodec {
         fn codec_id(&self) -> CodecId {
             self.id.clone()
+        }
+        fn requires_rotation(&self) -> bool {
+            self.requires_rotation
         }
         async fn encode(
             &self,
@@ -446,6 +494,7 @@ mod tests {
                 id: codec_id(),
                 encode,
                 decode,
+                requires_rotation: false,
             })),
             oracle,
         }
@@ -635,5 +684,47 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    // ---- install-seam check ----
+
+    fn codec_requiring_rotation() -> Arc<dyn ContentCodec> {
+        Arc::new(StubCodec {
+            id: codec_id(),
+            encode: Ok(vec![]),
+            decode: Ok(vec![]),
+            requires_rotation: true,
+        })
+    }
+
+    #[test]
+    fn install_codec_requires_rotation_without_oracle_fails_closed() {
+        let hooks = StubHooks {
+            codec: Some(codec_requiring_rotation()),
+            oracle: None,
+        };
+        assert!(matches!(
+            validate_at_rest_install(&hooks),
+            Err(AtRestInstallError::CodecRequiresRotation { .. })
+        ));
+    }
+
+    #[test]
+    fn install_codec_requires_rotation_with_oracle_ok() {
+        let hooks = StubHooks {
+            codec: Some(codec_requiring_rotation()),
+            oracle: Some(fresh_oracle("000042")),
+        };
+        assert!(validate_at_rest_install(&hooks).is_ok());
+    }
+
+    #[test]
+    fn install_no_codec_or_rotation_not_required_ok() {
+        // No codec at all.
+        let none = StubHooks { codec: None, oracle: None };
+        assert!(validate_at_rest_install(&none).is_ok());
+        // Codec that does not require rotation, no oracle.
+        let no_req = hooks_with(Ok(vec![]), Ok(vec![]), None);
+        assert!(validate_at_rest_install(&no_req).is_ok());
     }
 }

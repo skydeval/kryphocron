@@ -198,7 +198,8 @@ mod wire;
 // Crate-root re-exports of the load-bearing public types.
 
 pub use at_rest::{
-    decode_record_content, encode_record_content, RecordContentContext,
+    decode_record_content, encode_record_content, validate_at_rest_install, AtRestInstallError,
+    RecordContentContext,
 };
 pub use audit::{
     AuditError, ChannelAuditSink, FallbackAuditSink, ModerationAuditSink, SinkKind,

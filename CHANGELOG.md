@@ -4,7 +4,69 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased] — 0.2.1-dev
+## [0.3.0] — UNRELEASED
+
+The 0.3 cycle generalizes §8.3's record-content hook from encryption-specific
+to a content-codec seam (the `ContentCodec` at-rest content-transform surface)
+and wires the encode / decode / validation plumbing the substrate had only
+committed as forward surface. The §8.3 API changes are **breaking** (clean
+rename, no deprecation aliases). §8.2 (`AuditEncryptionResolver`) is unchanged.
+The build-system / constructor work below (previously drafted under 0.2.1-dev)
+ships as part of 0.3.0.
+
+### §8.3 content-codec generalization — Added
+
+- `encryption::ContentCodec` — the at-rest content-transform trait (`codec_id`,
+  `encode -> Vec<u8>`, `decode`, `requires_rotation`). May host encryption,
+  friction (laquna-shaped), or any round-trip transform; the trait asserts no
+  confidentiality / authentication / key property.
+- `encryption::{EncodedRecord, EncodeContext, DecodeContext, CodecId,
+  CodecIdError, CodecError, CodecErrorClass, RotationOracle, RotationContext,
+  RotationGenerationMark, NoRotationOracle, AtRestHooks, NoAtRestHooks,
+  resolve_rotation_generation}`.
+- `at_rest::{encode_record_content, decode_record_content,
+  RecordContentContext}` — the substrate-side encode/decode seams that drive
+  the codec, stamp the `EncodedRecord` metadata from substrate state, and emit
+  the §6.2/§6.3 audit events.
+- `at_rest::{validate_at_rest_install, AtRestInstallError}` — install-time
+  fail-closed check for a codec that requires a rotation oracle.
+- `read_pipeline::{ReadAuthorization, ReadPipelineStage, RecordValidation,
+  validate_record, validate_record_for_write, validate_record_for_read}` — the
+  §5.4 / §4.2 structural validation (`text`/`encodedContent` XOR + the
+  orphan-metadata rules + the `policy.audience` `mode == "list"` members rule)
+  and the sealed post-authorization witness that makes read-path validation and
+  decode a **compile-time-enforced post-auth** property.
+- Audit (§6): `UserAuditEvent::{ContentEncoded, ContentEncodeFailed,
+  ContentDecodeFailed}`, `SubstrateAuditEvent::{MalformedRecordRejected,
+  RewriteOnRotateProgress, RewriteOnRotateStarted, RewriteOnRotateTerminated}`,
+  the `RewriteOnRotateOutcome` and `MalformedRecordReason` enums, and
+  `OracleKind::Rotation`. `EVENT_SCHEMA_VERSION` 1.0.0 → 1.1.0 (additive
+  variants; schema-minor per §6.9).
+- `CodecError::NoCodecInstalled` + `CodecErrorClass::NoCodecInstalled` — an
+  **implementation-cycle gap-fill, not in the rev-6 design**: the locked design's
+  enumerated decode errors did not cover "no codec installed but the record
+  carries codec-encoded content" (cross-peer codec skew, or reading historical
+  records written before any codec was installed). `ContentDecodeFailed.codec`
+  is `Option<CodecId>` accordingly (`None` ⇒ no codec installed; `stored_codec`
+  carries the codec the record needed).
+
+### §8.3 content-codec generalization — Changed (breaking)
+
+- Renamed `RecordEncryptionResolver` → `ContentCodec`, `EncryptedRecord` →
+  `EncodedRecord`, `RecordEncryptionContext` → split `EncodeContext` +
+  `DecodeContext`, `EncryptionResolverSet` → `AtRestHooks`, `NoEncryption` →
+  `NoAtRestHooks`. `ContentCodec::encode` returns `Vec<u8>` (the substrate now
+  constructs `EncodedRecord` and stamps its metadata); `decode` no longer takes
+  a `reader`. **No deprecation aliases** — consumers rename their `impl` sites
+  and references.
+- `kryphocron-lexicons` dependency `0.2` → `0.3` (consumes the `postPrivate`
+  codec fields).
+
+### §8.3 content-codec generalization — Removed
+
+- `RecordEncryptionKeyId`, `RecordEncryptionAlgorithm`, the rev-1
+  `EncryptedRecord` / `RecordEncryptionContext`, `RecordEncryptionResolver`,
+  `EncryptionResolverSet`, `NoEncryption` (all replaced per the rename above).
 
 ### Added
 
