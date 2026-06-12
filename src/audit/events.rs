@@ -816,11 +816,16 @@ pub enum MalformedRecordReason {
     NeitherTextNorEncodedContent,
     /// `encodedContent` present without `encodedContentCodec`.
     EncodedContentWithoutCodec,
-    /// `encodedContentGeneration` present without `encodedContent`.
+    /// `encodedContentGeneration` present without `encodedContent`, and no
+    /// `text` either. The `text`-present counterpart is reported as
+    /// [`MalformedRecordReason::TextWithEncodedContentGeneration`] instead, so a
+    /// generation orphan is split across two reasons by `text` presence —
+    /// unlike the codec orphan below, which is reported uniformly.
     EncodedContentGenerationWithoutEncodedContent,
-    /// `encodedContentCodec` present without `encodedContent` (covers both
-    /// `text`-present and `text`-absent cases — the violation is the orphan
-    /// stamp).
+    /// `encodedContentCodec` present without `encodedContent`. Covers both the
+    /// `text`-present and `text`-absent cases under this single reason — the
+    /// violation is the orphan codec stamp regardless of `text`, in deliberate
+    /// contrast to the `text`-sensitive generation-orphan split above.
     EncodedContentCodecWithoutEncodedContent,
     /// `text` present together with `encodedContentGeneration` (which only
     /// applies to encoded content).

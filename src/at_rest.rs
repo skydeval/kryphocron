@@ -113,6 +113,11 @@ impl RecordContentContext {
 /// ([`CodecError::RotationStateUnavailable`]) or the codec fails. A
 /// [`UserAuditEvent::ContentEncodeFailed`] is emitted before the error returns.
 ///
+/// Audit emission at this seam is **fire-and-forget** (`let _ = sink.record(..)`):
+/// an unavailable or failing audit sink does *not* fail the encode, in contrast
+/// to the §4.3 capability-bind path where audit-unavailable is fail-closed
+/// (§4.9). See the module header for the rationale.
+///
 /// [`ContentCodec`]: crate::encryption::ContentCodec
 pub async fn encode_record_content(
     hooks: &dyn AtRestHooks,
@@ -201,6 +206,11 @@ pub async fn encode_record_content(
 ///
 /// A [`UserAuditEvent::ContentDecodeFailed`] is emitted before any error
 /// returns.
+///
+/// Audit emission at this seam is **fire-and-forget** (`let _ = sink.record(..)`):
+/// an unavailable or failing audit sink does *not* fail the decode, in contrast
+/// to the §4.3 capability-bind path where audit-unavailable is fail-closed
+/// (§4.9). See the module header for the rationale.
 ///
 /// [`ContentCodec`]: crate::encryption::ContentCodec
 pub async fn decode_record_content(

@@ -134,7 +134,10 @@ pub enum RecordValidation {
     Audience {
         /// `mode == "list"` (absent reads as `list` per the lexicon).
         mode_is_list: bool,
-        /// Whether the `members` array is present.
+        /// Whether the `members` array is present. Only consulted when
+        /// `mode_is_list` is `true` — the conditional-required rule binds
+        /// `members` to list mode only; under any non-list mode this flag
+        /// is unconstrained.
         has_members: bool,
     },
 }

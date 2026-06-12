@@ -68,6 +68,32 @@ ships as part of 0.3.0.
   `EncryptedRecord` / `RecordEncryptionContext`, `RecordEncryptionResolver`,
   `EncryptionResolverSet`, `NoEncryption` (all replaced per the rename above).
 
+### §4.3 / §4.5 audience-oracle bind wiring — Changed
+
+- `bind()` now consults the `AudienceOracle` at pipeline stage 3 for every
+  capability declaring an `AudienceOracleQuery` (`ViewPrivate`,
+  `ParticipatePrivate`, `EditPrivatePost`). A non-`InAudience` result denies the
+  bind inline at `PipelineStage::AudienceConsultation`
+  (`DenialReason::NotInAudience`, covering both `NotInAudience` and
+  `NoAudienceConfigured`); a stale audience oracle (past its
+  `data_freshness_bound`) fails closed via the `OracleStale` outcome.
+  Previously these binds did not consult the oracle, so the per-capability
+  predicates were permissive and `ReadAuthorization` — although
+  type-state-correct — carried no actual audience check. The per-capability
+  `OracleResults` audience field is now `Option<AudienceState>` (default
+  `None`); the predicate backstop fails closed on `None`, making an
+  unconsulted audience structurally unable to read as a grant. No new
+  audit-event, `DenialReason`, or `PipelineStage` variants were required.
+
+### Documentation
+
+- Clarified that the `at_rest::{encode_record_content, decode_record_content}`
+  audit emits are **fire-and-forget** (a failing or unavailable audit sink does
+  not fail the encode/decode), distinct from the §4.3 capability-bind path where
+  audit-unavailable is fail-closed; documented the `MalformedRecordReason`
+  codec-orphan vs generation-orphan reporting asymmetry; and documented that the
+  `policy.audience` `members` rule binds only under `mode == "list"`.
+
 ### Added
 
 - `build.rs` for the kryphocron crate, implementing the §5.4 post-processing
