@@ -130,13 +130,23 @@ pub enum BindOutcomeRepr {
         query: OracleQueryKind,
         /// Age of the oracle's data at the failed check.
         ///
-        /// `Duration::ZERO` is the **clock-skew sentinel**: when the
+        /// `Duration::ZERO` is the **clock-skew sentinel for the §4.3
+        /// stage-3 audience-oracle freshness check**: when the audience
         /// oracle's `last_synced_at` is future-dated (clock skew, or a
-        /// peer reporting forward time), `duration_since` cannot yield
-        /// an honest age, so the freshness check fails closed and
-        /// reports `ZERO` here rather than a misleading positive age.
-        /// An operator reading the audit log treats `sync_age == 0` on
-        /// an `OracleStale` outcome as "future-dated sync", not "fresh".
+        /// peer reporting forward time), `duration_since` cannot yield an
+        /// honest age, so the check fails closed and reports `ZERO` here
+        /// rather than a misleading positive age. An operator reading an
+        /// `OracleStale` audit entry whose `oracle` is
+        /// `OracleKind::Audience` treats `sync_age == 0` as "future-dated
+        /// sync", not "fresh".
+        ///
+        /// This is currently the only path that emits the sentinel. The
+        /// rotation-oracle freshness check (`crate::encryption`) does not
+        /// route through this outcome — it emits
+        /// `CodecError::RotationStateUnavailable`, which has no `sync_age`
+        /// field — so the convention does not span it. Any future oracle
+        /// emitter routed through this variant should either honor the same
+        /// `ZERO`-means-clock-skew convention or extend the variant shape.
         sync_age: Duration,
     },
     /// A pipeline stage denied.

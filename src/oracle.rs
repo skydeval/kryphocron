@@ -69,6 +69,18 @@ pub enum BlockState {
 }
 
 /// Audience state between a viewer and a resource (§4.5).
+///
+/// These variants describe *the oracle's answer about the resource's
+/// audience*, not *the state of the consultation itself*: they answer
+/// "what is this resource's audience with respect to this requester?", not
+/// whether the consultation was attempted, reached the oracle, or was
+/// structurally possible. A future capability that reaches an
+/// audience-denial path without an actual consultation — e.g. a
+/// non-`ResourceId` subject declaring an audience query (see the §4.3
+/// stage-3 inline-deny in `crate::authority`'s bind pipeline) — should add
+/// a variant for the no-consultation case rather than reusing
+/// `NoAudienceConfigured`. The enum is `#[non_exhaustive]` to accommodate
+/// exactly that.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudienceState {

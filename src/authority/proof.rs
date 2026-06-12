@@ -497,8 +497,16 @@ impl<C: UserCapability> UserProof<C> {
                         // surface at PipelineStage::Predicate and route around
                         // §11's forensic-stage commitment. `NoAudienceConfigured`
                         // is the morally-equivalent state: no audience could be
-                        // consulted at all. The debug_assert gives a future cap
-                        // author a debug-build panic so this path gets audited.
+                        // consulted at all. For a future capability declaring
+                        // multiple audience queries against the same
+                        // non-`ResourceId` target, this early return
+                        // short-circuits all subsequent queries for that target
+                        // — only the first query's `query` field appears in the
+                        // emitted `CapabilityIssuanceDenied`. That is the
+                        // §11-correct shape: a single deny emitted at
+                        // AudienceConsultation. The debug_assert gives a future
+                        // cap author a debug-build panic so this path gets
+                        // audited.
                         debug_assert!(
                             false,
                             "audience-declaring capability with non-ResourceId \
