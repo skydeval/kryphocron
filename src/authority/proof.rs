@@ -119,7 +119,8 @@ use core::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 use crate::authority::capability::{
-    CapabilityKind, Endpoint, ModerationCapability, SubstrateScope, UserCapability,
+    CapabilityKind, Endpoint, ModerationCapability, OracleResultsForCapability, SubstrateScope,
+    UserCapability,
 };
 use crate::authority::predicate::{BindError, BindFailureReason, DenialReason, PipelineStage};
 use crate::authority::subjects::HasResourceLocation;
@@ -153,6 +154,16 @@ enum BindFlow {
     DeniedAtPipeline {
         stage: PipelineStage,
         reason: DenialReason,
+    },
+    /// A stage-3 audience-oracle freshness commitment was past its
+    /// bound. The `CapabilityBound { outcome: OracleStale }` audit
+    /// event already emitted inside the closure (the stale outcome
+    /// has no `DenialReason`, so it is recorded as a non-success
+    /// bind outcome rather than a `CapabilityIssuanceDenied`); the
+    /// bind body surfaces [`BindError::OracleStale`] to the caller.
+    OracleStale {
+        oracle: crate::oracle::OracleKind,
+        query: crate::oracle::OracleQueryKind,
     },
 }
 
@@ -387,6 +398,7 @@ impl<C: UserCapability> UserProof<C> {
         // Sync trait objects, so a copy of the OracleSet is
         // allowed via its Copy derive).
         let oracles_block = ctx.oracles().block;
+        let oracles_audience = ctx.oracles().audience;
         let trace_id_for_predicate = trace_id;
         let attribution_ref_for_predicate = ctx.attribution_chain();
         let requester_ref_for_predicate = ctx.requester();
@@ -443,9 +455,92 @@ impl<C: UserCapability> UserProof<C> {
                     });
                 }
 
-                // Stage 5: Predicate
-                let oracle_results =
+                // Stage 3: AudienceConsultation (§4.5).
+                //
+                // Consult the audience oracle for each declared query. Only
+                // record-subject capabilities (ViewPrivate /
+                // ParticipatePrivate / EditPrivatePost) declare audience
+                // queries; for them `resource_id()` is `Some`. A non-
+                // `InAudience` result denies inline here (§11) — mirroring
+                // the stage-2 block deny — so the denial is forensically
+                // attributed to AudienceConsultation, not pushed down to the
+                // predicate. `Some(NotInAudience)` and
+                // `Some(NoAudienceConfigured)` both fail closed (Decision B).
+                // On `InAudience`, populate the result so the stage-5
+                // predicate sees `Some(InAudience)`; the predicate's `None`
+                // arm remains the type-state backstop for the structurally-
+                // impossible unconsulted case (defense in depth, not an
+                // alternative denial path). Without this stage the audience
+                // field stayed at its default and the read-authorization
+                // witness was semantically hollow.
+                //
+                // Timing: like the stage-2 block consultation above, this
+                // touches substrate-side secret state (audience
+                // membership) but runs inside the audited closure, ahead
+                // of the single §4.6 `equalize_timing` below — so its
+                // per-input latency variance is masked. The number of
+                // queries is a per-capability compile-time constant, so
+                // the call count is not data-dependent. (Block freshness
+                // is not yet checked at stage 2; that pre-existing gap is
+                // tracked separately.)
+                let mut oracle_results =
                     <<C as UserCapability>::OracleResults as Default>::default();
+                for &query in C::ORACLE_CONSULTATIONS.audience {
+                    let Some(resource) = target.resource_id() else {
+                        // A non-record subject that nonetheless declares an
+                        // audience query is a contradiction; leave the
+                        // field at its fail-closed `None` and let the
+                        // stage-5 predicate backstop deny.
+                        continue;
+                    };
+                    let sync_age = now
+                        .duration_since(oracles_audience.last_synced_at())
+                        .unwrap_or(Duration::ZERO);
+                    if sync_age > oracles_audience.data_freshness_bound() {
+                        let oracle = crate::oracle::OracleKind::Audience;
+                        let query_kind = crate::oracle::OracleQueryKind::Audience(query);
+                        let event = crate::audit::UserAuditEvent::CapabilityBound {
+                            trace_id,
+                            requester: proof_requester_did.clone(),
+                            subject_repr: subject_repr.clone(),
+                            capability: C::KIND,
+                            outcome: crate::authority::BindOutcomeRepr::OracleStale {
+                                oracle,
+                                query: query_kind,
+                                sync_age,
+                            },
+                            attribution: attribution.clone(),
+                            at: now,
+                        };
+                        scope.emit_user(event);
+                        return Ok(BindFlow::OracleStale {
+                            oracle,
+                            query: query_kind,
+                        });
+                    }
+                    let state =
+                        oracles_audience.audience_state(&proof_requester_did, resource);
+                    if !matches!(state, crate::oracle::AudienceState::InAudience) {
+                        let reason = DenialReason::NotInAudience { query, state };
+                        let event = crate::audit::UserAuditEvent::CapabilityIssuanceDenied {
+                            trace_id,
+                            requester: Requester::Did(proof_requester_did.clone()),
+                            capability: C::KIND,
+                            target_repr: subject_repr.clone(),
+                            reason: reason.clone(),
+                            attribution: attribution.clone(),
+                            at: now,
+                        };
+                        scope.emit_user(event);
+                        return Ok(BindFlow::DeniedAtPipeline {
+                            stage: PipelineStage::AudienceConsultation,
+                            reason,
+                        });
+                    }
+                    oracle_results.set_audience(query, state);
+                }
+
+                // Stage 5: Predicate
                 let predicate_ctx = crate::authority::PredicateContext::new(
                     requester_ref_for_predicate,
                     trace_id_for_predicate,
@@ -501,6 +596,9 @@ impl<C: UserCapability> UserProof<C> {
             }),
             Ok(BindFlow::DeniedAtPipeline { stage, reason }) => {
                 Err(BindError::DeniedAtPipeline { stage, reason })
+            }
+            Ok(BindFlow::OracleStale { oracle, query }) => {
+                Err(BindError::OracleStale { oracle, query })
             }
             Err(bind_err) => Err(bind_err),
         }
@@ -789,6 +887,9 @@ impl<E: Endpoint> ChannelProof<E> {
             Ok(BindFlow::DeniedAtPipeline { stage, reason }) => {
                 Err(BindError::DeniedAtPipeline { stage, reason })
             }
+            Ok(BindFlow::OracleStale { oracle, query }) => {
+                Err(BindError::OracleStale { oracle, query })
+            }
             Err(bind_err) => Err(bind_err),
         }
     }
@@ -1023,6 +1124,9 @@ impl<S: SubstrateScope> SubstrateProof<S> {
             }),
             Ok(BindFlow::DeniedAtPipeline { stage, reason }) => {
                 Err(BindError::DeniedAtPipeline { stage, reason })
+            }
+            Ok(BindFlow::OracleStale { oracle, query }) => {
+                Err(BindError::OracleStale { oracle, query })
             }
             Err(bind_err) => Err(bind_err),
         }
@@ -1382,6 +1486,9 @@ impl<C: ModerationCapability> ModerationProof<C> {
             }),
             Ok(BindFlow::DeniedAtPipeline { stage, reason }) => {
                 Err(BindError::DeniedAtPipeline { stage, reason })
+            }
+            Ok(BindFlow::OracleStale { oracle, query }) => {
+                Err(BindError::OracleStale { oracle, query })
             }
             Err(bind_err) => Err(bind_err),
         }
@@ -1908,20 +2015,48 @@ mod bind_test_fixtures {
         }
     }
 
-    pub struct NoopAudienceOracle;
-    impl AudienceOracle for NoopAudienceOracle {
+    // ---- Configurable audience oracle ----
+    //
+    // Mirrors `ConfigurableBlockOracle`: the returned `state`,
+    // `synced_at`, and `freshness_bound` are all tunable so tests can
+    // drive the §4.3 stage-3 InAudience / NotInAudience /
+    // NoAudienceConfigured / stale paths. The default
+    // (`fresh_in_audience`) affirms membership with a just-now sync,
+    // which is the success-path oracle for private binds.
+    pub struct ConfigurableAudienceOracle {
+        pub state: AudienceState,
+        pub synced_at: SystemTime,
+        pub freshness_bound: Duration,
+    }
+    impl ConfigurableAudienceOracle {
+        pub fn fresh_in_audience() -> Self {
+            ConfigurableAudienceOracle {
+                state: AudienceState::InAudience,
+                synced_at: SystemTime::now(),
+                freshness_bound: Duration::from_secs(60),
+            }
+        }
+        pub fn fresh_with_state(state: AudienceState) -> Self {
+            ConfigurableAudienceOracle {
+                state,
+                synced_at: SystemTime::now(),
+                freshness_bound: Duration::from_secs(60),
+            }
+        }
+    }
+    impl AudienceOracle for ConfigurableAudienceOracle {
         fn audience_state(
             &self,
             _: &Did,
             _: &crate::authority::ResourceId,
         ) -> AudienceState {
-            AudienceState::NoAudienceConfigured
+            self.state
         }
         fn last_synced_at(&self) -> SystemTime {
-            SystemTime::UNIX_EPOCH
+            self.synced_at
         }
         fn data_freshness_bound(&self) -> Duration {
-            Duration::from_secs(60)
+            self.freshness_bound
         }
         fn worst_case_latency_for(&self, _: AudienceOracleQuery) -> Duration {
             Duration::ZERO
@@ -1956,7 +2091,7 @@ mod bind_test_fixtures {
         pub inspection: Arc<CapturingInspection>,
         pub correlation_key: crate::identity::CorrelationKey,
         pub block: Arc<ConfigurableBlockOracle>,
-        pub audience: Arc<NoopAudienceOracle>,
+        pub audience: Arc<ConfigurableAudienceOracle>,
         pub mute: Arc<NoopMuteOracle>,
     }
 
@@ -1973,7 +2108,7 @@ mod bind_test_fixtures {
                 block: Arc::new(ConfigurableBlockOracle {
                     state: BlockState::None,
                 }),
-                audience: Arc::new(NoopAudienceOracle),
+                audience: Arc::new(ConfigurableAudienceOracle::fresh_in_audience()),
                 mute: Arc::new(NoopMuteOracle),
             }
         }
@@ -1981,6 +2116,12 @@ mod bind_test_fixtures {
         pub fn with_block_state(state: BlockState) -> Self {
             let mut f = Self::new();
             f.block = Arc::new(ConfigurableBlockOracle { state });
+            f
+        }
+
+        pub fn with_audience(audience: ConfigurableAudienceOracle) -> Self {
+            let mut f = Self::new();
+            f.audience = Arc::new(audience);
             f
         }
 
@@ -2036,8 +2177,11 @@ mod user_bind_tests {
     use crate::audit::UserAuditEvent;
     use crate::authority::v1::{ParticipatePrivate, ViewPrivate};
     use crate::authority::{issue_user, BindOutcomeRepr, CapabilityClass, CapabilityKind};
-    use crate::oracle::{BlockOracleQuery, BlockState};
-    use std::time::Duration;
+    use crate::oracle::{
+        AudienceOracleQuery, AudienceState, BlockOracleQuery, BlockState, OracleKind,
+        OracleQueryKind,
+    };
+    use std::time::{Duration, SystemTime};
 
     /// Helper: issue a UserProof<ViewPrivate> via the §4.3
     /// chokepoint so the resulting proof carries the same
@@ -2183,6 +2327,146 @@ mod user_bind_tests {
                 assert!(matches!(reason, DenialReason::Blocked { .. }));
             }
             other => panic!("expected CapabilityIssuanceDenied, got {other:?}"),
+        }
+    }
+
+    /// §4.3 stage 3 — AudienceConsultation: a requester the audience
+    /// oracle reports as `NotInAudience` is denied inline at stage 3
+    /// (§11), so the denial surfaces at `AudienceConsultation` with a
+    /// `NotInAudience` reason — mirroring the stage-2 block deny.
+    /// Before the stage-3 wiring the audience field stayed at its
+    /// fail-open default and this bind would have succeeded without
+    /// ever consulting membership.
+    #[tokio::test]
+    async fn bind_denied_when_requester_not_in_audience() {
+        let fixture =
+            BindFixture::with_audience(ConfigurableAudienceOracle::fresh_with_state(
+                AudienceState::NotInAudience,
+            ));
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+
+        let r = proof.bind(&ctx, &sample_resource_id()).await;
+        let Err(err) = r else {
+            panic!("expected Err (NotInAudience), got Ok");
+        };
+        match err {
+            BindError::DeniedAtPipeline { stage, reason } => {
+                assert_eq!(stage, PipelineStage::AudienceConsultation);
+                match reason {
+                    DenialReason::NotInAudience { query, state } => {
+                        assert_eq!(
+                            query,
+                            AudienceOracleQuery::RequesterAgainstResourceAudience
+                        );
+                        assert!(matches!(state, AudienceState::NotInAudience));
+                    }
+                    other => panic!("expected NotInAudience, got {other:?}"),
+                }
+            }
+            other => panic!("expected DeniedAtPipeline(AudienceConsultation), got {other:?}"),
+        }
+
+        let captured = fixture.user.captured();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            UserAuditEvent::CapabilityIssuanceDenied { reason, .. } => {
+                assert!(matches!(reason, DenialReason::NotInAudience { .. }));
+            }
+            other => panic!("expected CapabilityIssuanceDenied, got {other:?}"),
+        }
+    }
+
+    /// §4.5 Decision B: `NoAudienceConfigured` denies the private
+    /// capability just like `NotInAudience` — a resource with no
+    /// configured audience grants no private read. Denied inline at
+    /// stage 3, so it surfaces at `AudienceConsultation` with a
+    /// `NotInAudience` reason carrying the `NoAudienceConfigured`
+    /// state.
+    #[tokio::test]
+    async fn bind_denied_when_no_audience_configured() {
+        let fixture =
+            BindFixture::with_audience(ConfigurableAudienceOracle::fresh_with_state(
+                AudienceState::NoAudienceConfigured,
+            ));
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+
+        let r = proof.bind(&ctx, &sample_resource_id()).await;
+        let Err(err) = r else {
+            panic!("expected Err (NoAudienceConfigured), got Ok");
+        };
+        match err {
+            BindError::DeniedAtPipeline {
+                stage: PipelineStage::AudienceConsultation,
+                reason: DenialReason::NotInAudience { state, .. },
+            } => {
+                assert!(matches!(state, AudienceState::NoAudienceConfigured));
+            }
+            other => {
+                panic!("expected DeniedAtPipeline(AudienceConsultation, NotInAudience), got {other:?}")
+            }
+        }
+        assert_eq!(fixture.user.captured().len(), 1);
+    }
+
+    /// §4.3 stage 3 / §4.6: an audience oracle whose `last_synced_at`
+    /// is older than its `data_freshness_bound` fails the bind closed
+    /// with `OracleStale` rather than serving possibly-revoked
+    /// membership. The stale outcome has no `DenialReason`, so it is
+    /// recorded as `CapabilityBound { outcome: OracleStale }` (a
+    /// non-success bind outcome), and the caller sees
+    /// `BindError::OracleStale`.
+    #[tokio::test]
+    async fn bind_fails_closed_when_audience_oracle_stale() {
+        // InAudience would otherwise grant, but the ancient sync makes
+        // the oracle stale before the membership answer is trusted.
+        let fixture = BindFixture::with_audience(ConfigurableAudienceOracle {
+            state: AudienceState::InAudience,
+            synced_at: SystemTime::UNIX_EPOCH,
+            freshness_bound: Duration::from_secs(60),
+        });
+        let ctx = fixture.build_ctx(Requester::Did(sample_did()));
+        let proof = issue_view_private_for(&ctx, sample_resource_id());
+
+        let r = proof.bind(&ctx, &sample_resource_id()).await;
+        let Err(err) = r else {
+            panic!("expected Err (OracleStale), got Ok");
+        };
+        match err {
+            BindError::OracleStale { oracle, query } => {
+                assert_eq!(oracle, OracleKind::Audience);
+                assert_eq!(
+                    query,
+                    OracleQueryKind::Audience(
+                        AudienceOracleQuery::RequesterAgainstResourceAudience
+                    )
+                );
+            }
+            other => panic!("expected OracleStale, got {other:?}"),
+        }
+
+        let captured = fixture.user.captured();
+        assert_eq!(captured.len(), 1, "stale bind emits one CapabilityBound");
+        match &captured[0] {
+            UserAuditEvent::CapabilityBound { outcome, .. } => match outcome {
+                BindOutcomeRepr::OracleStale {
+                    oracle,
+                    query,
+                    sync_age,
+                } => {
+                    assert_eq!(*oracle, OracleKind::Audience);
+                    assert_eq!(
+                        *query,
+                        OracleQueryKind::Audience(
+                            AudienceOracleQuery::RequesterAgainstResourceAudience
+                        )
+                    );
+                    assert!(*sync_age > Duration::from_secs(60));
+                }
+                other => panic!("expected OracleStale outcome, got {other:?}"),
+            },
+            other => panic!("expected CapabilityBound, got {other:?}"),
         }
     }
 

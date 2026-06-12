@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use smallvec::SmallVec;
 
-use crate::oracle::{AudienceOracleQuery, BlockOracleQuery, MuteOracleQuery};
+use crate::oracle::{AudienceOracleQuery, AudienceState, BlockOracleQuery, MuteOracleQuery};
 use crate::sealed;
 
 /// Capability-class discriminator (§4.3 `CapabilityClass`).
@@ -294,7 +294,23 @@ pub struct OracleConsultations {
 /// predicate signature, which preserves the §4.3 "single source
 /// of truth" property even though v0.1 hand-writes the
 /// `*OracleResults` structs rather than macro-generating them.
-pub trait OracleResultsForCapability<C: ?Sized>: sealed::Sealed {}
+pub trait OracleResultsForCapability<C: ?Sized>: sealed::Sealed {
+    /// Record an audience-oracle result for `query` into the
+    /// capability's result struct (§4.3 stage 3).
+    ///
+    /// The bind pipeline calls this once per declared
+    /// [`AudienceOracleQuery`] after consulting the
+    /// [`crate::oracle::AudienceOracle`], moving the per-capability
+    /// audience field from its fail-closed `None` default to
+    /// `Some(state)`. The macro-generated impl writes to the field
+    /// paired with `query`; capabilities that declare no audience
+    /// queries get a total no-op body (the pipeline never calls it
+    /// for them). Keeping population behind this sealed method —
+    /// rather than a public field write — preserves the §4.3
+    /// "single source of truth" property: only the pipeline can move
+    /// a result out of its fail-closed default.
+    fn set_audience(&mut self, query: AudienceOracleQuery, state: AudienceState);
+}
 
 // ---- The four class traits ----
 
