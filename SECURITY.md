@@ -60,7 +60,12 @@ The following are in scope for security reports:
 - **Tier-classification bypass.** Any path that lets a
   private-tier value reach a public-surface emission point by
   type, or that lets `tier::visible_to` return `Visible` for a
-  combination the spec commits to `Forbidden`.
+  combination the substrate commits to `Forbidden`.
+- **Encoding-at-default bypass.** Any path that produces a
+  private-tier record via the substrate's at-rest write seam
+  (`encode_record_content`) without the installed `ContentCodec`
+  running — i.e., any reachable code path that emits plaintext
+  content where the substrate's type system promises encoding.
 - **JWT / capability-claim signature handling.** Any path that
   accepts a malformed, expired, replayed, or
   improperly-algorithm-tagged JWT or claim.
@@ -69,8 +74,14 @@ The following are in scope for security reports:
   `VerifiedSyncEstablished`.
 - **Inter-service-auth nonce handling.** Replay-window
   violations, partition-cap bypass, etc.
-- **Encryption-resolver contract violations.** Any path that
-  reaches a `produce_sensitive_representation` decision with an
+- **`ContentCodec` contract violations.** Encoding succeeds but
+  produces output the decoder rejects, codec stamp mismatches
+  between encode and decode, rotation-mark generation collisions
+  that admit cross-batch correlation, or any path that produces
+  an `EncodedRecord` whose metadata misrepresents the codec or
+  generation under which the content was produced.
+- **`AuditEncryptionResolver` contract violations.** Any path
+  that reaches a sensitive-representation decision with an
   inconsistent encryption context.
 
 The following are **out of scope**:
@@ -80,20 +91,30 @@ The following are **out of scope**:
   storage). Bugs in operator implementations of those traits are
   out of scope for kryphocron; report them to the relevant
   operator project.
-- **Timing-channel observability.** §4.6 ships coarse timing
-  equalization as a first defense, explicitly **not** a
+- **Timing-channel observability.** The substrate ships coarse
+  timing equalization as a first defense, explicitly **not** a
   constant-time discipline. Reports of "I measured timing
-  differences and could infer X" against the v0.1 timing surface
-  are expected; the README documents this disclosure (§4.6).
-  Reports of timing channels that bypass §4.6's coarse-
-  equalization commitments (e.g., the equalization stage doesn't
-  fire) are in scope.
+  differences and could infer X" against the current timing
+  surface are expected; the README documents this disclosure.
+  Reports of timing channels that bypass the coarse-equalization
+  commitments (e.g., the equalization stage doesn't fire) are in
+  scope.
+- **Laquna confidentiality.** The default `ContentCodec` (laquna)
+  is a friction-encoding primitive, not confidentiality-grade
+  encryption. Reports of the form "I decoded a laquna-encoded
+  record using the published decoder and the public seed" are
+  expected, not vulnerabilities — laquna's threat model is
+  documented explicitly in the README's Privacy posture section,
+  and the substrate's identity is friction at rest, not
+  confidentiality at rest. Reports of `ContentCodec` integrity
+  failures (covered above under in-scope) are different and are
+  in scope.
 - **Bugs in dependencies.** Report `ed25519-dalek`, `blake3`,
-  `ciborium`, `serde_json`, `tokio`, `getrandom`, etc. issues
-  upstream. If a dependency vulnerability affects kryphocron in
-  a non-obvious way (e.g., we're using an API in a way that
-  exposes a known issue), please flag the kryphocron-specific
-  exposure separately.
+  `ciborium`, `serde_json`, `tokio`, `getrandom`, `chacha20`,
+  `hkdf`, `sha2`, `zstd`, etc. issues upstream. If a dependency
+  vulnerability affects kryphocron in a non-obvious way (e.g.,
+  we're using an API in a way that exposes a known issue),
+  please flag the kryphocron-specific exposure separately.
 - **`tools.kryphocron.*` lexicon schema design.** The lexicons
   are CC0-licensed; suggestions and corrections are welcome via
   public GitHub issues on the `kryphocron-lexicons` repo (this is
@@ -102,7 +123,7 @@ The following are **out of scope**:
 ## Disclosure history
 
 Past advisories will be listed here once the project receives
-any. As of v0.1.0 there are none.
+any. None to date.
 
 Advisories will also be posted to the repository's GitHub
 security tab:
