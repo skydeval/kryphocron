@@ -248,6 +248,19 @@ ships as part of 0.3.0.
   `new(...)` constructors — realizing the design's consumer-constructible
   intent while preserving field-addition freedom.
 
+### Known limitations
+
+- `audit-serde-json` derive wiring is partial. The feature flag is structurally
+  wired and the `serde` / `serde_json` dependencies are correctly optional —
+  both `cargo build --features audit-serde-json` and `cargo build` succeed — but
+  §6.10's "every reachable type gains the `Serialize`/`Deserialize` derives"
+  goal is not fully realized. Closing it requires derive additions across
+  `crate::identity` (`ServiceIdentity`'s sealed-token `PhantomData`; `Instant`
+  fields in `BindOutcomeRepr::Expired`), `kryphocron-lexicons` (`SemVer`,
+  `Nsid`, `Did`), and downstream crates. Operators planning to consume the JSON
+  audit stream should know the derive coverage is incomplete this cycle. A
+  future enrichment closes it.
+
 ## [0.2.0] — 2026-06-02
 
 ### Added
