@@ -69,6 +69,18 @@ pub enum BlockState {
 }
 
 /// Audience state between a viewer and a resource (§4.5).
+///
+/// These variants describe *the oracle's answer about the resource's
+/// audience*, not *the state of the consultation itself*: they answer
+/// "what is this resource's audience with respect to this requester?", not
+/// whether the consultation was attempted, reached the oracle, or was
+/// structurally possible. A future capability that reaches an
+/// audience-denial path without an actual consultation — e.g. a
+/// non-`ResourceId` subject declaring an audience query (see the §4.3
+/// stage-3 inline-deny in `crate::authority`'s bind pipeline) — should add
+/// a variant for the no-consultation case rather than reusing
+/// `NoAudienceConfigured`. The enum is `#[non_exhaustive]` to accommodate
+/// exactly that.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudienceState {
@@ -144,6 +156,10 @@ pub enum OracleKind {
     Audience,
     /// Mute oracle.
     Mute,
+    /// Rotation oracle (§8.3 at-rest content-codec rotation generation).
+    /// Consulted at the encode seam rather than the bind path, but shares
+    /// the §4.5 oracle trait shape and freshness discipline.
+    Rotation,
 }
 
 /// Specific oracle query that produced a result or freshness
@@ -212,9 +228,17 @@ mod tests {
         // Pin the v1 variant set. Adding a new variant breaks the
         // exhaustive match — the test failure is the signal that
         // operator tooling parsing audit events must be updated.
-        for &k in &[OracleKind::Block, OracleKind::Audience, OracleKind::Mute] {
+        for &k in &[
+            OracleKind::Block,
+            OracleKind::Audience,
+            OracleKind::Mute,
+            OracleKind::Rotation,
+        ] {
             match k {
-                OracleKind::Block | OracleKind::Audience | OracleKind::Mute => {}
+                OracleKind::Block
+                | OracleKind::Audience
+                | OracleKind::Mute
+                | OracleKind::Rotation => {}
             }
         }
     }

@@ -32,7 +32,6 @@ use std::time::SystemTime;
 use smallvec::SmallVec;
 
 use crate::proto::Did;
-use crate::sealed;
 
 /// Cryptographically random forensic-correlation identifier.
 ///
@@ -173,7 +172,6 @@ pub struct ServiceIdentity {
     key_id: KeyId,
     key_material: PublicKey,
     rotation_evidence: Option<RotationChain>,
-    _private: core::marker::PhantomData<sealed::Token>,
 }
 
 impl ServiceIdentity {
@@ -192,8 +190,25 @@ impl ServiceIdentity {
             key_id,
             key_material,
             rotation_evidence,
-            _private: core::marker::PhantomData,
         }
+    }
+
+    /// Construct a service identity from its components.
+    ///
+    /// The primary consumer use is building an operator's **own** service
+    /// audience identity at startup, to pass as `verify_jwt`'s
+    /// `local_audience`: the receive-time audience check compares the JWT's
+    /// `aud` against this identity's [`service_did`](Self::service_did).
+    /// `rotation_evidence` is `None` for a fresh service with no prior key
+    /// rotation.
+    #[must_use]
+    pub fn new(
+        service_did: Did,
+        key_id: KeyId,
+        key_material: PublicKey,
+        rotation_evidence: Option<RotationChain>,
+    ) -> Self {
+        Self::new_internal(service_did, key_id, key_material, rotation_evidence)
     }
 
     /// Test-support constructor. Available only with the

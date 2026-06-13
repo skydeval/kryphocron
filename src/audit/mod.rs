@@ -110,9 +110,10 @@ pub use self::bounded_string::{BoundedString, BoundedStringTooLong};
 pub use self::events::{
     BatchRejectionReason, ChannelAuditEvent, ChannelCloseCause, DeprecationEventDetail,
     DerivationOutcome, FallbackAuditEvent, FallbackTrustPolicy, InvalidationSource,
-    ModerationAuditEvent, ModeratorRationale, NarrowingKind, OracleFreshnessState,
-    PayloadCompleteness, PeerOperation, PeerTrustConstraints, PeerTrustDecision,
-    RateLimitBucket, SubstrateAuditEvent, SyncPerspective, UserAuditEvent, MAX_RATIONALE_LEN,
+    MalformedRecordReason, ModerationAuditEvent, ModeratorRationale, NarrowingKind,
+    OracleFreshnessState, PayloadCompleteness, PeerOperation, PeerTrustConstraints,
+    PeerTrustDecision, RateLimitBucket, RewriteOnRotateOutcome, SubstrateAuditEvent,
+    SyncPerspective, UserAuditEvent, MAX_RATIONALE_LEN,
 };
 pub use self::rate_limit::{IssuanceRateLimiter, TokenBucket};
 pub use self::sinks::{
@@ -133,18 +134,20 @@ pub use self::sinks::{
 /// §6.7's inspection-notification set, §6.1's cross-cutting
 /// `trace_id` / `at` / [`crate::TargetRepresentation`] rules,
 /// §6.8's ordering guarantees, and §6.9's evolution discipline.
-pub const EVENT_SCHEMA_VERSION: SemVer = SemVer::new(1, 0, 0);
+pub const EVENT_SCHEMA_VERSION: SemVer = SemVer::new(1, 1, 0);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// §6.9 commits `EVENT_SCHEMA_VERSION = SemVer::new(1, 0, 0)`
-    /// for the v1 audit contract. v0.1 ships v1; bumping this
-    /// requires a coordinated crate-major bump per §6.9's
-    /// schema-major-coincides-with-crate-major rule.
+    /// §6.9: the audit-event contract is at schema `1.1.0`. The 0.3.0
+    /// cycle added §8.3 codec event variants (`ContentEncoded`,
+    /// `ContentEncodeFailed`, `ContentDecodeFailed`,
+    /// `MalformedRecordRejected`, `RewriteOnRotate{Progress,Started,Terminated}`)
+    /// — all additive on `#[non_exhaustive]` enums, hence a schema-MINOR
+    /// bump (1.0.0 -> 1.1.0), which §6.9 permits alongside a crate-minor.
     #[test]
-    fn event_schema_version_pinned_at_1_0_0() {
-        assert_eq!(EVENT_SCHEMA_VERSION, SemVer::new(1, 0, 0));
+    fn event_schema_version_pinned_at_1_1_0() {
+        assert_eq!(EVENT_SCHEMA_VERSION, SemVer::new(1, 1, 0));
     }
 }

@@ -7,12 +7,15 @@
 //! The vocabulary the kryphocron substrate uses to express its
 //! threat-model commitments in Rust types.
 //!
-//! v0.1.0 ships the substrate's authority discipline end-to-end:
-//! issuance, bind, reborrow, context derivation, tier-aware
+//! The crate ships the substrate's authority discipline
+//! end-to-end: issuance, bind (with stage-3 audience-oracle
+//! consultation), reborrow, context derivation, tier-aware
 //! visibility, audit emission with composite-rollback semantics,
 //! timing-channel equalization, JWT and capability-claim
-//! verification, the three-message sync-handshake protocol, and
-//! the encryption-hook trait surfaces.
+//! verification, and the three-message sync-handshake protocol.
+//! 0.3 adds the §8.3 at-rest content-codec seam with an
+//! encoding-at-default baseline (laquna + a default rotation
+//! oracle).
 //!
 //! This crate provides:
 //!
@@ -69,10 +72,12 @@
 //! - [`trust`] service-trust-declaration verification (§7.4).
 //! - [`resolver`] trait surfaces for DID resolution and federation-
 //!   peer trust (§7.3, §7.7).
-//! - [`encryption`] hook-trait surfaces and opaque key-id types
-//!   (§8.2, §8.3; trait surface only — v0.1 ships [`encryption::NoEncryption`]
-//!   as the default no-op resolver set, operator plug-ins fill
-//!   in real algorithm support).
+//! - [`encryption`] at-rest hook surfaces: the §8.2 audit-encryption
+//!   trait surface and opaque key-id types, plus the §8.3
+//!   [`encryption::ContentCodec`] content-codec seam. 0.3 ships
+//!   [`encryption::DefaultAtRestHooks`] — laquna ([`codec::laquna`]) +
+//!   a default rotation oracle — as the encoding-at-default baseline;
+//!   operators substitute *strengthening* codecs (rev 3 §2.1 / §5).
 //!
 //! ## Discipline
 //!
@@ -92,29 +97,32 @@
 //!   on the *binding* of a capability proof (success or
 //!   failure), not on its issuance.
 //! - **Door-open, not door-ajar.** Where the spec defers to
-//!   operator policy (encryption algorithm, oracle backends,
-//!   audit sink storage, inspection-notification queue), the
-//!   crate ships a trait surface + explicit no-op default
-//!   ([`encryption::NoEncryption`],
-//!   [`authority::NoInspectionNotifications`]); operators
-//!   install real implementations when their deployment needs
-//!   them.
+//!   operator policy (audit-encryption algorithm, oracle
+//!   backends, audit sink storage, inspection-notification
+//!   queue), the crate ships a trait surface + explicit no-op
+//!   default (e.g. [`authority::NoInspectionNotifications`]);
+//!   operators install real implementations when their
+//!   deployment needs them. The §8.3 at-rest *content codec* is
+//!   the exception — it is encoding-at-default, not door-open:
+//!   the baseline installs a real codec (rev 3 §2.1).
 //!
-//! ## v0.1 enrichment posture
+//! ## Enrichment posture
 //!
 //! The audit pipeline is wired end-to-end. Certain audit-event
-//! payload fields ship with placeholder data in v0.1 pending
-//! per-class sealed-extraction traits in v0.2 (channel-class
+//! payload fields ship with placeholder data pending per-class
+//! sealed-extraction traits in a future release (channel-class
 //! peer + session id; substrate-class scope kind; moderation-
-//! class case id); user-class oracle consultations consult only
-//! the universal block-vs-resource-owner query in v0.1
-//! (multi-query consultations land alongside a per-capability
-//! oracle-results-builder in v0.2). The
-//! [`AuthContext::derive_for`] [`ingress::NarrowCapabilities`]
-//! narrowing ships recording-only — the [`AuthContext`] gains a
-//! capabilities field in v0.2 for structural superset
-//! enforcement. [`tier::visible_to`] is tier-only in v0.1; an
-//! audience-aware overload lands in v0.2.
+//! class case id). Bind consults the universal
+//! block-vs-resource-owner query and, for audience-gated
+//! capabilities, the audience oracle (§4.5); a generalized
+//! per-capability multi-query oracle-results-builder is future
+//! work. The [`AuthContext::derive_for`]
+//! [`ingress::NarrowCapabilities`] narrowing ships recording-only
+//! — the [`AuthContext`] gains a capabilities field in a future
+//! release for structural superset enforcement.
+//! [`tier::visible_to`] is the tier-only standalone predicate; an
+//! audience-aware overload is future work (bind itself already
+//! consults the audience oracle).
 //!
 //! [`PhantomData`]: core::marker::PhantomData
 
@@ -125,6 +133,11 @@
 // `#[allow]` annotations where the type/function is part of the
 // public surface but not consumed by the crate itself yet
 // (operator-pluggable trait surfaces, future-accessor scaffolding).
+
+// The vendored laquna codec internals (`src/codec/laquna/internal/`) are
+// `no_std`-style source using `alloc::` paths. Bring `alloc` into the extern
+// prelude crate-wide so those paths resolve in the `std` crate (rev 3 §3.1).
+extern crate alloc;
 
 // Internal modules.
 mod sealed;
@@ -137,12 +150,21 @@ mod identity;
 /// the v1 capability vocabulary.
 pub mod authority;
 
+/// §8.3 at-rest content encode / decode seams driving an installed
+/// [`encryption::ContentCodec`].
+pub mod at_rest;
+
 /// §4.9 audit pipeline traits, sink types, composite-audit
 /// rollback machinery, fallback sink contract.
 pub mod audit;
 
-/// §8 encryption-hook surfaces. v1 ships only the type vocabulary
-/// and the trait shapes; no implementations.
+/// Built-in [`encryption::ContentCodec`] implementations (rev 3 §3.7).
+/// [`codec::laquna`] is the substrate's default at-rest content codec.
+pub mod codec;
+
+/// §8 at-rest hook surfaces: the §8.2 audit-encryption trait surface
+/// (type vocabulary only) and the §8.3 [`encryption::ContentCodec`]
+/// content-codec seam.
 pub mod encryption;
 
 /// §4.2 ingress submodule — constructs [`AuthContext`] values from
@@ -152,6 +174,10 @@ pub mod ingress;
 /// §4.5 oracle traits: block, audience, mute. Freshness
 /// commitments and per-query worst-case latency reporting.
 pub mod oracle;
+
+/// §5.4 / rev6 §4.2 private-record structural validation and the read-side
+/// post-authorization witness ([`read_pipeline::ReadAuthorization`]).
+pub mod read_pipeline;
 
 /// §7.3, §7.7 DID resolution and federation-peer trust trait
 /// surfaces. The crate ships trait shapes; concrete resolvers are
@@ -187,6 +213,10 @@ mod wire;
 
 // Crate-root re-exports of the load-bearing public types.
 
+pub use at_rest::{
+    decode_record_content, encode_record_content, validate_at_rest_install, AtRestInstallError,
+    RecordContentContext,
+};
 pub use audit::{
     AuditError, ChannelAuditSink, FallbackAuditSink, ModerationAuditSink, SinkKind,
     SinkPanicGuard, SubstrateAuditSink, TerminatedSinkGuard, UserAuditSink,
@@ -203,11 +233,13 @@ pub use authority::{
     SubstrateScope, UserCapability, UserProof, UserProofRef,
 };
 pub use encryption::{
-    produce_sensitive_representation, AuditEncryptionAlgorithm,
-    AuditEncryptionKeyId, AuditEncryptionResolver, EncryptedRecord,
-    EncryptionContext, EncryptionError, EncryptionResolverSet, NoEncryption,
-    RecordEncryptionAlgorithm, RecordEncryptionContext,
-    RecordEncryptionKeyId, RecordEncryptionResolver,
+    produce_sensitive_representation, resolve_rotation_generation, AtRestHooks,
+    AuditEncryptionAlgorithm, AuditEncryptionKeyId, AuditEncryptionResolver,
+    CodecError, CodecErrorClass, CodecId, CodecIdError, ContentCodec,
+    DecodeContext, DefaultAtRestHooks, DefaultAtRestHooksBuilder, EncodeContext,
+    EncodedRecord, EncryptionContext, EncryptionError, NoRotationOracle,
+    RotationContext, RotationGenerationMark, RotationOracle, MAX_CODEC_ID_LEN,
+    MAX_ROTATION_GENERATION_MARK_LEN,
 };
 pub use identity::{
     CorrelationKey, KeyId, PublicKey, RotationChain, RotationEntry,
@@ -225,6 +257,10 @@ pub use oracle::{
     MuteOracleQuery, MuteState, OracleKind, OracleQueryKind,
 };
 pub use proto::{AtUri, BlobRef, Cid, CidError, Datetime, Did, Handle, Nsid, RecordKey, Rkey, Tid, UnknownNsid};
+pub use read_pipeline::{
+    validate_record, validate_record_for_read, validate_record_for_write, ReadAuthorization,
+    ReadPipelineStage, RecordValidation,
+};
 
 // §5.3 / §5.4 / §5.6 re-exports from the lexicon companion crate.
 // The lexicon set's compiled-in registry is the substrate's
@@ -240,7 +276,7 @@ pub use target::{
 };
 pub use tier::{
     visible_to, HasNsid, MixedTier, PrivateTier, PublicTier, Tier,
-    TierWitness, Tiered, Visibility,
+    TierWitness, Tiered, Visibility, KRYPHOCRON_IMPLEMENTED_NSIDS,
 };
 pub use timing::{
     equalize_timing, equalize_timing_target_for,

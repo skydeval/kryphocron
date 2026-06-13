@@ -65,10 +65,13 @@ macro_rules! capability_marker {
         subject: $subject:ty,
         semantics: $sem:expr,
         block: [$($block_q:expr),* $(,)?],
-        audience: [$($aud_q:expr),* $(,)?],
+        // Audience queries are paired with their result field
+        // (`query => field`) so the macro can generate the §4.3
+        // stage-3 `set_audience` populate arm for each. (Block and
+        // mute keep separate `results_*` field lists below.)
+        audience: [$($aud_q:expr => $ra_field:ident),* $(,)?],
         mute: [$($mute_q:expr),* $(,)?],
         results_block: [$($rb_field:ident),* $(,)?],
-        results_audience: [$($ra_field:ident),* $(,)?],
         results_mute: [$($rm_field:ident),* $(,)?],
     ) => {
         /// User-class capability marker (§4.3).
@@ -103,8 +106,12 @@ macro_rules! capability_marker {
                 pub $rb_field: BlockState,
             )*
             $(
-                /// Audience-oracle query result.
-                pub $ra_field: AudienceState,
+                /// Audience-oracle query result. `None` until the
+                /// §4.3 stage-3 audience consultation populates it via
+                /// `set_audience`; predicates fail closed on `None`
+                /// (§4.5 fail-closed default — an unconsulted audience
+                /// is indistinguishable from a denied one).
+                pub $ra_field: Option<AudienceState>,
             )*
             $(
                 /// Mute-oracle query result.
@@ -114,16 +121,44 @@ macro_rules! capability_marker {
 
         impl sealed::Sealed for $results {}
 
-        impl OracleResultsForCapability<$marker> for $results {}
+        impl OracleResultsForCapability<$marker> for $results {
+            fn set_audience(
+                &mut self,
+                query: AudienceOracleQuery,
+                state: AudienceState,
+            ) {
+                $(
+                    if query == $aud_q {
+                        self.$ra_field = Some(state);
+                        return;
+                    }
+                )*
+                // No audience field is paired with `query` (e.g. a
+                // block-only or non-record capability). The §4.3
+                // pipeline only calls this for queries this capability
+                // declares, so this is unreachable for those binds; the
+                // no-op keeps the trait method total.
+                let _ = (query, state);
+            }
+        }
     };
 }
 
-// Default impls on the state enums power the macro-generated
-// `#[derive(Default)]` on the `*OracleResults` structs. v0.1
-// stub defaults: no block, no audience configured, no mute. These
-// match the most-permissive starting state, which is the safe
-// choice for a struct that gets *overwritten* by the §4.3 pipeline
-// before predicates see it.
+// `BlockState` / `MuteState` Default impls power the macro-generated
+// `#[derive(Default)]` on the `*OracleResults` structs for the block
+// and mute fields. Their `None`-state defaults are safe because the
+// §4.3 pipeline *overwrites* them before predicates see them (block at
+// stage 2; mute at stage 4, informational-only).
+//
+// The audience field does NOT rely on that overwrite invariant: it is
+// `Option<AudienceState>`, defaults to `None`, and predicates fail
+// closed on `None` (§4.5). This closes the fail-open hazard where a
+// bare `AudienceState` default of `NoAudienceConfigured` would have
+// been read as a real consultation result had stage 3 never run. The
+// `Default for AudienceState` impl below is consequently no longer
+// load-bearing for the macro structs (the `Option` field never calls
+// it); it is retained only as the public `AudienceState: Default`
+// surface and is never consulted on the bind path.
 
 #[allow(clippy::derivable_impls)]
 impl Default for BlockState {
@@ -150,6 +185,36 @@ impl Default for crate::oracle::MuteState {
 // User-class capabilities.
 // ============================================================
 
+/// Shared §4.5 audience-gate backstop for the private user
+/// capabilities (`ViewPrivate`, `ParticipatePrivate`,
+/// `EditPrivatePost`).
+///
+/// The *primary* audience gate is the §4.3 stage-3 consultation, which
+/// denies any non-`InAudience` result inline (surfacing at
+/// `PipelineStage::AudienceConsultation`). By the time this predicate
+/// runs, the field is therefore `Some(InAudience)` on the live path.
+/// This check is the **type-state backstop**: it binds only on a
+/// positive `InAudience` and fails closed on everything else —
+/// `Some(NotInAudience)`, `Some(NoAudienceConfigured)`, and especially
+/// `None` (the structurally-impossible "consultation never ran" case).
+/// The `Option` keeps "unconsulted" distinct from "in audience" so a
+/// missing consultation can never be read as a grant even if a future
+/// refactor were to skip stage 3. `EditPrivatePost`, the §4.3
+/// `ViewPrivate + ParticipatePrivate` composition, reduces to this
+/// same single resource-audience check.
+fn require_in_audience(
+    audience: Option<AudienceState>,
+    query: AudienceOracleQuery,
+) -> Result<(), DenialReason> {
+    match audience {
+        Some(AudienceState::InAudience) => Ok(()),
+        other => Err(DenialReason::NotInAudience {
+            query,
+            state: other.unwrap_or(AudienceState::NoAudienceConfigured),
+        }),
+    }
+}
+
 capability_marker! {
     ViewPrivate, UserCapability, ViewPrivateOracleResults,
     kind: CapabilityKind::ViewPrivate,
@@ -158,10 +223,12 @@ capability_marker! {
     subject: ResourceId,
     semantics: CapabilitySemantics::Read,
     block: [BlockOracleQuery::RequesterVsResourceOwner],
-    audience: [AudienceOracleQuery::RequesterAgainstResourceAudience],
+    audience: [
+        AudienceOracleQuery::RequesterAgainstResourceAudience
+            => audience_requester_against_resource_audience,
+    ],
     mute: [],
     results_block: [block_requester_vs_resource_owner],
-    results_audience: [audience_requester_against_resource_audience],
     results_mute: [],
 }
 
@@ -169,13 +236,12 @@ impl IssuancePolicy for ViewPrivate {
     fn capability_predicate(
         _ctx: &PredicateContext<'_>,
         _target: &ResourceId,
-        _oracle_results: &ViewPrivateOracleResults,
+        oracle_results: &ViewPrivateOracleResults,
     ) -> Result<(), DenialReason> {
-        // v0.1: permissive predicate. The bind pipeline consults
-        // the block oracle at stage 2; v0.2 adds the audience
-        // oracle and predicate-level audience/ownership
-        // refinement.
-        Ok(())
+        require_in_audience(
+            oracle_results.audience_requester_against_resource_audience,
+            AudienceOracleQuery::RequesterAgainstResourceAudience,
+        )
     }
 }
 
@@ -190,13 +256,15 @@ capability_marker! {
         BlockOracleQuery::RequesterVsResourceOwner,
         BlockOracleQuery::RequesterVsParentPostOwner,
     ],
-    audience: [AudienceOracleQuery::RequesterAgainstResourceAudience],
+    audience: [
+        AudienceOracleQuery::RequesterAgainstResourceAudience
+            => audience_requester_against_resource_audience,
+    ],
     mute: [],
     results_block: [
         block_requester_vs_resource_owner,
         block_requester_vs_parent_post_owner,
     ],
-    results_audience: [audience_requester_against_resource_audience],
     results_mute: [],
 }
 
@@ -204,9 +272,12 @@ impl IssuancePolicy for ParticipatePrivate {
     fn capability_predicate(
         _ctx: &PredicateContext<'_>,
         _target: &ResourceId,
-        _oracle_results: &ParticipatePrivateOracleResults,
+        oracle_results: &ParticipatePrivateOracleResults,
     ) -> Result<(), DenialReason> {
-        Ok(())
+        require_in_audience(
+            oracle_results.audience_requester_against_resource_audience,
+            AudienceOracleQuery::RequesterAgainstResourceAudience,
+        )
     }
 }
 
@@ -223,13 +294,15 @@ capability_marker! {
         BlockOracleQuery::RequesterVsResourceOwner,
         BlockOracleQuery::RequesterVsParentPostOwner,
     ],
-    audience: [AudienceOracleQuery::RequesterAgainstResourceAudience],
+    audience: [
+        AudienceOracleQuery::RequesterAgainstResourceAudience
+            => audience_requester_against_resource_audience,
+    ],
     mute: [],
     results_block: [
         block_requester_vs_resource_owner,
         block_requester_vs_parent_post_owner,
     ],
-    results_audience: [audience_requester_against_resource_audience],
     results_mute: [],
 }
 
@@ -237,9 +310,12 @@ impl IssuancePolicy for EditPrivatePost {
     fn capability_predicate(
         _ctx: &PredicateContext<'_>,
         _target: &ResourceId,
-        _oracle_results: &EditPrivatePostOracleResults,
+        oracle_results: &EditPrivatePostOracleResults,
     ) -> Result<(), DenialReason> {
-        Ok(())
+        require_in_audience(
+            oracle_results.audience_requester_against_resource_audience,
+            AudienceOracleQuery::RequesterAgainstResourceAudience,
+        )
     }
 }
 
@@ -254,7 +330,6 @@ capability_marker! {
     audience: [],
     mute: [],
     results_block: [block_requester_vs_resource_owner],
-    results_audience: [],
     results_mute: [],
 }
 
@@ -279,7 +354,6 @@ capability_marker! {
     audience: [],
     mute: [],
     results_block: [block_requester_vs_resource_owner],
-    results_audience: [],
     results_mute: [],
 }
 

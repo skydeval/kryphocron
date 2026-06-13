@@ -35,53 +35,134 @@ The crate ships:
   wire format with W11/W12/W13 monotonicity invariants, trust
   declarations, DID resolution, and the three-message sync
   handshake protocol.
-- **Encryption hook surfaces** — operator-pluggable
-  `AuditEncryptionResolver` and `RecordEncryptionResolver`
-  trait shapes; v1 ships the surfaces, v2+ ships the algorithm
-  variants.
+- **At-rest content codec** — private-tier record content is
+  **encoded at rest by default** via the `ContentCodec` seam
+  (§8.3), with the friction-encoding `laquna` codec shipped as
+  the built-in `DefaultAtRestHooks` baseline. Operators may
+  substitute a *strengthening* codec (authenticated encryption,
+  HSM-backed). See "Privacy posture" below.
+- **Audit-encryption hook surface** — the operator-pluggable
+  `AuditEncryptionResolver` trait shape (§8.2); the crate ships
+  the surface, operator plug-ins fill in algorithm variants.
 
 ## What it is NOT
 
 `kryphocron` deliberately does NOT ship:
 
-- Concrete encryption implementations. The trait surfaces are
-  committed; specific ciphers are operator-supplied.
-- A PDS, AppView, Graph, or any other operator substrate
+- Confidentiality-grade encryption. The default at-rest codec
+  (laquna) is *friction-encoding*, explicitly not encryption (see
+  Privacy posture); the `ContentCodec` seam accepts an
+  operator-supplied authenticated-encryption codec, but the crate
+  ships no cipher implementation of its own.
+- A PDS, AppView, or any other operator substrate
   component. Those are downstream crates that build on
   kryphocron primitives.
 - HTTP transport, TLS, or wire I/O. The crate produces and
   consumes byte arrays; operators wire up their own transports.
-- Key management, KMS integrations, or rotation orchestration.
-  The crate's `DidResolver` and encryption resolvers receive
-  key material from operator code.
+- Key management, KMS integrations, or multi-process rotation
+  coordination. The crate ships a **single-process**
+  `DefaultRotationOracle`; coordinated (DB/KMS-backed) rotation
+  is operator-supplied, and the `DidResolver` and audit-encryption
+  resolver receive key material from operator code.
 - ATProto record validation beyond what `kryphocron-lexicons`
   commits.
 
 The discipline is **door-open, not door-ajar**: where an
 implementation choice is operator policy, the crate commits a
-trait shape and leaves the implementation to operators.
+trait shape and leaves the implementation to operators. The §8.3
+at-rest *content codec* is the one principled exception — it is
+encoding-at-default, not door-open (see Privacy posture below).
+
+## Privacy posture
+
+kryphocron stores private-tier records encoded at rest by default,
+using a friction-encoding codec (laquna) shipped as part of the
+substrate. From laquna's README:
+
+> Laquna is not encryption. The decoder is in this repository, the
+> slug travels inline in every artifact, and the seed is typically
+> derived from public metadata, so any party with this code and the
+> seed can recover the plaintext. Laquna provides no confidentiality,
+> no authentication, and no resistance to a motivated adversary. Its
+> only value is friction against opportunistic, at-scale content
+> extraction.
+>
+> Laquna provides friction against opportunistic and determined human
+> adversaries. It does not defend against LLM-assisted adversaries
+> that can call the public `decode()` API directly; consumers requiring
+> resistance to LLM-assisted bulk extraction must compose Laquna with
+> additional access controls in the consuming system.
+
+Operators requiring stronger at-rest guarantees install an alternative
+`ContentCodec` via custom `AtRestHooks`. The substrate's encode/decode
+seams accept any codec implementation that satisfies the `ContentCodec`
+trait — including authenticated encryption codecs that deliver
+confidentiality and integrity. **Substitution is a strengthening path;
+configurations that opt out of encoding-at-rest (identity codecs, no-op
+encoders) are not supported. Kryphocron's identity is
+encoding-at-default — deployments configured otherwise are not
+kryphocron deployments.**
+
+Note on layered privacy: the substrate's audience-oracle wiring is the
+**authorization** layer — it gates *who can read* a record.
+Friction-encoding is the **at-rest** layer — it raises the cost of
+*unauthorized observation of repository bytes*. The two layers compose:
+audience-enforced read authorization plus friction-encoded at-rest
+storage. Neither alone is sufficient for strong privacy; together they
+form kryphocron's defense-in-depth posture.
+
+### Deployment shape and the default rotation oracle
+
+The substrate ships `DefaultRotationOracle` as part of
+`DefaultAtRestHooks` — a **single-process** rotation oracle. It uses a
+file-backed generation state at `<data_dir>/kryphocron/rotation.state`
+and is correct under deployments where exactly one kryphocron process
+touches the data dir at a time.
+
+**Multi-process deployments — including any deployment behind a load
+balancer with multiple workers, deployments with separate writer and
+reader processes, deployments with maintenance workers (compactors,
+re-encoding jobs, audit scrubbers) alongside the main service, and
+deployments using process supervisors that may briefly run two copies
+during restart — install a coordinated `RotationOracle` (DB-backed,
+KMS-backed, or otherwise process-coordinated) from day one, not "as
+they scale."** This applies regardless of user count.
+
+Records are encoded under both single- and multi-process configurations
+— encoding-at-default holds either way. What `DefaultRotationOracle`
+delivers under single-process deployment is the
+rotation-cadence-correct-over-time property; multi-process deployments
+running `DefaultRotationOracle` get encoded records but with
+process-divergent rotation state, which silently breaks the
+rewrite-on-rotate mechanism the substrate ships to refresh friction.
+Substituting a coordinated oracle restores correctness.
 
 ## Quick start
 
 ```toml
 [dependencies]
-kryphocron = "0.2"
+kryphocron = "0.3"
 ```
 
 A minimal substrate-side integration sketch:
 
 ```rust,ignore
 use kryphocron::{
-    AuditSinks, NoEncryption, OracleSet, TraceId,
+    AuditSinks, DefaultAtRestHooks, OracleSet, TraceId,
     authority::{NoInspectionNotifications, issue_user, v1::ViewPrivate},
     verification::verify_jwt,
 };
 
 // At substrate startup, install audit sinks, oracles, the DID
-// resolver, the deployment correlation key, the inspection-
-// notification queue, and (optionally) an encryption resolver set.
-let resolver_set = NoEncryption;  // v1 default; no encryption.
+// resolver, the deployment correlation key, and the inspection-
+// notification queue.
 let inspection_queue = NoInspectionNotifications;  // no-op default.
+
+// Private-tier record content is encoded at rest by default. Construct the
+// baseline at-rest hooks once at startup; the
+// `at_rest::{encode,decode}_record_content` seams drive the installed
+// `ContentCodec` (laquna by default). See "Privacy posture" below.
+let at_rest_hooks = DefaultAtRestHooks::for_data_dir(data_dir)?;
 
 // Per-request: verify a JWT, build an AuthContext.
 let trace_id = TraceId::from_bytes(/* fresh per-request */);
@@ -147,8 +228,10 @@ Five organizing principles:
 5. **Door-open, not door-ajar.** Where the spec defers a choice
    to operator policy, the crate commits the trait surface and
    leaves the implementation pluggable. Defaults are explicit
-   (e.g., `NoEncryption` for the encryption resolver set), not
-   implicit.
+   (e.g., `NoInspectionNotifications` for the inspection-
+   notification queue), not implicit. The one principled
+   exception is the §8.3 at-rest content codec, which is
+   **encoding-at-default, not door-open** (see Privacy posture).
 
 ## Status
 
@@ -161,12 +244,12 @@ Five organizing principles:
   on this?" decision.
 - **Downstream integrators** (PDS, AppView, and Graph substrate
   builders) consuming kryphocron as a dependency. The
-  wire-format and audit-event shapes are committed within 0.2.x;
+  wire-format and audit-event shapes are committed within 0.3.x;
   consumer-facing API ergonomics may evolve as integrations
   surface concrete needs.
 - **Adversarial reviewers** stress-testing the substrate's
   threat-model commitments. The crate forbids `unsafe`, denies
-  `todo!()` / `unimplemented!()`, and ships with 340+ tests
+  `todo!()` / `unimplemented!()`, and ships with 390+ tests
   pinning behavior across user, channel, substrate, and
   moderation classes plus the §4.6 timing-channel equalization
   surface.
@@ -227,10 +310,13 @@ end-to-end:
   declarations, DID resolution + rotation evidence, three-message
   sync handshake protocol, delegation receipts + chain
   rehydration.
-- **§8 encryption hook surfaces** — `AuditEncryptionResolver`,
-  `RecordEncryptionResolver` trait shapes; v1 default is
-  `NoEncryption` (no-op resolver set), operator plug-ins fill
-  in real algorithm support.
+- **§8 at-rest hook surfaces** — §8.2 `AuditEncryptionResolver`
+  trait shape (operator plug-ins fill in algorithm variants);
+  §8.3 `ContentCodec` content-codec seam with the
+  encode/decode/validate plumbing. The default baseline
+  (`DefaultAtRestHooks`) installs the built-in `laquna` codec +
+  a single-process rotation oracle — **encoding-at-default**, not
+  a no-op (see Privacy posture).
 
 ### Known limitations
 
@@ -242,7 +328,7 @@ with a programmatic signal where operators benefit from one
 below), and a public README disclosure where they don't.
 
 A few audit-event payload fields ship with placeholder data
-pending sealed per-class extraction traits in v0.3+:
+pending sealed per-class extraction traits in a future release:
 
 - Channel-class `peer ServiceIdentity` and `session_id` on
   `ChannelBound` / `ChannelReborrowFailed`.
@@ -257,20 +343,21 @@ extraction traits land. Operators consuming the audit stream branch on this
 discriminator to gate dashboards or alerting that would otherwise
 silently render placeholder data as real values.
 
-Other enrichments deferred to v0.3+:
+Other enrichments deferred to a future release:
 
-- User-class oracle consultations consult only the universal
-  block-vs-resource-owner query (multi-query
-  consultations land alongside a per-capability
-  oracle-results-builder in v0.3+).
+- User-class bind consults the universal block-vs-resource-owner
+  query and (for audience-gated capabilities) the audience
+  oracle; the generalized per-capability multi-query
+  oracle-results-builder is future work.
 - `tier::visible_to` is tier-only; an audience-aware
-  overload lands in v0.3+.
+  overload is future work (bind itself consults the audience
+  oracle, so this gap is limited to the standalone predicate).
 - Moderation-class reborrow miss is silent at the audit layer
-  (no fitting variant in v1's audit vocabulary); v0.3+ adds
-  the variant.
+  (no fitting variant in the current audit vocabulary); a
+  future release adds the variant.
 
 Wire-format-touching changes are reserved for a future minor
-cycle or the v1.0 cycle. v0.2.x patches are non-breaking only.
+cycle or the v1.0 cycle. v0.3.x patches are non-breaking only.
 
 ### Closed-namespace lexicon registry
 

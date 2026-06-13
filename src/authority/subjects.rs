@@ -53,6 +53,20 @@ pub trait HasResourceLocation: sealed::Sealed {
     /// Borrow the lexicon NSID of the resource this subject
     /// names.
     fn resource_nsid(&self) -> &Nsid;
+    /// Borrow this subject as a full [`ResourceId`] (did + nsid +
+    /// rkey) when it names a single record resource, or `None` when
+    /// the subject is not a record reference.
+    ///
+    /// The §4.3 bind pipeline's stage-3 audience consultation needs a
+    /// full `ResourceId` — the rkey identifies the specific record
+    /// whose `audienceList` governs membership, which `resource_did`
+    /// / `resource_nsid` alone cannot supply. Subjects that declare no
+    /// audience queries (e.g. `ManageAudienceSubject`,
+    /// `ModerationSubject`) keep the default `None`; `ResourceId`
+    /// overrides to `Some(self)`.
+    fn resource_id(&self) -> Option<&ResourceId> {
+        None
+    }
 }
 
 /// Parsed, canonicalized record reference (§4.4).
@@ -124,6 +138,9 @@ impl HasResourceLocation for ResourceId {
     }
     fn resource_nsid(&self) -> &Nsid {
         &self.nsid
+    }
+    fn resource_id(&self) -> Option<&ResourceId> {
+        Some(self)
     }
 }
 

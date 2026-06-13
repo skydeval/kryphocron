@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 use crate::authority::capability::CapabilityKind;
 use crate::authority::predicate::{BindFailureReason, BindOutcomeRepr, DenialReason, SemVer};
 use crate::authority::ModerationCaseId;
+use crate::encryption::{CodecErrorClass, CodecId, RotationGenerationMark};
 use crate::identity::{KeyId, ServiceIdentity, SessionDigest, SessionId, TraceId};
 use crate::ingress::{AttributionChain, Requester};
 use crate::oracle::OracleKind;
@@ -175,6 +176,85 @@ pub enum UserAuditEvent {
         composite_op_id: CompositeOpId,
         /// Which sibling sink's failure triggered the rollback.
         failing_sink: SinkKind,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// A private-tier record's content was encoded at rest by the
+    /// installed [`crate::encryption::ContentCodec`] on write. The
+    /// `codec` and `generation` are sourced from the substrate's own
+    /// state (installed codec id; freshness-checked rotation hint), not
+    /// the codec's return — authoritative by construction. Structural
+    /// subject only; no plaintext, no content bytes. §6.2.
+    ///
+    /// Emission is fire-and-forget at the substrate seam
+    /// (`let _ = sink.record(..)`): a failing or unavailable audit sink does
+    /// not block the encode, unlike the §4.3 capability-bind path where
+    /// audit-unavailable is fail-closed (§4.9).
+    ContentEncoded {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Requesting user (the writer).
+        requester: Did,
+        /// Subject representation (§4.4) — structural layer only.
+        subject_repr: TargetRepresentation,
+        /// Installed codec the content was encoded under.
+        codec: CodecId,
+        /// Rotation generation stamped on the record, if any.
+        generation: Option<RotationGenerationMark>,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// An authorized write failed at the at-rest encode seam. Emitted by
+    /// the substrate whether the failure arose in
+    /// `resolve_rotation_generation` (before the codec ran), in
+    /// substrate-side validation, or inside the codec — the codec is not
+    /// the emitter. `codec` is the installed codec id regardless of
+    /// whether the codec was reached. §6.2.
+    ///
+    /// Emission is fire-and-forget at the substrate seam
+    /// (`let _ = sink.record(..)`): a failing or unavailable audit sink does
+    /// not block the encode, unlike the §4.3 capability-bind path where
+    /// audit-unavailable is fail-closed (§4.9).
+    ContentEncodeFailed {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Requesting user (the writer).
+        requester: Did,
+        /// Subject representation (§4.4) — structural layer only.
+        subject_repr: TargetRepresentation,
+        /// Installed codec id.
+        codec: CodecId,
+        /// Coarse, plaintext-free error class.
+        error_class: CodecErrorClass,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// An authorized read failed at the at-rest decode seam (codec-id
+    /// verification or codec-internal). Emitted by the substrate, only
+    /// after authorization, so it opens no enumeration channel to
+    /// unauthorized readers. §6.2.
+    ///
+    /// Emission is fire-and-forget at the substrate seam
+    /// (`let _ = sink.record(..)`): a failing or unavailable audit sink does
+    /// not block the decode, unlike the §4.3 capability-bind path where
+    /// audit-unavailable is fail-closed (§4.9).
+    ContentDecodeFailed {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Requesting user (the reader).
+        requester: Did,
+        /// Subject representation (§4.4) — structural layer only.
+        subject_repr: TargetRepresentation,
+        /// Installed codec id. `Option` for forensic flexibility; under the
+        /// 0.3 encoding-at-default baseline a codec is always installed, so
+        /// this is `Some` on the decode-failure paths the substrate emits.
+        codec: Option<CodecId>,
+        /// Codec id read from the stored record — present on a codec mismatch
+        /// (`UnknownOrWrongCodec`, which covers cross-peer codec skew — rev 3
+        /// §6.2); `None` otherwise.
+        stored_codec: Option<CodecId>,
+        /// Coarse, plaintext-free error class.
+        error_class: CodecErrorClass,
         /// Emission wallclock (§6.1).
         at: SystemTime,
     },
@@ -648,6 +728,130 @@ pub enum SubstrateAuditEvent {
         /// Emission wallclock (§6.1).
         at: SystemTime,
     },
+    /// `validate_record` rejected a record for a structural-invariant
+    /// violation (the `text`/`encodedContent` XOR, an orphan encoded-side
+    /// stamp, or the `mode == "list"` members rule). Carries no content —
+    /// only the structural reason. At read time this is emitted after the
+    /// §4.3 audience-oracle check, so it opens no enumeration channel. §6.4.
+    ///
+    /// Emission is fire-and-forget at the substrate seam
+    /// (`let _ = sink.record(..)`): a failing or unavailable audit sink does
+    /// not block the rejection, unlike the §4.3 capability-bind path where
+    /// audit-unavailable is fail-closed (§4.9).
+    MalformedRecordRejected {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// NSID of the rejected record.
+        nsid: Nsid,
+        /// Requesting user (writer on the write path, reader on the read path).
+        requester: Did,
+        /// The structural reason for rejection.
+        reason: MalformedRecordReason,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// Periodic progress from a host rewrite-on-rotate job re-encoding
+    /// records under a new generation. The substrate commits the variant;
+    /// the emitting job is host-side. §6.5.
+    RewriteOnRotateProgress {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Service principal running the job.
+        service: ServiceIdentity,
+        /// Codec the job re-encodes under.
+        codec: CodecId,
+        /// Generation records are moving from.
+        generation_from: RotationGenerationMark,
+        /// Generation records are moving to.
+        generation_to: RotationGenerationMark,
+        /// Records processed so far.
+        records_processed: u64,
+        /// Records remaining.
+        records_remaining: u64,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// Bookend marking a rewrite-on-rotate job beginning a generation
+    /// transition. §6.6.
+    RewriteOnRotateStarted {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Service principal running the job.
+        service: ServiceIdentity,
+        /// Codec the job re-encodes under.
+        codec: CodecId,
+        /// Generation the job is advancing records to.
+        generation_target: RotationGenerationMark,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+    /// Bookend marking a rewrite-on-rotate job's terminal outcome.
+    /// Distinguishes "completed" from "died silently". §6.6.
+    RewriteOnRotateTerminated {
+        /// Forensic trace id (§6.1).
+        trace_id: TraceId,
+        /// Service principal running the job.
+        service: ServiceIdentity,
+        /// Codec the job re-encoded under.
+        codec: CodecId,
+        /// Generation the job was advancing records to.
+        generation_target: RotationGenerationMark,
+        /// Terminal outcome.
+        outcome: RewriteOnRotateOutcome,
+        /// Total records rewritten.
+        records_rewritten: u64,
+        /// Emission wallclock (§6.1).
+        at: SystemTime,
+    },
+}
+
+/// Terminal outcome of a host rewrite-on-rotate job, carried by
+/// [`SubstrateAuditEvent::RewriteOnRotateTerminated`] (§6.6).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "audit-serde-json", derive(serde::Serialize, serde::Deserialize))]
+pub enum RewriteOnRotateOutcome {
+    /// The job ran to completion.
+    Completed,
+    /// The job was aborted (operator-initiated).
+    Aborted,
+    /// The job failed host-side (storage / backend error).
+    FailedHostSide,
+}
+
+/// Structural reason a record was rejected by `validate_record`, carried by
+/// [`SubstrateAuditEvent::MalformedRecordRejected`] (§6.4).
+///
+/// The orphan-metadata family covers two axes: encoded-side stamps present
+/// without `encodedContent` at all, and encoded-side stamps orphaned onto a
+/// plaintext (`text`-bearing) record.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "audit-serde-json", derive(serde::Serialize, serde::Deserialize))]
+pub enum MalformedRecordReason {
+    /// Both `text` and `encodedContent` present (XOR violated).
+    BothTextAndEncodedContent,
+    /// Neither `text` nor `encodedContent` present (XOR violated).
+    NeitherTextNorEncodedContent,
+    /// `encodedContent` present without `encodedContentCodec`.
+    EncodedContentWithoutCodec,
+    /// `encodedContentGeneration` present without `encodedContent`, and no
+    /// `text` either. The `text`-present counterpart is reported as
+    /// [`MalformedRecordReason::TextWithEncodedContentGeneration`] instead, so a
+    /// generation orphan is split across two reasons by `text` presence —
+    /// unlike the codec orphan below, which is reported uniformly.
+    EncodedContentGenerationWithoutEncodedContent,
+    /// `encodedContentCodec` present without `encodedContent`. Covers both the
+    /// `text`-present and `text`-absent cases under this single reason — the
+    /// violation is the orphan codec stamp regardless of `text`, in deliberate
+    /// contrast to the `text`-sensitive generation-orphan split above.
+    EncodedContentCodecWithoutEncodedContent,
+    /// `text` present together with `encodedContentGeneration` (which only
+    /// applies to encoded content).
+    TextWithEncodedContentGeneration,
+    /// `policy.audience.mode == "list"` but `members` is absent (the
+    /// conditional-required members rule).
+    ListModeWithoutMembers,
 }
 
 /// Per-NSID detail of a deprecation event in
@@ -1138,7 +1342,10 @@ mod tests {
                 | UserAuditEvent::CapabilityBound { .. }
                 | UserAuditEvent::ReborrowFailed { .. }
                 | UserAuditEvent::DerivedContext { .. }
-                | UserAuditEvent::CompositeRollbackMarker { .. } => {}
+                | UserAuditEvent::CompositeRollbackMarker { .. }
+                | UserAuditEvent::ContentEncoded { .. }
+                | UserAuditEvent::ContentEncodeFailed { .. }
+                | UserAuditEvent::ContentDecodeFailed { .. } => {}
             }
         }
     }
@@ -1460,7 +1667,11 @@ mod tests {
                 | SubstrateAuditEvent::DidDocumentInvalidated { .. }
                 | SubstrateAuditEvent::PeerTrustGranted { .. }
                 | SubstrateAuditEvent::PeerTrustDenied { .. }
-                | SubstrateAuditEvent::PeerTrustUnknown { .. } => {}
+                | SubstrateAuditEvent::PeerTrustUnknown { .. }
+                | SubstrateAuditEvent::MalformedRecordRejected { .. }
+                | SubstrateAuditEvent::RewriteOnRotateProgress { .. }
+                | SubstrateAuditEvent::RewriteOnRotateStarted { .. }
+                | SubstrateAuditEvent::RewriteOnRotateTerminated { .. } => {}
             }
         }
     }
