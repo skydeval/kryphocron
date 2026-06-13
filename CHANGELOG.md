@@ -68,6 +68,67 @@ ships as part of 0.3.0.
   `EncryptedRecord` / `RecordEncryptionContext`, `RecordEncryptionResolver`,
   `EncryptionResolverSet`, `NoEncryption` (all replaced per the rename above).
 
+### default-codec arc (laquna built-in) — Added
+
+- `kryphocron::codec::laquna` module — the default `ContentCodec`
+  implementation: friction-encoding for at-rest content, vendored from
+  laquna v0.2 as the substrate's built-in default. Vendoring pulls in
+  laquna's dependency tree as direct dependencies (`chacha20`, `hkdf`,
+  `sha2`, `ruzstd`, `zstd`, `hex`; `blake3` / `getrandom` already present).
+  **`zstd` is a binding to C libzstd** (`zstd-sys`) — the one non-Rust build
+  dependency the default codec introduces.
+- `kryphocron::codec::laquna::DefaultRotationOracle` — the default
+  `RotationOracle` shipped alongside laquna for **single-process**
+  deployments. 24-hour wall-clock cadence, CSRNG slug generation,
+  lex-sortable mark format (`"laquna/{unix_secs:020}/{hex_slug}"`).
+  Construction is fallible; install-time write check at
+  `<data_dir>/kryphocron/rotation.state`. Configurable via builder.
+- `kryphocron::codec::laquna::RotationOracleConstructionError` —
+  construction-time error type for `DefaultRotationOracle` (CSRNG failure
+  and initial-persistence-write failure).
+- `encryption::DefaultAtRestHooks` + `DefaultAtRestHooksBuilder` — the new
+  baseline; installs laquna + `DefaultRotationOracle`. Constructed via
+  `for_data_dir(path)?` or `builder(path).build()?`. The builder takes the
+  `data_dir` at construction; operators not substituting `with_rotation_oracle`
+  get the same default rotation oracle as `for_data_dir(path)`. Substitution
+  via `with_codec` is restricted to **strengthening** configurations
+  (authenticated encryption, HSM-backed encryption, etc.); identity codecs and
+  weakening substitutions are not supported configurations per kryphocron's
+  identity (encoding-at-default).
+- README: privacy-posture section absorbing laquna's threat-model framing,
+  the principle-stance note on the codec/rotation surfaces, and the
+  deployment-shape constraint for `DefaultRotationOracle` (single-process;
+  multi-process deployments install a coordinated `RotationOracle` from day
+  one).
+
+### default-codec arc (laquna built-in) — Changed (breaking)
+
+- `AtRestHooks::content_codec()` returns `Arc<dyn ContentCodec>` (was
+  `Option<Arc<dyn ContentCodec>>`). The no-codec path is removed from the
+  public API; records produced via the substrate's at-rest write path are
+  never plaintext (the encoding-at-default floor).
+- `at_rest::encode_record_content` returns
+  `Result<EncodedRecord, CodecError>` (was
+  `Result<Option<EncodedRecord>, CodecError>`); the encode seam always
+  produces an encoded record.
+
+### default-codec arc (laquna built-in) — Removed
+
+- `NoAtRestHooks` (the no-op baseline the §8.3 generalization introduced
+  above). The "no codec installed" semantic no longer exists in the public
+  API; operators migrate to `DefaultAtRestHooks::for_data_dir(...)?`.
+- `CodecError::NoCodecInstalled` + `CodecErrorClass::NoCodecInstalled` (the
+  implementation-cycle gap-fill noted in §8.3 Added above). The scenario is
+  structurally impossible via the new public API; cross-codec deployment skew
+  is handled by the existing `CodecError::UnknownOrWrongCodec`.
+
+### default-codec arc (laquna built-in) — Documentation
+
+- `ContentCodec` trait rustdoc updated to remove stale "v1 ships no impl" /
+  `NoAtRestHooks` references (laquna is the default).
+- `DefaultAtRestHooksBuilder::with_codec` rustdoc carries the
+  strengthening-only floor reminder.
+
 ### §4.3 / §4.5 audience-oracle bind wiring — Changed
 
 - `bind()` now consults the `AudienceOracle` at pipeline stage 3 for every

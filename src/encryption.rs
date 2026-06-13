@@ -474,8 +474,12 @@ pub struct EncodedRecord {
 /// externally: the substrate consults the installed [`RotationOracle`] and
 /// passes the result as [`EncodeContext::current_generation_hint`].
 ///
-/// v0.1 installs no codec; with none installed, record content is stored as
-/// plaintext.
+/// kryphocron 0.3 installs laquna ([`crate::codec::laquna`]) as the default
+/// codec via [`DefaultAtRestHooks`]; `AtRestHooks::content_codec` is
+/// non-optional, so private-tier record content is always encoded at rest (the
+/// encoding-at-default floor, rev 3 §2.1). Operators substitute *strengthening*
+/// codecs (authenticated encryption, HSM-backed, …) via
+/// [`DefaultAtRestHooksBuilder::with_codec`].
 #[async_trait]
 pub trait ContentCodec: Send + Sync {
     /// Stable, operator-namespaced identifier (e.g. `"laquna/0.2"`). The

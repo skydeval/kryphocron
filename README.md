@@ -59,7 +59,73 @@ The crate ships:
 
 The discipline is **door-open, not door-ajar**: where an
 implementation choice is operator policy, the crate commits a
-trait shape and leaves the implementation to operators.
+trait shape and leaves the implementation to operators. The §8.3
+at-rest *content codec* is the one principled exception — it is
+encoding-at-default, not door-open (see Privacy posture below).
+
+## Privacy posture
+
+kryphocron stores private-tier records encoded at rest by default,
+using a friction-encoding codec (laquna) shipped as part of the
+substrate. From laquna's README:
+
+> Laquna is not encryption. The decoder is in this repository, the
+> slug travels inline in every artifact, and the seed is typically
+> derived from public metadata, so any party with this code and the
+> seed can recover the plaintext. Laquna provides no confidentiality,
+> no authentication, and no resistance to a motivated adversary. Its
+> only value is friction against opportunistic, at-scale content
+> extraction.
+>
+> Laquna provides friction against opportunistic and determined human
+> adversaries. It does not defend against LLM-assisted adversaries
+> that can call the public `decode()` API directly; consumers requiring
+> resistance to LLM-assisted bulk extraction must compose Laquna with
+> additional access controls in the consuming system.
+
+Operators requiring stronger at-rest guarantees install an alternative
+`ContentCodec` via custom `AtRestHooks`. The substrate's encode/decode
+seams accept any codec implementation that satisfies the `ContentCodec`
+trait — including authenticated encryption codecs that deliver
+confidentiality and integrity. **Substitution is a strengthening path;
+configurations that opt out of encoding-at-rest (identity codecs, no-op
+encoders) are not supported. Kryphocron's identity is
+encoding-at-default — deployments configured otherwise are not
+kryphocron deployments.**
+
+Note on layered privacy: the substrate's audience-oracle wiring is the
+**authorization** layer — it gates *who can read* a record.
+Friction-encoding is the **at-rest** layer — it raises the cost of
+*unauthorized observation of repository bytes*. The two layers compose:
+audience-enforced read authorization plus friction-encoded at-rest
+storage. Neither alone is sufficient for strong privacy; together they
+form kryphocron's defense-in-depth posture.
+
+### Deployment shape and the default rotation oracle
+
+The substrate ships `DefaultRotationOracle` as part of
+`DefaultAtRestHooks` — a **single-process** rotation oracle. It uses a
+file-backed generation state at `<data_dir>/kryphocron/rotation.state`
+and is correct under deployments where exactly one kryphocron process
+touches the data dir at a time.
+
+**Multi-process deployments — including any deployment behind a load
+balancer with multiple workers, deployments with separate writer and
+reader processes, deployments with maintenance workers (compactors,
+re-encoding jobs, audit scrubbers) alongside the main service, and
+deployments using process supervisors that may briefly run two copies
+during restart — install a coordinated `RotationOracle` (DB-backed,
+KMS-backed, or otherwise process-coordinated) from day one, not "as
+they scale."** This applies regardless of user count.
+
+Records are encoded under both single- and multi-process configurations
+— encoding-at-default holds either way. What `DefaultRotationOracle`
+delivers under single-process deployment is the
+rotation-cadence-correct-over-time property; multi-process deployments
+running `DefaultRotationOracle` get encoded records but with
+process-divergent rotation state, which silently breaks the
+rewrite-on-rotate mechanism the substrate ships to refresh friction.
+Substituting a coordinated oracle restores correctness.
 
 ## Quick start
 

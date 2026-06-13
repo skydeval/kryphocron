@@ -390,6 +390,42 @@ mod tests {
         }
     }
 
+    /// Test-only `ContentCodec` for the legacy `text`-record read path the
+    /// substrate supports for migration / federation interop (rev 3 §1.2
+    /// #1-2). `decode` returns the stored `content` (the legacy `text` bytes)
+    /// unchanged; `encode` is never exercised by the test suite.
+    ///
+    /// This is the *legacy-read* test seam — deliberately **not** named an
+    /// "identity codec": identity-codec *configuration* is forbidden by the
+    /// encoding-at-default floor (rev 3 §1.2 #4 / §5.5), whereas reading legacy
+    /// `text` records is a supported migration path. The two seams are kept
+    /// distinct by name (rev 3 §11 / R2 #5).
+    struct LegacyTextCodec;
+
+    #[async_trait]
+    impl ContentCodec for LegacyTextCodec {
+        fn codec_id(&self) -> CodecId {
+            CodecId::new("legacy-text/0.0").unwrap()
+        }
+        async fn encode(
+            &self,
+            _plaintext: &[u8],
+            _context: &EncodeContext,
+            _deadline: Instant,
+        ) -> Result<Vec<u8>, CodecError> {
+            panic!("LegacyTextCodec is decode-only (legacy text read path); encode must not be called")
+        }
+        async fn decode(
+            &self,
+            encoded: &EncodedRecord,
+            _context: &DecodeContext,
+            _deadline: Instant,
+        ) -> Result<Vec<u8>, CodecError> {
+            // Legacy `text` content is returned unchanged.
+            Ok(encoded.content.clone())
+        }
+    }
+
     struct StubOracle {
         generation: Option<RotationGenerationMark>,
         synced: SystemTime,
@@ -585,6 +621,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out, b"PLAIN");
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn decode_legacy_text_record_returns_text_unchanged() {
+        // The legacy `text`-record read path (rev 3 §1.2 #1-2): a record whose
+        // stored content is the legacy plaintext, read back through the decode
+        // seam via the `LegacyTextCodec` fixture.
+        let hooks = StubHooks {
+            codec: Arc::new(LegacyTextCodec),
+            oracle: None,
+        };
+        let sink = CapturingSink::default();
+        let record = EncodedRecord {
+            codec: CodecId::new("legacy-text/0.0").unwrap(),
+            content: b"a legacy plaintext post".to_vec(),
+            generation: None,
+        };
+        let out = decode_record_content(
+            &authz(),
+            &hooks,
+            &sink,
+            &record,
+            &ctx(),
+            deadline(),
+            SystemTime::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, b"a legacy plaintext post");
         assert!(sink.events.lock().unwrap().is_empty());
     }
 
