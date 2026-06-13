@@ -124,6 +124,31 @@ kryphocron-lexicons = "0.3"
 # enrichment.
 tokio = { version = "1", features = ["time"] }
 
+# rev 3 §3 default-codec arc: the vendored laquna v0.2.0 source
+# (`src/codec/laquna/internal/`) is the substrate's built-in at-rest content
+# codec. These are laquna's own dependencies, pulled in directly because the
+# source is vendored verbatim (no `laquna` crate dependency — §3.8). Versions
+# match laquna v0.2.0's manifest. `blake3` (extendable stream) is already a
+# direct dependency above; the rest land here.
+#
+# - chacha20: anchor-stream keystream.
+# - hkdf + sha2: per-stream keying-material derivation (HKDF-SHA256).
+# - ruzstd: pure-Rust decode-side decompressor (the `hash` feature lets the
+#   decoder verify the zstd frame content-checksum manually).
+# - zstd: encode-side compressor. NOTE: a binding to the C libzstd
+#   (`zstd-sys`) — the one non-Rust build dependency the default codec brings
+#   in. Inherent to vendoring laquna verbatim (laquna uses zstd for encode).
+chacha20 = { version = "0.9", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+ruzstd = { version = "0.7", default-features = false, features = ["hash"] }
+zstd = "0.13"
+
+# rev 3 §3.4 / §4.7: hex decode/encode for the laquna adapter's rotation-mark
+# slug parsing and the default rotation oracle's mark formatting. (Was a
+# laquna dev-dependency; a direct dependency here.)
+hex = "0.4"
+
 [dev-dependencies]
 # `trybuild` for "this should not compile" assertions on the
 # sealed surfaces.

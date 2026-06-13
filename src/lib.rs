@@ -127,6 +127,11 @@
 // public surface but not consumed by the crate itself yet
 // (operator-pluggable trait surfaces, future-accessor scaffolding).
 
+// The vendored laquna codec internals (`src/codec/laquna/internal/`) are
+// `no_std`-style source using `alloc::` paths. Bring `alloc` into the extern
+// prelude crate-wide so those paths resolve in the `std` crate (rev 3 §3.1).
+extern crate alloc;
+
 // Internal modules.
 mod sealed;
 mod proto;
@@ -145,6 +150,10 @@ pub mod at_rest;
 /// §4.9 audit pipeline traits, sink types, composite-audit
 /// rollback machinery, fallback sink contract.
 pub mod audit;
+
+/// Built-in [`encryption::ContentCodec`] implementations (rev 3 §3.7).
+/// [`codec::laquna`] is the substrate's default at-rest content codec.
+pub mod codec;
 
 /// §8 at-rest hook surfaces: the §8.2 audit-encryption trait surface
 /// (type vocabulary only) and the §8.3 [`encryption::ContentCodec`]
