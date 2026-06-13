@@ -55,7 +55,7 @@ kryphocron-lexicons = "0.3"                             # naming codegen record 
 
 [build-dependencies]
 # §5.4 post-processing reads KRYPHOCRON_LEXICON_REGISTRY (NSID -> tier) to emit
-# the per-record HasNsid impls; resolved via the [patch.crates-io] override below.
+# the per-record HasNsid impls.
 kryphocron-lexicons = "0.3"
 
 [features]
@@ -116,13 +116,3 @@ too_many_arguments = "allow"
 # (Proof families, Outcome, etc.). Function-level #[must_use] on
 # helpers returning already-must_use types is doubled; clippy
 # flags it correctly — fixes are inline.
-
-# Local 0.3.0-dev override: consume the local kryphocron-lexicons
-# skydeval/0.3.0-dev checkout (sibling on disk), which carries the
-# 0.3.0 codec-field lexicon JSONs + regenerated codegen. The
-# [dependencies] requirement above is already at "0.3", so this
-# path override simply satisfies it from the local checkout until
-# kryphocron-lexicons 0.3.0 is published to crates.io. Remove this
-# section at coordinated-ship time once 0.3.0 is published.
-[patch.crates-io]
-kryphocron-lexicons = { path = "../kryphocron-lexicons" }
