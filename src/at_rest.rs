@@ -313,6 +313,21 @@ pub enum AtRestInstallError {
         /// The codec that requires rotation.
         codec: CodecId,
     },
+    /// The installed codec declares [`ContentCodec::requires_rotation`] and a
+    /// [`RotationOracle`] *is* installed, but the oracle yields no generation
+    /// for the install-time probe ([`RotationContext::for_install_probe`]) —
+    /// e.g. [`crate::encryption::NoRotationOracle`] paired with a
+    /// rotation-requiring codec. Such a pairing would panic / fail at first
+    /// encode; the install seam fails closed here instead.
+    ///
+    /// [`ContentCodec::requires_rotation`]: crate::encryption::ContentCodec::requires_rotation
+    /// [`RotationOracle`]: crate::encryption::RotationOracle
+    /// [`RotationContext::for_install_probe`]: crate::encryption::RotationContext::for_install_probe
+    #[error("codec {codec} requires rotation, but the installed oracle yields no generation")]
+    OracleYieldsNoGeneration {
+        /// The codec that requires rotation.
+        codec: CodecId,
+    },
 }
 
 /// Install-time validation of an [`AtRestHooks`] set (rev6 §2.4 / §11 #7).
@@ -333,10 +348,28 @@ pub enum AtRestInstallError {
 /// [`RotationOracle`]: crate::encryption::RotationOracle
 pub fn validate_at_rest_install(hooks: &dyn AtRestHooks) -> Result<(), AtRestInstallError> {
     let codec = hooks.content_codec();
-    if codec.requires_rotation() && hooks.rotation_oracle().is_none() {
-        return Err(AtRestInstallError::CodecRequiresRotation {
-            codec: codec.codec_id(),
-        });
+    if codec.requires_rotation() {
+        match hooks.rotation_oracle() {
+            None => {
+                return Err(AtRestInstallError::CodecRequiresRotation {
+                    codec: codec.codec_id(),
+                });
+            }
+            Some(oracle) => {
+                // Probe presence *and* generation-yielding: an oracle that is
+                // installed but returns `None` (e.g. `NoRotationOracle`, or any
+                // oracle deterministically yielding no generation) would fail
+                // at first encode. Catch it at the diagnosable install point.
+                if oracle
+                    .current_generation(&RotationContext::for_install_probe())
+                    .is_none()
+                {
+                    return Err(AtRestInstallError::OracleYieldsNoGeneration {
+                        codec: codec.codec_id(),
+                    });
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -745,5 +778,84 @@ mod tests {
         // A codec that does not require rotation needs no oracle.
         let no_req = hooks_with(Ok(vec![]), Ok(vec![]), None);
         assert!(validate_at_rest_install(&no_req).is_ok());
+    }
+
+    fn fixup_tmp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("kryphocron-fixup-{}-{}", std::process::id(), tag))
+    }
+
+    #[test]
+    fn validate_install_rejects_norotation_oracle_with_rotating_codec() {
+        // Rotation-absent hardening: a `requires_rotation` codec (laquna) paired with an oracle
+        // that yields no generation (NoRotationOracle) is caught at install —
+        // not at first encode. `build()` here does not fail (with_rotation_oracle
+        // short-circuits the fallible default-oracle construction).
+        use crate::encryption::{DefaultAtRestHooks, NoRotationOracle};
+        let dir = fixup_tmp_dir("norotation");
+        let hooks = DefaultAtRestHooks::builder(dir.clone())
+            .with_rotation_oracle(Arc::new(NoRotationOracle))
+            .build()
+            .expect("build (no fallible inner construction)");
+        match validate_at_rest_install(&hooks) {
+            Err(AtRestInstallError::OracleYieldsNoGeneration { codec }) => {
+                assert_eq!(codec.as_str(), "laquna/0.2");
+            }
+            other => panic!("expected OracleYieldsNoGeneration, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_install_passes_for_healthy_default_oracle() {
+        // The real DefaultRotationOracle yields a generation for the probe.
+        use crate::encryption::DefaultAtRestHooks;
+        let dir = fixup_tmp_dir("healthy");
+        let hooks = DefaultAtRestHooks::for_data_dir(dir.clone()).expect("build");
+        assert!(validate_at_rest_install(&hooks).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end constitutional-claim test: encoding-at-default made executable
+    /// end-to-end — `DefaultAtRestHooks` → real laquna `Codec` + real
+    /// `DefaultRotationOracle` → `encode_record_content` →
+    /// `decode_record_content`. Asserts the emitted bytes are not the
+    /// plaintext, the substrate stamped the laquna codec id, and decode
+    /// round-trips. A regression that reintroduced any plaintext path through
+    /// the seam fails this test.
+    #[tokio::test]
+    async fn default_hooks_encode_then_decode_real_record() {
+        use crate::encryption::DefaultAtRestHooks;
+        let dir = fixup_tmp_dir("e2e");
+        let hooks = DefaultAtRestHooks::for_data_dir(dir.clone()).expect("install hooks");
+        // The install seam accepts the real baseline.
+        validate_at_rest_install(&hooks).expect("install validates");
+
+        let sink = CapturingSink::default();
+        let now = SystemTime::now();
+        let plaintext = b"this is the constitutional-claim plaintext sentinel";
+
+        let encoded = encode_record_content(&hooks, &sink, plaintext, &ctx(), deadline(), now)
+            .await
+            .expect("encode succeeds");
+
+        // Floor assertion 1: the emitted bytes are not the plaintext.
+        assert!(
+            !encoded
+                .content
+                .windows(plaintext.len())
+                .any(|w| w == plaintext),
+            "encoded bytes contain the plaintext sentinel — encoding-at-default failed"
+        );
+        // Floor assertion 2: the substrate stamped the laquna codec id.
+        assert_eq!(encoded.codec.as_str(), "laquna/0.2");
+
+        // Round-trip: decode recovers the plaintext.
+        let decoded =
+            decode_record_content(&authz(), &hooks, &sink, &encoded, &ctx(), deadline(), now)
+                .await
+                .expect("decode succeeds");
+        assert_eq!(decoded.as_slice(), plaintext.as_slice());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

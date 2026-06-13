@@ -544,6 +544,36 @@ pub struct RotationContext {
     pub audience_list: Option<AtUri>,
 }
 
+impl RotationContext {
+    /// Construct a probe context for install-time oracle validation.
+    ///
+    /// Used by [`crate::at_rest::validate_at_rest_install`] to probe the
+    /// installed [`RotationOracle`] for a `requires_rotation` codec: if the
+    /// oracle returns `None` from `current_generation()` for this context, the
+    /// codec/oracle pairing cannot encode and install fails closed
+    /// (`AtRestInstallError::OracleYieldsNoGeneration`) — rather than panicking
+    /// at first encode. Carries synthetic identity values; no audience list.
+    ///
+    /// **Operator contract for custom oracles:** an oracle whose
+    /// `current_generation()` behavior is gated on specific context fields
+    /// (per-account rotation policy, per-audience keying, …) must accept this
+    /// probe context as a well-formed smoke test — treat any well-formed
+    /// `RotationContext` as valid input and yield *some* generation, gating
+    /// per-account/per-audience behavior on real contexts at runtime. An oracle
+    /// that returns `None` for the probe is read as "cannot serve rotation,"
+    /// and install fails.
+    #[must_use]
+    pub fn for_install_probe() -> Self {
+        RotationContext {
+            originator: Did::new("did:plc:rotationinstallprobe")
+                .expect("constant probe DID is well-formed"),
+            nsid: Nsid::new("tools.kryphocron.rotation.installProbe")
+                .expect("constant probe NSID is well-formed"),
+            audience_list: None,
+        }
+    }
+}
+
 /// The deployment-wide source of the current rotation generation. A §4.5-family
 /// oracle by trait shape (sync surface, freshness discipline) — though consulted
 /// at the encode seam rather than the bind path. The substrate (not the
@@ -571,9 +601,23 @@ pub trait RotationOracle: Send + Sync {
     fn data_freshness_bound(&self) -> Duration;
 }
 
-/// Explicit "no rotation" convenience [`RotationOracle`]: returns `None` and
-/// never reads stale (its freshness bound is [`Duration::MAX`]). Installing it
-/// is equivalent to `rotation_oracle() == None`; provided for symmetry.
+/// Explicit "no rotation" convenience [`RotationOracle`]: `current_generation()`
+/// returns `None` and it never reads stale (freshness bound [`Duration::MAX`]).
+///
+/// Suitable only for codecs that declare `requires_rotation() -> false` (the
+/// codec opts out of rotation, so the `None` return is never queried for a
+/// generation).
+///
+/// **Pairing with a `requires_rotation` codec fails at install.**
+/// [`crate::at_rest::validate_at_rest_install`] probes the installed oracle with
+/// [`RotationContext::for_install_probe`]; `NoRotationOracle` returns `None`, so
+/// install returns `AtRestInstallError::OracleYieldsNoGeneration`. (This is *not*
+/// the same as `rotation_oracle() == None`, which yields the distinct
+/// `CodecRequiresRotation` — both fail closed, at the same seam.) A
+/// rotation-free deployment pairs `NoRotationOracle` with a
+/// `requires_rotation() == false` codec; a deployment using a rotation-requiring
+/// codec (e.g. the default laquna codec) installs a real rotation oracle via
+/// `DefaultAtRestHooksBuilder::with_rotation_oracle`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoRotationOracle;
 

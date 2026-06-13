@@ -101,6 +101,15 @@ ships as part of 0.3.0.
   multi-process deployments install a coordinated `RotationOracle` from day
   one).
 
+- `AtRestInstallError::OracleYieldsNoGeneration { codec }` +
+  `RotationContext::for_install_probe()` — `validate_at_rest_install` now probes
+  the installed rotation oracle (not just its presence) when the codec declares
+  `requires_rotation()`, so a rotation-requiring codec paired with an oracle
+  that yields no generation (e.g. `NoRotationOracle`) fails closed at install
+  rather than at first encode. The adapter's encode returns the existing
+  `CodecError::RotationStateUnavailable` (not a panic) if a healthy-at-install
+  oracle later returns no generation (runtime transient).
+
 ### default-codec arc (laquna built-in) — Changed (breaking)
 
 - `AtRestHooks::content_codec()` returns `Arc<dyn ContentCodec>` (was

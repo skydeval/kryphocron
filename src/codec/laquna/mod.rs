@@ -208,16 +208,21 @@ impl ContentCodec for Codec {
         );
 
         // The rotation generation is sourced by the substrate from the
-        // installed oracle and already freshness-checked. Under
-        // `DefaultAtRestHooks` the install seam guarantees a rotation oracle is
-        // present (laquna `requires_rotation() -> true` + the rev 6.1 §11 item
-        // 8 install check), so the hint is `Some` here. A `None` means an
-        // operator constructed hooks bypassing the install seam — unsupported.
-        let mark = context.current_generation_hint.as_ref().expect(
-            "substrate invariant: rotation oracle must be installed \
-             (install-seam check enforces this for codecs declaring \
-             requires_rotation -> true)",
-        );
+        // installed oracle and already freshness-checked. The install seam
+        // (`validate_at_rest_install`) probes that the oracle yields a
+        // generation, so under a validated install the hint is `Some`. A `None`
+        // here is the runtime-transient case (an oracle healthy at install
+        // returns `None` later — backend unavailability, cold cache, rate
+        // limit): return a clean, fail-closed error rather than panicking.
+        let mark = context.current_generation_hint.as_ref().ok_or_else(|| {
+            CodecError::RotationStateUnavailable {
+                codec: self.codec_id(),
+            }
+        })?;
+        // A mark that fails to parse, by contrast, is a deliberate operator
+        // configuration error — pairing laquna's codec with an oracle that
+        // emits a non-laquna mark format (§4.7) — not a runtime transient.
+        // That stays a substrate-invariant panic.
         let slug = parse_slug_from_mark(mark).expect(
             "substrate invariant: rotation mark must match the default \
              oracle's format (§4.7)",
@@ -666,6 +671,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CodecError::Malformed { .. }));
+    }
+
+    /// Rotation-absent runtime-transient case: an oracle healthy at install returns
+    /// `None` later, so the encode-time `current_generation_hint` is `None`.
+    /// The adapter returns a clean fail-closed `RotationStateUnavailable`
+    /// rather than panicking.
+    #[tokio::test]
+    async fn encode_returns_rotation_unavailable_on_none_hint() {
+        let codec = Codec::default();
+        let ctx = EncodeContext {
+            nsid: Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+            rkey: RecordKey::new("3kabcdefghij2").unwrap(),
+            originator: Did::new("did:plc:exampleexampleexample").unwrap(),
+            audience_list: None,
+            current_generation_hint: None,
+            trace_id: TraceId::from_bytes([0xAB; 16]),
+            operator_context: Default::default(),
+        };
+        let err = codec.encode(b"x", &ctx, Instant::now()).await.unwrap_err();
+        assert!(matches!(err, CodecError::RotationStateUnavailable { .. }));
     }
 
     #[test]
