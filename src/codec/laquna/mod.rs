@@ -20,16 +20,22 @@
 //! trait, deriving the per-record seed from the record-identity tuple and
 //! recovering the rotation slug from the rotation oracle's generation mark.
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
 use crate::encryption::{
     CodecError, CodecId, ContentCodec, DecodeContext, EncodeContext, EncodedRecord,
-    RotationGenerationMark,
+    RotationContext, RotationGenerationMark, RotationOracle,
 };
 use crate::proto::{Did, Nsid, RecordKey};
+
+/// Default rotation cadence: 24-hour wall-clock (rev 3 §4.2).
+const DEFAULT_CADENCE: Duration = Duration::from_secs(86_400);
 
 mod internal;
 pub use internal::DecodeError;
@@ -256,6 +262,324 @@ impl ContentCodec for Codec {
     }
 }
 
+// ===========================================================================
+// DefaultRotationOracle (rev 3 §4) — the single-process starter rotation
+// oracle shipped with the laquna default codec.
+// ===========================================================================
+
+/// Error returned when [`DefaultRotationOracle`] construction fails.
+///
+/// A *construction-time* error, distinct from the runtime behavior the oracle
+/// exposes through the [`RotationOracle`] trait during operation. The two
+/// cases are a CSRNG failure (no initial slug could be generated) and an
+/// install-time persistence-write failure (the write check at
+/// `<data_dir>/kryphocron/rotation.state` failed). Surfacing the latter at
+/// construction lets operators see a misconfigured data directory at the
+/// diagnosable install point rather than at the first runtime rotation
+/// (rev 3 §4.5 / §4.7). This is the only new public type the default-codec
+/// arc introduces (rev 3 §10).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RotationOracleConstructionError {
+    /// The CSRNG returned an error during initial slug generation.
+    #[error("CSRNG failed during initial rotation-slug generation: {0}")]
+    CsrngFailed(getrandom::Error),
+    /// The install-time write check at `<data_dir>/kryphocron/rotation.state`
+    /// failed (e.g. a non-writable data directory).
+    #[error("install-time rotation-state write failed at {path}: {source}")]
+    InitialPersistenceFailed {
+        /// The persistence path the write was attempted at.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: io::Error,
+    },
+}
+
+/// The current rotation slug and the wall-clock instant it was generated.
+struct RotationState {
+    current_slug: [u8; 32],
+    generated_at: SystemTime,
+}
+
+/// A request to persist a rotation state, dispatched to the background
+/// persistence worker on rotation (rev 3 §4.6).
+struct PersistRequest {
+    slug: [u8; 32],
+    generated_at: SystemTime,
+}
+
+/// The default [`RotationOracle`] for kryphocron's built-in laquna codec
+/// (rev 3 §4).
+///
+/// **Single-process deployments only** (rev 3 §4.1). The slug + its generation
+/// timestamp live in-memory behind an `RwLock` and are persisted to
+/// `<data_dir>/kryphocron/rotation.state`; the in-memory state is the
+/// authoritative source, so this oracle is never stale relative to external
+/// storage (its [`data_freshness_bound`](RotationOracle::data_freshness_bound)
+/// is [`Duration::MAX`]). Multi-process deployments — anything behind a load
+/// balancer, with separate writer/reader processes, or with maintenance
+/// workers — substitute a coordinated `RotationOracle` (DB-backed, KMS-backed,
+/// etc.) from day one to keep rotation cadence correct across processes.
+///
+/// Rotation is wall-clock: a fresh CSRNG slug is generated when the configured
+/// cadence (default 24h) elapses past the current slug's generation time.
+/// Rotation does the in-memory swap synchronously and dispatches the file
+/// write to a background thread (rev 3 §4.6), so a slow filesystem does not
+/// stall encode calls.
+pub struct DefaultRotationOracle {
+    state: Arc<RwLock<RotationState>>,
+    cadence: Duration,
+    persist_tx: mpsc::Sender<PersistRequest>,
+}
+
+impl DefaultRotationOracle {
+    /// Construct with the default 24-hour wall-clock cadence, persisting to
+    /// `<data_dir>/kryphocron/rotation.state`.
+    ///
+    /// Performs an install-time write check at the persistence path, so a
+    /// misconfigured data directory surfaces here rather than at the first
+    /// runtime rotation.
+    ///
+    /// # Errors
+    ///
+    /// [`RotationOracleConstructionError`] on CSRNG failure or install-time
+    /// persistence-write failure.
+    pub fn for_data_dir(data_dir: PathBuf) -> Result<Self, RotationOracleConstructionError> {
+        Self::construct(default_state_path(&data_dir), DEFAULT_CADENCE)
+    }
+
+    /// Builder for operators tuning cadence, persistence path, or both.
+    #[must_use]
+    pub fn builder() -> DefaultRotationOracleBuilder {
+        DefaultRotationOracleBuilder {
+            cadence: DEFAULT_CADENCE,
+            persistence_path: None,
+        }
+    }
+
+    fn construct(
+        persistence_path: PathBuf,
+        cadence: Duration,
+    ) -> Result<Self, RotationOracleConstructionError> {
+        let now = SystemTime::now();
+
+        // Restart behavior (§4.4): load existing state if present + parseable +
+        // still within cadence; otherwise generate a fresh slug.
+        let state = match read_state_file(&persistence_path) {
+            Some(loaded)
+                if now
+                    .duration_since(loaded.generated_at)
+                    .map(|age| age < cadence)
+                    .unwrap_or(false) =>
+            {
+                loaded
+            }
+            _ => RotationState {
+                current_slug: generate_slug()
+                    .map_err(RotationOracleConstructionError::CsrngFailed)?,
+                generated_at: now,
+            },
+        };
+
+        // Install-time write check (§4.5 / §4.7 R2 #9).
+        write_state_file(&persistence_path, &state).map_err(|source| {
+            RotationOracleConstructionError::InitialPersistenceFailed {
+                path: persistence_path.clone(),
+                source,
+            }
+        })?;
+
+        // Background persistence worker (§4.6): runtime rotation writes are
+        // dispatched here so a slow fsync never stalls an encode. Best-effort —
+        // transient write failures are tolerated (the install-time check above
+        // catches persistent misconfig; restart behavior (§4.4) handles a
+        // crash mid-write). The worker exits when the oracle drops (the sender
+        // disconnects).
+        let (persist_tx, persist_rx) = mpsc::channel::<PersistRequest>();
+        let worker_path = persistence_path;
+        std::thread::spawn(move || {
+            while let Ok(req) = persist_rx.recv() {
+                let snapshot = RotationState {
+                    current_slug: req.slug,
+                    generated_at: req.generated_at,
+                };
+                let _ = write_state_file(&worker_path, &snapshot);
+            }
+        });
+
+        Ok(Self {
+            state: Arc::new(RwLock::new(state)),
+            cadence,
+            persist_tx,
+        })
+    }
+}
+
+/// Builder for [`DefaultRotationOracle`] (rev 3 §4.5).
+pub struct DefaultRotationOracleBuilder {
+    cadence: Duration,
+    persistence_path: Option<PathBuf>,
+}
+
+impl DefaultRotationOracleBuilder {
+    /// Set the rotation cadence (default 24h).
+    #[must_use]
+    pub fn cadence(mut self, cadence: Duration) -> Self {
+        self.cadence = cadence;
+        self
+    }
+
+    /// Set the persistence path (e.g. `data_dir.join("kryphocron/rotation.state")`).
+    /// Required — `build()` fails if unset.
+    #[must_use]
+    pub fn persistence_path(mut self, path: PathBuf) -> Self {
+        self.persistence_path = Some(path);
+        self
+    }
+
+    /// Build the oracle.
+    ///
+    /// # Errors
+    ///
+    /// [`RotationOracleConstructionError`] on CSRNG failure, install-time
+    /// persistence-write failure, or if `persistence_path` was never set
+    /// (reported as `InitialPersistenceFailed` with an empty path — the
+    /// builder has no `data_dir` to default it from, unlike
+    /// [`DefaultRotationOracle::for_data_dir`]).
+    pub fn build(self) -> Result<DefaultRotationOracle, RotationOracleConstructionError> {
+        let path = self.persistence_path.ok_or_else(|| {
+            RotationOracleConstructionError::InitialPersistenceFailed {
+                path: PathBuf::new(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "persistence_path must be set on DefaultRotationOracle::builder()",
+                ),
+            }
+        })?;
+        DefaultRotationOracle::construct(path, self.cadence)
+    }
+}
+
+impl RotationOracle for DefaultRotationOracle {
+    fn current_generation(&self, _ctx: &RotationContext) -> Option<RotationGenerationMark> {
+        let now = SystemTime::now();
+
+        // Fast path: read-lock; if the current slug is within cadence, serve it.
+        {
+            let st = self.state.read().expect("rotation state lock not poisoned");
+            let fresh = now
+                .duration_since(st.generated_at)
+                .map(|age| age < self.cadence)
+                .unwrap_or(false);
+            if fresh {
+                return Some(format_mark(st.generated_at, &st.current_slug));
+            }
+        }
+
+        // Rotation path: write-lock + double-check (another thread may have
+        // rotated between the read and write locks).
+        let mut st = self.state.write().expect("rotation state lock not poisoned");
+        let still_stale = now
+            .duration_since(st.generated_at)
+            .map(|age| age >= self.cadence)
+            .unwrap_or(true);
+        if still_stale {
+            match generate_slug() {
+                Ok(slug) => {
+                    st.current_slug = slug;
+                    st.generated_at = now;
+                    // Dispatch the persist to the background worker (best-effort).
+                    let _ = self.persist_tx.send(PersistRequest {
+                        slug,
+                        generated_at: now,
+                    });
+                }
+                Err(_) => {
+                    // Runtime CSRNG failure (rare/transient): keep the current
+                    // slug rather than fail the encode. The next query retries.
+                }
+            }
+        }
+        Some(format_mark(st.generated_at, &st.current_slug))
+    }
+
+    fn last_synced_at(&self) -> SystemTime {
+        // The in-memory state is authoritative; report when the current slug
+        // was generated (always in the past). Paired with a `Duration::MAX`
+        // freshness bound, the §4.6 freshness check never trips for this
+        // single-process oracle.
+        self.state
+            .read()
+            .expect("rotation state lock not poisoned")
+            .generated_at
+    }
+
+    fn data_freshness_bound(&self) -> Duration {
+        // Single-process authoritative oracle: never stale relative to external
+        // storage (mirrors `NoRotationOracle`). Multi-process deployments
+        // substitute a coordinated oracle with a real freshness bound.
+        Duration::MAX
+    }
+}
+
+/// `<data_dir>/kryphocron/rotation.state` (rev 3 §4.4).
+fn default_state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("kryphocron").join("rotation.state")
+}
+
+/// Generate a fresh 32-byte slug from the OS CSRNG (rev 3 §4.3).
+fn generate_slug() -> Result<[u8; 32], getrandom::Error> {
+    let mut slug = [0u8; 32];
+    getrandom::getrandom(&mut slug)?;
+    Ok(slug)
+}
+
+/// Format the lex-sortable rotation mark (rev 3 §4.7):
+/// `"laquna/{:020}/{hex64}"` — 92 chars, within `BoundedString<128>`.
+fn format_mark(generated_at: SystemTime, slug: &[u8; 32]) -> RotationGenerationMark {
+    let unix_secs = generated_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    RotationGenerationMark::new(format!("laquna/{:020}/{}", unix_secs, hex::encode(slug)))
+        .expect("rotation mark (92 bytes) fits BoundedString<128>")
+}
+
+/// Read persisted rotation state. Returns `None` on any failure (missing,
+/// unreadable, or unparseable) — the caller then starts a fresh batch (§4.4).
+fn read_state_file(path: &Path) -> Option<RotationState> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut lines = contents.lines();
+    let secs: u64 = lines.next()?.trim().parse().ok()?;
+    let hex_slug = lines.next()?.trim();
+    if hex_slug.len() != 64 {
+        return None;
+    }
+    let mut slug = [0u8; 32];
+    hex::decode_to_slice(hex_slug, &mut slug).ok()?;
+    Some(RotationState {
+        current_slug: slug,
+        generated_at: UNIX_EPOCH + Duration::from_secs(secs),
+    })
+}
+
+/// Persist rotation state as two lines: `<unix_secs>\n<hex_slug>\n`, creating
+/// the parent directory if needed.
+fn write_state_file(path: &Path, state: &RotationState) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let secs = state
+        .generated_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    std::fs::write(
+        path,
+        format!("{}\n{}\n", secs, hex::encode(state.current_slug)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +676,113 @@ mod tests {
     #[test]
     fn requires_rotation_is_true() {
         assert!(Codec::default().requires_rotation());
+    }
+
+    // ---- DefaultRotationOracle (rev 3 §4) ----
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_tmp_dir() -> PathBuf {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("kryphocron-rot-{}-{}", std::process::id(), n))
+    }
+
+    fn rot_ctx() -> RotationContext {
+        RotationContext {
+            originator: Did::new("did:plc:exampleexampleexample").unwrap(),
+            nsid: Nsid::new("tools.kryphocron.feed.postPrivate").unwrap(),
+            audience_list: None,
+        }
+    }
+
+    #[test]
+    fn oracle_for_data_dir_constructs_and_serves_mark() {
+        let dir = unique_tmp_dir();
+        let oracle = DefaultRotationOracle::for_data_dir(dir.clone()).expect("construct");
+        let mark = oracle.current_generation(&rot_ctx()).expect("serves a mark");
+        assert!(mark.as_str().starts_with("laquna/"), "mark uses the §4.7 format");
+        assert!(
+            dir.join("kryphocron").join("rotation.state").exists(),
+            "install-time write created the state file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oracle_construction_fails_install_time_on_unwritable_path() {
+        // A data_dir that is actually a FILE: create_dir_all of the
+        // `<file>/kryphocron` subpath fails (ENOTDIR) at the install-time check.
+        let file_as_dir = unique_tmp_dir();
+        std::fs::write(&file_as_dir, b"i am a file, not a directory").unwrap();
+        let result = DefaultRotationOracle::for_data_dir(file_as_dir.clone());
+        assert!(matches!(
+            result,
+            Err(RotationOracleConstructionError::InitialPersistenceFailed { .. })
+        ));
+        let _ = std::fs::remove_file(&file_as_dir);
+    }
+
+    #[test]
+    fn oracle_restart_preserves_slug_within_cadence() {
+        let dir = unique_tmp_dir();
+        let m1 = {
+            let o1 = DefaultRotationOracle::for_data_dir(dir.clone()).unwrap();
+            o1.current_generation(&rot_ctx()).unwrap()
+        };
+        // Reconstruct against the same dir; cadence (24h) has not elapsed.
+        let o2 = DefaultRotationOracle::for_data_dir(dir.clone()).unwrap();
+        let m2 = o2.current_generation(&rot_ctx()).unwrap();
+        assert_eq!(m1, m2, "restart within cadence preserves slug + generation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oracle_restart_rotates_when_state_stale() {
+        let dir = unique_tmp_dir();
+        let state_path = dir.join("kryphocron").join("rotation.state");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        // Seed a stale state file dated at the unix epoch (1970 ≫ cadence ago).
+        std::fs::write(&state_path, format!("0\n{}\n", hex::encode([0x11u8; 32]))).unwrap();
+        let stale_mark = format_mark(UNIX_EPOCH, &[0x11u8; 32]);
+
+        let oracle = DefaultRotationOracle::for_data_dir(dir.clone()).unwrap();
+        let mark = oracle.current_generation(&rot_ctx()).unwrap();
+        assert_ne!(mark, stale_mark, "stale on-disk state rotates to a fresh slug");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_format_is_lex_sortable() {
+        let slug = [0xABu8; 32];
+        let m1 = format_mark(UNIX_EPOCH + Duration::from_secs(1_000_000), &slug);
+        let m2 = format_mark(UNIX_EPOCH + Duration::from_secs(2_000_000), &slug);
+        assert!(
+            m1.as_str() < m2.as_str(),
+            "earlier generation lex-sorts before later (rev 3 §4.7)"
+        );
+        assert_eq!(m1.as_str().len(), 92, "mark is 92 chars (within BoundedString<128>)");
+    }
+
+    #[test]
+    fn builder_requires_persistence_path() {
+        let result = DefaultRotationOracle::builder().build();
+        assert!(matches!(
+            result,
+            Err(RotationOracleConstructionError::InitialPersistenceFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn builder_custom_cadence_constructs() {
+        let dir = unique_tmp_dir();
+        let oracle = DefaultRotationOracle::builder()
+            .cadence(Duration::from_secs(3600))
+            .persistence_path(dir.join("kryphocron").join("rotation.state"))
+            .build()
+            .unwrap();
+        assert!(oracle.current_generation(&rot_ctx()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
