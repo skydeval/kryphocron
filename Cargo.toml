@@ -22,190 +22,61 @@ name = "kryphocron"
 path = "src/lib.rs"
 
 [dependencies]
-# §9.5 trait-async dependency. Used by the §7 resolver and §8
-# encryption-hook trait surfaces. v0.1 ships trait shapes only;
-# concrete resolver / encryption impls are operator-supplied.
-async-trait = "0.1"
+# See docs/internal/DEPENDENCIES.md for pinning discipline rationale.
+# Correctness-critical deps are tilde-pinned (patch-updates-only); a silent
+# minor bump on any of them could shift a wire-format- or correctness-deciding
+# behavior, so version moves must be explicit Cargo.toml edits.
+async-trait = "0.1"                 # async trait surfaces (§7 resolver, §8 hooks)
+smallvec = "1.13"                   # bounded inline vectors (capabilities, chains, scopes)
+thiserror = "2"                     # structured error derivation across §4 enums
+ed25519-dalek = "~2.2"              # JWT signature verification per §7.2 (Ed25519 default)
+base64 = "~0.22"                    # base64url JWT segment decoding (§7.2)
+serde_json = "1"                    # JSON parsing on the §7.2 JWT verification path
+ciborium = "~0.2"                   # canonical CBOR for the §4.8 capability-claim wire format
+blake3 = "~1.8"                     # keyed hash: session-id derivation + correlation (§4.4/§7.5)
+getrandom = "~0.2"                  # OS CSPRNG for session-key generation + handshake entropy (§7.5)
+kryphocron-lexicons = "0.3"         # §5 lexicons, codegen types, build-time tier registry
+tokio = { version = "1", features = ["time"] }  # §4.6 timing-equalization sleep primitive
 
-# §9.5 small-vector optimization. Used in capability sets,
-# attribution chains, scope vectors, JWT scope vectors, and the
-# §4.2 AttributionChain entries (replacing the spec's ArrayVec
-# reference; bounded depth is runtime-enforced by the crate's
-# constructors).
-smallvec = "1.13"
-
-# §9.5 structured error derivation. Used across §4 error enums.
-thiserror = "2"
-
-# §9.5 / §7.2 Ed25519 signature verification. Wired into the
-# JWT verification chain; the v1 algorithm allowlist defaults
-# to Ed25519-only per §7.2's conservative-default discipline.
-# ECDSA variants (ES256/ES256K) are operator opt-in and
-# currently stub with `UnsupportedAlgorithm` (v0.2+ feature
-# gate).
-#
-# v0.1 polish: tilde-pinned at the current resolved minor
-# (`~2.2`, patch-updates-only). Signature-verification correctness
-# is the highest-stakes correctness surface in the crate; minor
-# bumps must be explicit Cargo.toml edits, not silent transitive
-# resolution drifts.
-ed25519-dalek = "~2.2"
-
-# §7.2 / §9.5 base64url decoding for JWT segment parsing.
-# Originally pinned to 0.22 to align with proto-blue's lexicon
-# parsing (one major version across the dep tree). v0.1 polish:
-# tightened to tilde (`~0.22`) for canonical-encoding stability —
-# accidental minor bumps in a foundational primitives crate must
-# require an explicit Cargo.toml edit. For 0.x crates this is
-# functionally equivalent to a bare `0.22` (cargo treats minor as
-# breaking), but the tilde marks the pin as discipline-managed.
-base64 = "~0.22"
-
-# §7.2 / §9.5 JSON parsing for JWT headers and payloads.
-# Unconditional dependency because the verification path needs
-# JSON parsing on every authenticated request. The
-# `audit-serde-json` feature retains its `dep:serde` activation
-# for the optional `Serialize`/`Deserialize` derives on audit
-# events.
-serde_json = "1"
-
-# §4.8 / §7.6 / §9.5 deterministic CBOR encoding for the
-# capability-claim wire format. Uses ciborium's `Value` tree
-# as the building block and a project-internal canonicalizer
-# (RFC 8949 §4.2.1 length-then-bytewise map-key sort) to produce
-# round-trip-stable signatures. Originally pinned to 0.2 to align
-# with proto-blue's lexicon parsing transitive tree. v0.1 polish:
-# tightened to tilde (`~0.2`) — canonical-CBOR output is the
-# wire-format-deciding encoder for signed capability claims; a
-# silent minor bump that altered map-key ordering or tag rendering
-# would invalidate every signature ever produced under the prior
-# encoding.
-ciborium = "~0.2"
-
-# §4.4 / §7.5 / §9.5 keyed Blake3 for session-id derivation
-# (`SubstrateSessionDerivationKey`-keyed over `nonce || entropy`)
-# and session-digest correlation (`CorrelationKey`-keyed over
-# the session id, §4.4). Both call sites are wired in v0.1.
-#
-# v0.1 polish: tilde-pinned at the current resolved minor
-# (`~1.8`, patch-updates-only). Session-digest correlation depends
-# on stable keyed-hash output across versions; minor bumps require
-# explicit Cargo.toml edits.
-blake3 = "~1.8"
-
-# §7.5 / §9.5 OS CSPRNG access for
-# `SubstrateSessionDerivationKey::generate` and the responder-side
-# `responder_entropy` produced fresh per handshake. Already in the
-# transitive dep tree (via ed25519-dalek's rand_core); promoted to
-# a direct dep so the surface is explicit and pinned at the major
-# version we depend on. Originally pinned to 0.2 to align with
-# proto-blue's lexicon parsing transitive tree. v0.1 polish:
-# tightened to tilde (`~0.2`) — CSPRNG access is correctness-
-# critical for unforgeable session derivation; a silent minor bump
-# changing the OS entropy contract is the kind of surface a
-# foundational primitives crate must not silently inherit.
-getrandom = "~0.2"
-
-# §5 lexicon strategy: the companion crate ships the v1
-# lexicons, the codegen-produced Rust types, and the build-time
-# three-way-consistency-checked registry. The kryphocron crate
-# consumes it for `Tier`, `Visibility`, `UnknownNsid`, `SemVer`,
-# `DeprecationState`, `LexiconRegistryEntry`,
-# `KRYPHOCRON_LEXICON_REGISTRY`, and the validated AT-Protocol
-# identifier types (`Did`, `Nsid`, `RecordKey`, `AtUri`, `Cid`,
-# `Datetime`, `Tid`).
-kryphocron-lexicons = "0.3"
-
-# §4.6 timing-channel equalization sleep primitive
-# (`tokio::time::sleep` consumed by `crate::timing::equalize_timing`).
-# Tokio is a production dependency rather than dev-only;
-# operators on a non-tokio async runtime supply a tokio-
-# compatible reactor or shim. A runtime abstraction is a v0.2+
-# enrichment.
-tokio = { version = "1", features = ["time"] }
-
-# rev 3 §3 default-codec arc: the vendored laquna v0.2.0 source
-# (`src/codec/laquna/internal/`) is the substrate's built-in at-rest content
-# codec. These are laquna's own dependencies, pulled in directly because the
-# source is vendored verbatim (no `laquna` crate dependency — §3.8). Versions
-# match laquna v0.2.0's manifest. `blake3` (extendable stream) is already a
-# direct dependency above; the rest land here.
-#
-# - chacha20: anchor-stream keystream.
-# - hkdf + sha2: per-stream keying-material derivation (HKDF-SHA256).
-# - ruzstd: pure-Rust decode-side decompressor (the `hash` feature lets the
-#   decoder verify the zstd frame content-checksum manually).
-# - zstd: encode-side compressor. NOTE: a binding to the C libzstd
-#   (`zstd-sys`) — the one non-Rust build dependency the default codec brings
-#   in. Inherent to vendoring laquna verbatim (laquna uses zstd for encode).
-chacha20 = { version = "0.9", default-features = false }
-hkdf = { version = "0.12", default-features = false }
-sha2 = { version = "0.10", default-features = false }
-ruzstd = { version = "0.7", default-features = false, features = ["hash"] }
-zstd = "0.13"
-
-# rev 3 §3.4 / §4.7: hex decode/encode for the laquna adapter's rotation-mark
-# slug parsing and the default rotation oracle's mark formatting. (Was a
-# laquna dev-dependency; a direct dependency here.)
-hex = "0.4"
+# laquna deps (vendored encoder dependencies, rev 3 §3): chacha20, hkdf, sha2,
+# ruzstd, zstd, hex. NOTE: zstd binds C libzstd (zstd-sys) — the one non-Rust
+# build dependency the default codec brings in.
+chacha20 = { version = "0.9", default-features = false }    # anchor-stream keystream
+hkdf = { version = "0.12", default-features = false }       # per-stream HKDF-SHA256 keying
+sha2 = { version = "0.10", default-features = false }       # HKDF-SHA256 hash
+ruzstd = { version = "0.7", default-features = false, features = ["hash"] }  # decode-side zstd
+zstd = "0.13"                       # encode-side zstd compressor (C libzstd via zstd-sys)
+hex = "0.4"                         # rotation-mark slug parse/format (§3.4/§4.7)
 
 [dev-dependencies]
-# `trybuild` for "this should not compile" assertions on the
-# sealed surfaces.
-trybuild = "1"
-# §7.2 JWT verification tests are async because `verify_jwt` is
-# async (DID resolution may need network I/O). Use the
-# `tokio::test` macro with a single-thread runtime — tests
-# don't need the multi-thread scheduler.
-tokio = { version = "1", features = ["macros", "rt"] }
-# Naming the proto-blue-codegen record types (`tools::*::Main`) in the
-# §5.4 `HasNsid`-impl tests.
-kryphocron-lexicons = "0.3"
+trybuild = "1"                                          # compile-fail assertions on sealed surfaces
+tokio = { version = "1", features = ["macros", "rt"] }  # async test runtime for §7.2 JWT tests
+kryphocron-lexicons = "0.3"                             # naming codegen record types in §5.4 tests
 
 [build-dependencies]
-# §5.4 post-processing reads `KRYPHOCRON_LEXICON_REGISTRY` (NSID -> tier) to
-# emit the per-record `HasNsid` impls. The `[patch.crates-io]` override below
-# resolves this to the local checkout, same as the normal dependency.
+# §5.4 post-processing reads KRYPHOCRON_LEXICON_REGISTRY (NSID -> tier) to emit
+# the per-record HasNsid impls; resolved via the [patch.crates-io] override below.
 kryphocron-lexicons = "0.3"
 
 [features]
 default = []
 
-# Integration-test scaffolding. Exposes a minimal set of
-# constructors (`AuthContext::new_for_test`,
-# `ServiceIdentity::new_for_test`) so out-of-crate tests can
-# drive issuance → bind → audit pipelines end-to-end without
-# standing up a full verified-evidence path. Off by default.
-# Downstream crates testing integrations against kryphocron
-# opt in via
-# `kryphocron = { version = "0.1", features = ["test-support"] }`
-# in their `[dev-dependencies]`.
+# Integration-test scaffolding: exposes `AuthContext::new_for_test` /
+# `ServiceIdentity::new_for_test` so out-of-crate tests can drive
+# issuance → bind → audit without a full verified-evidence path. Off by default.
 test-support = []
 
-# §9.4 / §6.10 `audit-serde-json` feature for operators
-# consuming JSON audit streams. v0.1 ships the audit-event
-# variant set without the transitive `Serialize` / `Deserialize`
-# derive wiring (§6.10's "every reachable type gains the
-# derives" goal requires changes across `crate::identity`
-# (ServiceIdentity's sealed-token PhantomData; Instant fields
-# in `BindOutcomeRepr::Expired`), `kryphocron-lexicons` (SemVer,
-# Nsid, Did currently lack derives), and downstream crates; a
-# v0.2+ enrichment). Both `cargo build --features
-# audit-serde-json` and `cargo build` succeed today — the
-# feature flag is structurally wired and the `serde` /
-# `serde_json` dependencies are correctly optional.
+# Activates Serialize/Deserialize derives on audit events (§9.4 / §6.10). The
+# derive wiring is partial; see the CHANGELOG "Known limitations" note and
+# docs/internal/DEPENDENCIES.md.
 audit-serde-json = ["dep:serde"]
 
+# `serde` is optional (activated by `audit-serde-json`); `serde_json` is an
+# unconditional dependency above because the §7.2 JWT path always parses JSON.
 [dependencies.serde]
 version = "1"
 optional = true
 features = ["derive"]
-
-# `serde_json` lives in the unconditional `[dependencies]`
-# block above because the §7.2 JWT verification path needs
-# JSON parsing on every authenticated request. The
-# `audit-serde-json` feature still activates `serde` for the
-# optional Serialize/Deserialize derives on audit-event types.
 
 [lints.rust]
 unsafe_code = "forbid"
