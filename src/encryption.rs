@@ -26,10 +26,12 @@
 //!   The substrate constructs the surrounding [`EncodedRecord`] (the codec
 //!   has no authority over its metadata); rotation generation is sourced by
 //!   the substrate from a [`RotationOracle`] via
-//!   [`resolve_rotation_generation`]. v0.1 installs no codec
-//!   ([`NoAtRestHooks`]); record content is then stored as plaintext.
+//!   [`resolve_rotation_generation`]. 0.3 installs laquna by default via
+//!   [`DefaultAtRestHooks`] — `content_codec()` is non-optional, so
+//!   private-tier content is always encoded at rest (rev 3 §2.1).
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -352,24 +354,6 @@ pub enum CodecError {
         /// Operator-facing detail string.
         detail: String,
     },
-    /// No content codec is installed, but a record carries codec-encoded
-    /// content that needs one to decode. Two scenarios:
-    ///
-    /// 1. **Partial deployment / cross-peer codec skew** — a peer that does
-    ///    not have the codec a record was written under. Cross-codec
-    ///    federation is unsupported in 0.x (rev6 §5.2): such a read fails here.
-    /// 2. **Historical records** — content written before any codec was
-    ///    installed in this deployment.
-    ///
-    /// `stored` is the codec the record was written under (i.e. the one that
-    /// would be needed to decode it). Added by the 0.3.0 implementation cycle
-    /// as a rev6 gap-fill — rev6's enumerated decode errors did not cover the
-    /// no-installed-codec case (additive under `#[non_exhaustive]`).
-    #[error("no codec installed to decode record stored under codec {stored}")]
-    NoCodecInstalled {
-        /// Codec id the stored record was written under.
-        stored: CodecId,
-    },
 }
 
 /// Coarse, plaintext-free classification of a [`CodecError`] for the audit
@@ -387,8 +371,6 @@ pub enum CodecErrorClass {
     DeadlineExceeded,
     /// See [`CodecError::BackendUnavailable`].
     BackendUnavailable,
-    /// See [`CodecError::NoCodecInstalled`].
-    NoCodecInstalled,
 }
 
 impl CodecError {
@@ -403,7 +385,6 @@ impl CodecError {
             }
             CodecError::DeadlineExceeded { .. } => CodecErrorClass::DeadlineExceeded,
             CodecError::BackendUnavailable { .. } => CodecErrorClass::BackendUnavailable,
-            CodecError::NoCodecInstalled { .. } => CodecErrorClass::NoCodecInstalled,
         }
     }
 }
@@ -610,29 +591,195 @@ impl RotationOracle for NoRotationOracle {
 pub trait AtRestHooks: Send + Sync {
     /// Audit-encryption resolver, if installed.
     fn audit(&self) -> Option<Arc<dyn AuditEncryptionResolver>>;
-    /// Record-content codec, if installed. `None` ⇒ content stored as plaintext.
-    fn content_codec(&self) -> Option<Arc<dyn ContentCodec>>;
+    /// Record-content codec. **Non-optional** — the substrate's typed write
+    /// path always encodes private-tier record content at rest (rev 3 §2.1,
+    /// the structural encoding-at-default floor). There is no opt-out: a
+    /// deployment that does not encode private-tier records at rest is not a
+    /// kryphocron deployment. Operators substitute toward *strengthening*
+    /// codecs (authenticated encryption, HSM-backed, …) via
+    /// [`DefaultAtRestHooksBuilder::with_codec`]; substitution toward weaker
+    /// or identity codecs configures something that is not kryphocron.
+    fn content_codec(&self) -> Arc<dyn ContentCodec>;
     /// The rotation oracle serving `content_codec`. `None` ⇒ rotation-less
     /// deployment (encode hint is `None`).
     fn rotation_oracle(&self) -> Option<Arc<dyn RotationOracle>>;
 }
 
-/// **v1 default** [`AtRestHooks`] implementation that returns `None` from every
-/// accessor: no audit encryption, no codec, no rotation oracle. Audit events
-/// emit with [`crate::target::TargetRepresentation::sensitive`] = `None`;
-/// record content is stored as plaintext. Zero-sized.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoAtRestHooks;
+/// The default [`AtRestHooks`] baseline shipped with kryphocron 0.3.0
+/// (rev 3 §5). Installs laquna as the at-rest content codec and a
+/// [`DefaultRotationOracle`](crate::codec::laquna::DefaultRotationOracle). No
+/// audit-encryption resolver.
+///
+/// Recommended baseline for operators who do not need custom hooks. The
+/// substrate's constitutional claim — that private-tier records are encoded at
+/// rest via the substrate's typed write path — is delivered by this baseline
+/// out of the box.
+///
+/// **Single-process deployments only** for the default rotation oracle (see
+/// the oracle's §4.1 docs). Multi-process deployments substitute a coordinated
+/// rotation oracle via [`DefaultAtRestHooksBuilder::with_rotation_oracle`]
+/// regardless of user count.
+///
+/// Construction is **fallible** — the inner `DefaultRotationOracle`
+/// construction performs CSRNG initialization and an install-time write check
+/// at `<data_dir>/kryphocron/rotation.state`; both can fail at construction.
+/// Operators handle the `Result` at the install seam; failures here are
+/// catchable diagnostically.
+///
+/// Construction:
+/// - [`DefaultAtRestHooks::for_data_dir`] — zero-config; laquna with the
+///   default seed policy and a default rotation oracle persisting to
+///   `<path>/kryphocron/rotation.state`.
+/// - [`DefaultAtRestHooks::builder`] — for operators substituting the codec,
+///   the audit resolver, or the rotation oracle. The `data_dir` provided at
+///   `builder(path)` is the substrate's data root; if `with_rotation_oracle`
+///   is not called, the builder defaults the rotation oracle to
+///   `DefaultRotationOracle::for_data_dir(path)?`.
+///
+/// Operators implementing custom `AtRestHooks` (e.g. to install completely
+/// custom oracle infrastructure) implement the trait directly rather than
+/// using this struct.
+#[derive(Clone)]
+pub struct DefaultAtRestHooks {
+    codec: Arc<dyn ContentCodec>,
+    rotation_oracle: Arc<dyn RotationOracle>,
+    audit: Option<Arc<dyn AuditEncryptionResolver>>,
+}
 
-impl AtRestHooks for NoAtRestHooks {
-    fn audit(&self) -> Option<Arc<dyn AuditEncryptionResolver>> {
-        None
+impl DefaultAtRestHooks {
+    /// Zero-config construction. Installs laquna with the default seed policy
+    /// and `DefaultRotationOracle::for_data_dir(data_dir)?`.
+    ///
+    /// # Errors
+    ///
+    /// [`RotationOracleConstructionError`](crate::codec::laquna::RotationOracleConstructionError)
+    /// if the inner rotation-oracle construction fails (CSRNG failure or
+    /// install-time write check failure at the data dir).
+    pub fn for_data_dir(
+        data_dir: PathBuf,
+    ) -> Result<Self, crate::codec::laquna::RotationOracleConstructionError> {
+        Ok(Self {
+            codec: Arc::new(crate::codec::laquna::Codec::default()),
+            rotation_oracle: Arc::new(
+                crate::codec::laquna::DefaultRotationOracle::for_data_dir(data_dir)?,
+            ),
+            audit: None,
+        })
     }
-    fn content_codec(&self) -> Option<Arc<dyn ContentCodec>> {
-        None
+
+    /// Builder construction. `data_dir` is the substrate's data root; it is
+    /// used to default the rotation oracle to
+    /// `DefaultRotationOracle::for_data_dir(data_dir)?` if `with_rotation_oracle`
+    /// is not called. If the operator does call `with_rotation_oracle`, the
+    /// `data_dir` is ignored for rotation-oracle purposes (the operator-supplied
+    /// oracle is used). Operators not substituting the oracle get the same
+    /// zero-config rotation oracle as `for_data_dir(path)`.
+    #[must_use]
+    pub fn builder(data_dir: PathBuf) -> DefaultAtRestHooksBuilder {
+        DefaultAtRestHooksBuilder {
+            data_dir,
+            codec: None,
+            rotation_oracle: None,
+            audit: None,
+        }
+    }
+}
+
+/// Builder for [`DefaultAtRestHooks`] (rev 3.1 §2).
+pub struct DefaultAtRestHooksBuilder {
+    data_dir: PathBuf,
+    codec: Option<Arc<dyn ContentCodec>>,
+    rotation_oracle: Option<Arc<dyn RotationOracle>>,
+    audit: Option<Arc<dyn AuditEncryptionResolver>>,
+}
+
+impl DefaultAtRestHooksBuilder {
+    /// Substitute the content codec.
+    ///
+    /// **Substitution is a strengthening path** (rev 3 §1.2 #4, §1.3, §5.5).
+    /// Install codecs delivering guarantees stronger than laquna's friction —
+    /// authenticated encryption codecs, HSM-backed encryption codecs, codecs
+    /// with hardware-attested key custody, etc. Substitution toward weaker
+    /// guarantees — identity-function codecs, no-op encoders, codecs that emit
+    /// plaintext under any record-shape — is **not a supported configuration**.
+    /// An operator installing an identity-function codec is running a
+    /// deployment that is not kryphocron, in the same sense that an operator
+    /// forking the source and deleting the codec call is running a deployment
+    /// that is not kryphocron. Kryphocron's identity is encoding-at-default;
+    /// configurations that opt out of that identity are not kryphocron
+    /// deployments. See the kryphocron README's privacy-posture section for the
+    /// operator-facing framing.
+    #[must_use]
+    pub fn with_codec(mut self, codec: Arc<dyn ContentCodec>) -> Self {
+        self.codec = Some(codec);
+        self
+    }
+
+    /// Substitute the rotation oracle.
+    ///
+    /// Multi-process deployments install a coordinated `RotationOracle` here
+    /// from day one (see the oracle's §4.1 docs). `DefaultRotationOracle` is a
+    /// single-process starter oracle; multi-process deployments substitute it
+    /// for a coordinated implementation (DB-backed, KMS-backed, etc.) at
+    /// install time, not "as they scale."
+    ///
+    /// If this method is called, the `data_dir` passed to `builder(path)` is no
+    /// longer used for rotation-oracle defaulting; the operator-supplied oracle
+    /// is used directly.
+    #[must_use]
+    pub fn with_rotation_oracle(mut self, oracle: Arc<dyn RotationOracle>) -> Self {
+        self.rotation_oracle = Some(oracle);
+        self
+    }
+
+    /// Install an audit-encryption resolver (§8.2).
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn AuditEncryptionResolver>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Build the `DefaultAtRestHooks`. Fallible because the default rotation
+    /// oracle's construction is fallible; if the operator called
+    /// `with_rotation_oracle`, no fallible construction happens here and
+    /// `build()` cannot fail.
+    ///
+    /// # Errors
+    ///
+    /// [`RotationOracleConstructionError`](crate::codec::laquna::RotationOracleConstructionError)
+    /// from the default rotation oracle's construction (only when
+    /// `with_rotation_oracle` was not called).
+    pub fn build(
+        self,
+    ) -> Result<DefaultAtRestHooks, crate::codec::laquna::RotationOracleConstructionError> {
+        // rev 3.2 §6: explicit type annotations defend against inference
+        // fragility on the unsized `Arc<Concrete> -> Arc<dyn _>` coercions.
+        let codec: Arc<dyn ContentCodec> = self
+            .codec
+            .unwrap_or_else(|| Arc::new(crate::codec::laquna::Codec::default()));
+        let rotation_oracle: Arc<dyn RotationOracle> = match self.rotation_oracle {
+            Some(o) => o,
+            None => Arc::new(crate::codec::laquna::DefaultRotationOracle::for_data_dir(
+                self.data_dir,
+            )?),
+        };
+        Ok(DefaultAtRestHooks {
+            codec,
+            rotation_oracle,
+            audit: self.audit,
+        })
+    }
+}
+
+impl AtRestHooks for DefaultAtRestHooks {
+    fn audit(&self) -> Option<Arc<dyn AuditEncryptionResolver>> {
+        self.audit.clone()
+    }
+    fn content_codec(&self) -> Arc<dyn ContentCodec> {
+        self.codec.clone()
     }
     fn rotation_oracle(&self) -> Option<Arc<dyn RotationOracle>> {
-        None
+        Some(self.rotation_oracle.clone())
     }
 }
 
@@ -816,12 +963,20 @@ mod tests {
     }
 
     #[test]
-    fn no_at_rest_hooks_returns_none_everywhere() {
-        let h = NoAtRestHooks;
-        assert!(h.audit().is_none());
-        assert!(h.content_codec().is_none());
-        assert!(h.rotation_oracle().is_none());
-        assert_eq!(std::mem::size_of::<NoAtRestHooks>(), 0);
+    fn default_at_rest_hooks_installs_real_codec_and_oracle() {
+        // The encoding-at-default floor (rev 3 §2.1): the baseline always
+        // installs a real codec (content_codec is non-optional) and a rotation
+        // oracle. No audit-encryption resolver by default.
+        let dir = std::env::temp_dir().join(format!(
+            "kryphocron-hooks-{}-{}",
+            std::process::id(),
+            "default"
+        ));
+        let hooks = DefaultAtRestHooks::for_data_dir(dir.clone()).expect("construct");
+        assert_eq!(hooks.content_codec().codec_id().as_str(), "laquna/0.2");
+        assert!(hooks.rotation_oracle().is_some());
+        assert!(hooks.audit().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     struct StubOracle {

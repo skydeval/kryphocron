@@ -71,9 +71,10 @@
 //!   peer trust (§7.3, §7.7).
 //! - [`encryption`] at-rest hook surfaces: the §8.2 audit-encryption
 //!   trait surface and opaque key-id types, plus the §8.3
-//!   [`encryption::ContentCodec`] content-codec seam. v0.1 ships
-//!   [`encryption::NoAtRestHooks`] as the default no-op hook set;
-//!   operator plug-ins fill in real codec / encryption support.
+//!   [`encryption::ContentCodec`] content-codec seam. 0.3 ships
+//!   [`encryption::DefaultAtRestHooks`] — laquna ([`codec::laquna`]) +
+//!   a default rotation oracle — as the encoding-at-default baseline;
+//!   operators substitute *strengthening* codecs (rev 3 §2.1 / §5).
 //!
 //! ## Discipline
 //!
@@ -93,13 +94,14 @@
 //!   on the *binding* of a capability proof (success or
 //!   failure), not on its issuance.
 //! - **Door-open, not door-ajar.** Where the spec defers to
-//!   operator policy (encryption algorithm, oracle backends,
-//!   audit sink storage, inspection-notification queue), the
-//!   crate ships a trait surface + explicit no-op default
-//!   ([`encryption::NoAtRestHooks`],
-//!   [`authority::NoInspectionNotifications`]); operators
-//!   install real implementations when their deployment needs
-//!   them.
+//!   operator policy (audit-encryption algorithm, oracle
+//!   backends, audit sink storage, inspection-notification
+//!   queue), the crate ships a trait surface + explicit no-op
+//!   default (e.g. [`authority::NoInspectionNotifications`]);
+//!   operators install real implementations when their
+//!   deployment needs them. The §8.3 at-rest *content codec* is
+//!   the exception — it is encoding-at-default, not door-open:
+//!   the baseline installs a real codec (rev 3 §2.1).
 //!
 //! ## v0.1 enrichment posture
 //!
@@ -229,9 +231,9 @@ pub use encryption::{
     produce_sensitive_representation, resolve_rotation_generation, AtRestHooks,
     AuditEncryptionAlgorithm, AuditEncryptionKeyId, AuditEncryptionResolver,
     CodecError, CodecErrorClass, CodecId, CodecIdError, ContentCodec,
-    DecodeContext, EncodeContext, EncodedRecord, EncryptionContext,
-    EncryptionError, NoAtRestHooks, NoRotationOracle, RotationContext,
-    RotationGenerationMark, RotationOracle, MAX_CODEC_ID_LEN,
+    DecodeContext, DefaultAtRestHooks, DefaultAtRestHooksBuilder, EncodeContext,
+    EncodedRecord, EncryptionContext, EncryptionError, NoRotationOracle,
+    RotationContext, RotationGenerationMark, RotationOracle, MAX_CODEC_ID_LEN,
     MAX_ROTATION_GENERATION_MARK_LEN,
 };
 pub use identity::{

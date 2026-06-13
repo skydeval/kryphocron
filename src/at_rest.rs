@@ -25,9 +25,11 @@
 //! audit-unavailable-is-fail-closed discipline is specific to the §4.3
 //! capability bind path, which content encode/decode is not.
 //!
-//! With no codec installed, [`encode_record_content`] returns `Ok(None)` — the
-//! caller stores the plaintext in the lexicon `text` field (the [`NoAtRestHooks`]
-//! baseline). [`NoAtRestHooks`]: crate::encryption::NoAtRestHooks
+//! There is no plaintext path: the substrate's typed write path always encodes
+//! private-tier record content at rest (rev 3 §2.1). [`encode_record_content`]
+//! returns the substrate-stamped [`EncodedRecord`]; `content_codec()` is
+//! non-optional, so the default baseline ([`crate::encryption::DefaultAtRestHooks`])
+//! always installs a codec.
 
 use std::time::{Instant, SystemTime};
 
@@ -100,9 +102,8 @@ impl RecordContentContext {
 /// [`ContentCodec`], stamping the resulting [`EncodedRecord`] from substrate
 /// state and emitting the §6.2 audit event.
 ///
-/// Returns `Ok(None)` when no codec is installed — the plaintext path; the
-/// caller stores the plaintext in the record's `text` field. Returns
-/// `Ok(Some(record))` with the substrate-stamped [`EncodedRecord`] on success.
+/// Returns the substrate-stamped [`EncodedRecord`] on success. There is no
+/// plaintext path — `content_codec()` is non-optional (rev 3 §2.1).
 ///
 /// `now` is the current wall-clock instant; it is used both for the rotation
 /// oracle freshness check and as the emitted event's wallclock.
@@ -126,11 +127,11 @@ pub async fn encode_record_content(
     ctx: &RecordContentContext,
     deadline: Instant,
     now: SystemTime,
-) -> Result<Option<EncodedRecord>, CodecError> {
-    let Some(codec) = hooks.content_codec() else {
-        // No codec installed: plaintext path. Caller stores plaintext in `text`.
-        return Ok(None);
-    };
+) -> Result<EncodedRecord, CodecError> {
+    // The substrate's typed write path always encodes private-tier content at
+    // rest (rev 3 §2.1); `content_codec()` is non-optional — there is no
+    // plaintext path.
+    let codec = hooks.content_codec();
     let codec_id = codec.codec_id();
 
     // Resolve the rotation generation — freshness-checked in substrate code.
@@ -183,7 +184,7 @@ pub async fn encode_record_content(
         at: now,
     });
 
-    Ok(Some(record))
+    Ok(record)
 }
 
 /// Decode private-tier record content at rest through the installed
@@ -197,11 +198,9 @@ pub async fn encode_record_content(
 ///
 /// # Errors
 ///
-/// - [`CodecError::NoCodecInstalled`] when this deployment has no codec but the
-///   record carries codec-encoded content (cross-peer codec skew, or a
-///   pre-codec historical record).
 /// - [`CodecError::UnknownOrWrongCodec`] when the record's stored codec does
-///   not match the installed codec.
+///   not match the installed codec (this covers cross-peer codec skew — rev 3
+///   §6.2).
 /// - The codec's own [`CodecError`] on a decode failure.
 ///
 /// A [`UserAuditEvent::ContentDecodeFailed`] is emitted before any error
@@ -222,22 +221,10 @@ pub async fn decode_record_content(
     deadline: Instant,
     now: SystemTime,
 ) -> Result<Vec<u8>, CodecError> {
-    let Some(codec) = hooks.content_codec() else {
-        // No codec installed, but the record carries codec-encoded content.
-        let err = CodecError::NoCodecInstalled {
-            stored: encoded.codec.clone(),
-        };
-        emit_decode_failed(
-            user_sink,
-            ctx,
-            authz.reader(),
-            None,
-            Some(encoded.codec.clone()),
-            err.class(),
-            now,
-        );
-        return Err(err);
-    };
+    // `content_codec()` is non-optional (rev 3 §2.1). Cross-codec deployment
+    // skew — a record stamped with a different `CodecId` than the installed
+    // codec — maps to `UnknownOrWrongCodec` below (rev 3 §6.2).
+    let codec = hooks.content_codec();
     let installed = codec.codec_id();
 
     if encoded.codec != installed {
@@ -345,12 +332,11 @@ pub enum AtRestInstallError {
 /// [`ContentCodec::requires_rotation`]: crate::encryption::ContentCodec::requires_rotation
 /// [`RotationOracle`]: crate::encryption::RotationOracle
 pub fn validate_at_rest_install(hooks: &dyn AtRestHooks) -> Result<(), AtRestInstallError> {
-    if let Some(codec) = hooks.content_codec() {
-        if codec.requires_rotation() && hooks.rotation_oracle().is_none() {
-            return Err(AtRestInstallError::CodecRequiresRotation {
-                codec: codec.codec_id(),
-            });
-        }
+    let codec = hooks.content_codec();
+    if codec.requires_rotation() && hooks.rotation_oracle().is_none() {
+        return Err(AtRestInstallError::CodecRequiresRotation {
+            codec: codec.codec_id(),
+        });
     }
     Ok(())
 }
@@ -423,7 +409,7 @@ mod tests {
     }
 
     struct StubHooks {
-        codec: Option<Arc<dyn ContentCodec>>,
+        codec: Arc<dyn ContentCodec>,
         oracle: Option<Arc<dyn RotationOracle>>,
     }
 
@@ -431,7 +417,7 @@ mod tests {
         fn audit(&self) -> Option<Arc<dyn AuditEncryptionResolver>> {
             None
         }
-        fn content_codec(&self) -> Option<Arc<dyn ContentCodec>> {
+        fn content_codec(&self) -> Arc<dyn ContentCodec> {
             self.codec.clone()
         }
         fn rotation_oracle(&self) -> Option<Arc<dyn RotationOracle>> {
@@ -500,12 +486,12 @@ mod tests {
         oracle: Option<Arc<dyn RotationOracle>>,
     ) -> StubHooks {
         StubHooks {
-            codec: Some(Arc::new(StubCodec {
+            codec: Arc::new(StubCodec {
                 id: codec_id(),
                 encode,
                 decode,
                 requires_rotation: false,
-            })),
+            }),
             oracle,
         }
     }
@@ -519,7 +505,6 @@ mod tests {
         let now = SystemTime::now();
         let rec = encode_record_content(&hooks, &sink, b"hi", &ctx(), deadline(), now)
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(rec.codec, codec_id());
         assert_eq!(rec.content, b"CIPHER");
@@ -529,17 +514,6 @@ mod tests {
             events.as_slice(),
             [UserAuditEvent::ContentEncoded { .. }]
         ));
-    }
-
-    #[tokio::test]
-    async fn encode_no_codec_is_plaintext_path() {
-        let hooks = StubHooks { codec: None, oracle: None };
-        let sink = CapturingSink::default();
-        let out = encode_record_content(&hooks, &sink, b"hi", &ctx(), deadline(), SystemTime::now())
-            .await
-            .unwrap();
-        assert!(out.is_none());
-        assert!(sink.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -668,34 +642,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn decode_no_codec_installed_is_no_codec_installed_error() {
-        let hooks = StubHooks { codec: None, oracle: None };
-        let sink = CapturingSink::default();
-        let err = decode_record_content(
-            &authz(),
-            &hooks,
-            &sink,
-            &encoded_under(codec_id()),
-            &ctx(),
-            deadline(),
-            SystemTime::now(),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, CodecError::NoCodecInstalled { .. }));
-        let events = sink.events.lock().unwrap();
-        assert!(matches!(
-            events.as_slice(),
-            [UserAuditEvent::ContentDecodeFailed {
-                codec: None,
-                stored_codec: Some(_),
-                error_class: CodecErrorClass::NoCodecInstalled,
-                ..
-            }]
-        ));
-    }
-
     // ---- install-seam check ----
 
     fn codec_requiring_rotation() -> Arc<dyn ContentCodec> {
@@ -710,7 +656,7 @@ mod tests {
     #[test]
     fn install_codec_requires_rotation_without_oracle_fails_closed() {
         let hooks = StubHooks {
-            codec: Some(codec_requiring_rotation()),
+            codec: codec_requiring_rotation(),
             oracle: None,
         };
         assert!(matches!(
@@ -722,18 +668,15 @@ mod tests {
     #[test]
     fn install_codec_requires_rotation_with_oracle_ok() {
         let hooks = StubHooks {
-            codec: Some(codec_requiring_rotation()),
+            codec: codec_requiring_rotation(),
             oracle: Some(fresh_oracle("000042")),
         };
         assert!(validate_at_rest_install(&hooks).is_ok());
     }
 
     #[test]
-    fn install_no_codec_or_rotation_not_required_ok() {
-        // No codec at all.
-        let none = StubHooks { codec: None, oracle: None };
-        assert!(validate_at_rest_install(&none).is_ok());
-        // Codec that does not require rotation, no oracle.
+    fn install_codec_not_requiring_rotation_without_oracle_ok() {
+        // A codec that does not require rotation needs no oracle.
         let no_req = hooks_with(Ok(vec![]), Ok(vec![]), None);
         assert!(validate_at_rest_install(&no_req).is_ok());
     }

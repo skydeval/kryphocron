@@ -169,9 +169,8 @@ pub trait InspectionNotificationQueueImpl: Send + Sync {
 /// unconditionally without forcing every deployment to ship a
 /// queue implementation.
 ///
-/// Parallels the wire-side `NoAtRestHooks` default and the
-/// process-static `AuthorityId` placeholder: ship the discipline,
-/// let operators upgrade to a real implementation when their
+/// Parallels the process-static `AuthorityId` placeholder: ship the
+/// discipline, let operators upgrade to a real implementation when their
 /// deployment needs the feature.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoInspectionNotifications;
