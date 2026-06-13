@@ -1,77 +1,68 @@
 # kryphocron
 
 **Privacy-first ATProto substrate primitives.** Type architecture,
-audit vocabulary, inter-service auth, and encryption hooks for
-substrates that need to commit threat-model invariants
-structurally rather than as policy.
+audit vocabulary, inter-service auth, and at-rest content encoding for
+substrates that need to commit threat-model invariants structurally
+rather than as policy.
 
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-brightgreen.svg)](https://www.mozilla.org/MPL/2.0/)
 [![Crates.io](https://img.shields.io/crates/v/kryphocron)](https://crates.io/crates/kryphocron)
 
 ## What it is
 
-`kryphocron` is the foundational primitives crate for the
-Kryphocron substrate — an ATProto-compatible identity and
-publishing substrate built around the discipline that **the
-wrong path is harder to write than the right path**. Misuse of
-a primitive should be a compile error wherever possible, a
+`kryphocron` is the foundational primitives crate for the Kryphocron
+substrate — an ATProto-compatible identity and publishing substrate built
+around the discipline that **the wrong path is harder to write than the right
+path**. Misuse of a primitive should be a compile error wherever possible, a
 runtime error otherwise, and a silent success never.
 
 The crate ships:
 
-- **Tier-aware envelope types** (`Tier`, `Tiered<T>`, `HasNsid`)
-  that make Public / Private classification a structural
-  property of the type system. A function emitting to a public
-  surface cannot, by type, accept a private-tier value.
+- **Tier-aware envelope types** (`Tier`, `Tiered<T>`, `HasNsid`) that make
+  Public / Private classification a structural property of the type system. A
+  function emitting to a public surface cannot, by type, accept a private-tier
+  value.
 - **Capability proofs** — sealed, unforgeable in safe Rust via
   `PhantomData<sealed::Token>` markers.
-- **`AuthContext`** — the in-process authentication context
-  type with attribution-chain rehydration from upstream
-  delegation.
-- **Audit pipeline** — composite-rollback machinery, fallback-
-  sink contract, and a 30+ variant audit-event vocabulary
-  covering user, channel, substrate, and moderation classes.
-- **Inter-service auth** — JWT verification, capability claim
-  wire format with W11/W12/W13 monotonicity invariants, trust
-  declarations, DID resolution, and the three-message sync
-  handshake protocol.
-- **At-rest content codec** — private-tier record content is
-  **encoded at rest by default** via the `ContentCodec` seam
-  (§8.3), with the friction-encoding `laquna` codec shipped as
-  the built-in `DefaultAtRestHooks` baseline. Operators may
-  substitute a *strengthening* codec (authenticated encryption,
-  HSM-backed). See "Privacy posture" below.
+- **`AuthContext`** — the in-process authentication context type with
+  attribution-chain rehydration from upstream delegation.
+- **Audit pipeline** — composite-rollback machinery, a fallback-sink contract,
+  and a 30+ variant audit-event vocabulary covering user, channel, substrate,
+  and moderation classes.
+- **Inter-service auth** — JWT verification, a capability-claim wire format
+  with monotonicity invariants (replay / time-rewind guards), trust
+  declarations, DID resolution, and the three-message sync handshake.
+- **At-rest content codec** — private-tier record content is **encoded at rest
+  by default** via the `ContentCodec` seam, with the friction-encoding
+  `laquna` codec shipped as the built-in `DefaultAtRestHooks` baseline.
+  Operators may substitute a *strengthening* codec (authenticated encryption,
+  HSM-backed). See "Privacy posture".
 - **Audit-encryption hook surface** — the operator-pluggable
-  `AuditEncryptionResolver` trait shape (§8.2); the crate ships
-  the surface, operator plug-ins fill in algorithm variants.
+  `AuditEncryptionResolver` trait shape; the crate ships the surface, operator
+  plug-ins fill in algorithm variants.
 
 ## What it is NOT
 
 `kryphocron` deliberately does NOT ship:
 
-- Confidentiality-grade encryption. The default at-rest codec
-  (laquna) is *friction-encoding*, explicitly not encryption (see
-  Privacy posture); the `ContentCodec` seam accepts an
-  operator-supplied authenticated-encryption codec, but the crate
-  ships no cipher implementation of its own.
-- A PDS, AppView, or any other operator substrate
-  component. Those are downstream crates that build on
-  kryphocron primitives.
-- HTTP transport, TLS, or wire I/O. The crate produces and
-  consumes byte arrays; operators wire up their own transports.
-- Key management, KMS integrations, or multi-process rotation
-  coordination. The crate ships a **single-process**
-  `DefaultRotationOracle`; coordinated (DB/KMS-backed) rotation
-  is operator-supplied, and the `DidResolver` and audit-encryption
-  resolver receive key material from operator code.
-- ATProto record validation beyond what `kryphocron-lexicons`
-  commits.
+- Confidentiality-grade encryption. The default at-rest codec (laquna) is
+  *friction-encoding*, explicitly not encryption (see Privacy posture); the
+  `ContentCodec` seam accepts an operator-supplied authenticated-encryption
+  codec, but the crate ships no cipher of its own.
+- A PDS, AppView, or any other operator substrate component — those are
+  downstream crates that build on kryphocron primitives.
+- HTTP transport, TLS, or wire I/O. The crate produces and consumes byte
+  arrays; operators wire up their own transports.
+- Key management, KMS integrations, or multi-process rotation coordination.
+  The crate ships a **single-process** `DefaultRotationOracle`; coordinated
+  (DB/KMS-backed) rotation is operator-supplied, and the `DidResolver` and
+  audit-encryption resolver receive key material from operator code.
+- ATProto record validation beyond what `kryphocron-lexicons` commits.
 
-The discipline is **door-open, not door-ajar**: where an
-implementation choice is operator policy, the crate commits a
-trait shape and leaves the implementation to operators. The §8.3
-at-rest *content codec* is the one principled exception — it is
-encoding-at-default, not door-open (see Privacy posture below).
+The discipline is **door-open, not door-ajar**: where an implementation choice
+is operator policy, the crate commits a trait shape and leaves the
+implementation to operators. The at-rest content codec is the one principled
+exception — encoding-at-default, not door-open (see Privacy posture below).
 
 ## Privacy posture
 
@@ -161,7 +152,7 @@ let inspection_queue = NoInspectionNotifications;  // no-op default.
 // Private-tier record content is encoded at rest by default. Construct the
 // baseline at-rest hooks once at startup; the
 // `at_rest::{encode,decode}_record_content` seams drive the installed
-// `ContentCodec` (laquna by default). See "Privacy posture" below.
+// `ContentCodec` (laquna by default). See "Privacy posture" above.
 let at_rest_hooks = DefaultAtRestHooks::for_data_dir(data_dir)?;
 
 // Per-request: verify a JWT, build an AuthContext.
@@ -180,8 +171,8 @@ let ctx = kryphocron::ingress::from_xrpc_request(
 
 // Issue a capability proof against the requester's context, then
 // bind it against the target. `bind` and `reborrow` are async —
-// the §4.3 pipeline runs inside `composite_audit` which is
-// async, and timing-channel equalization sleeps via tokio.
+// the bind pipeline runs inside `composite_audit`, which is async,
+// and timing-channel equalization sleeps via tokio.
 let proof = issue_user::<ViewPrivate>(&ctx, target_resource_id)?;
 let bound = proof.bind(&ctx, &target_resource_id).await?;
 
@@ -190,252 +181,137 @@ let bound = proof.bind(&ctx, &target_resource_id).await?;
 let subject = bound.subject();
 ```
 
-The substrate's value isn't in the API ergonomics — it's in the
-threat-model invariants the type system enforces.
+The substrate's value isn't in the API ergonomics — it's in the threat-model
+invariants the type system enforces.
 
 ### Bind API asymmetry
 
 Three of the four `*Proof::bind` methods take `(self, ctx, target)`.
-`ModerationProof::bind` takes a fourth argument:
-`rationale: ModeratorRationale` (a length-bounded operator-declared
-string, mandatory for every moderation action per §6.5). Operators
-writing generic bind-dispatch code need to handle this asymmetry —
-the rationale is bind-time input, not issuance-time, matching
-operator workflows where the moderator commits a rationale at
-the moment of action.
+`ModerationProof::bind` takes a fourth argument: `rationale:
+ModeratorRationale` (a length-bounded operator-declared string, mandatory for
+every moderation action). Operators writing generic bind-dispatch code must
+handle this asymmetry — the rationale is bind-time input, not issuance-time,
+matching workflows where the moderator commits a rationale at the moment of
+action.
 
 ## Design discipline
 
 Five organizing principles:
 
-1. **The wrong path is harder to write than the right path.**
-   Misuse of a primitive is a compile error wherever possible,
-   a runtime error otherwise, and a silent success never.
-
-2. **Capabilities are unforgeable in safe code.** Code outside
-   the crate's `authority` module cannot construct authorization
-   proofs. Sealed traits and a private token type carried in
-   `PhantomData` on every proof type enforce this.
-
-3. **Tier is not a label, it's a structural property.** A
-   function that emits to a public surface cannot accept a
-   private-tier value, by type, not by runtime check.
-
-4. **Audit reflects action, not intent.** Audit events fire on
-   the *binding* of a capability proof (success or failure), not
-   on its issuance.
-
-5. **Door-open, not door-ajar.** Where the spec defers a choice
-   to operator policy, the crate commits the trait surface and
-   leaves the implementation pluggable. Defaults are explicit
-   (e.g., `NoInspectionNotifications` for the inspection-
-   notification queue), not implicit. The one principled
-   exception is the §8.3 at-rest content codec, which is
-   **encoding-at-default, not door-open** (see Privacy posture).
+1. **The wrong path is harder to write than the right path.** Misuse of a
+   primitive is a compile error wherever possible, a runtime error otherwise,
+   and a silent success never.
+2. **Capabilities are unforgeable in safe code.** Code outside the crate's
+   `authority` module cannot construct authorization proofs — sealed traits
+   and a private token carried in `PhantomData` on every proof type enforce
+   this.
+3. **Tier is not a label, it's a structural property.** A function emitting to
+   a public surface cannot accept a private-tier value, by type, not by
+   runtime check.
+4. **Audit reflects action, not intent.** Audit events fire on the *binding*
+   of a capability proof (success or failure), not on its issuance.
+5. **Door-open, not door-ajar.** Where an implementation choice is operator
+   policy, the crate ships the trait surface and leaves the implementation
+   pluggable. Defaults are explicit (e.g. `NoInspectionNotifications`), not
+   implicit. The at-rest content codec is the one principled exception —
+   encoding-at-default, not door-open (see Privacy posture).
 
 ## Status
 
-**kryphocron** publishes its substrate primitives to three audiences:
+0.3.0 ships the substrate's authority discipline end-to-end: tier-aware
+envelopes, sealed capability proofs, the `AuthContext` derivation surface, the
+audit pipeline with composite-rollback machinery, JWT-based inter-service auth
+with the three-message sync handshake, and the at-rest content-codec seam with
+the built-in `laquna` default. 390+ tests pin behavior across all four
+capability classes plus the timing-channel equalization surface; the crate
+forbids `unsafe` and denies `todo!()` / `unimplemented!()`.
 
-- **ATProto-adjacent operators** evaluating whether the
-  substrate's design discipline fits their threat model. The §4
-  type architecture and §6 audit vocabulary are committed; the
-  trait surfaces are stable enough to inform a "would we build
-  on this?" decision.
-- **Downstream integrators** (PDS, AppView, and Graph substrate
-  builders) consuming kryphocron as a dependency. The
-  wire-format and audit-event shapes are committed within 0.3.x;
-  consumer-facing API ergonomics may evolve as integrations
-  surface concrete needs.
-- **Adversarial reviewers** stress-testing the substrate's
-  threat-model commitments. The crate forbids `unsafe`, denies
-  `todo!()` / `unimplemented!()`, and ships with 390+ tests
-  pinning behavior across user, channel, substrate, and
-  moderation classes plus the §4.6 timing-channel equalization
-  surface.
-
-kryphocron ships the substrate's authority discipline
-end-to-end:
-
-- **§4 type architecture** — tier-aware envelopes, sealed
-  capability proofs (no struct-literal construction outside the
-  crate), `AuthContext` with attribution-chain rehydration from
-  upstream delegation.
-- **§4.1 tier-aware visibility** — `tier::visible_to(tier, ctx)`
-  predicate.
-- **§4.2 scope-narrowing derivation** — `AuthContext::derive_for`
-  with three legal narrowings (drop-to-anonymous,
-  narrow-capabilities, service-to-service); audit emits a
-  `DerivedContext` event on every attempt (success and failure).
-- **§4.3 capability issuance** — `issue_user`, `issue_channel`,
-  `issue_substrate`, `issue_moderation` chokepoints with
-  per-class requester-authority enforcement.
-- **§4.3 bind + reborrow** — async pipelines across all four
-  capability classes: pre-checks → stage 0 deprecation gate
-  (write-semantics user-class + moderation) → stage 2 oracle
-  consultation (user-class) → stage 5 predicate (user-class) →
-  audit emit via `composite_audit` → stage 6 timing equalization
-  (user-class) → return.
-- **§4.6 timing-channel equalization** — `equalize_timing` +
-  `equalize_timing_target_for::<C>` via `tokio::time::sleep`.
-  Coarse equalization to a deployment-configured target;
-  **NOT** a constant-time discipline. Granularity is limited by
-  the host scheduler (ms-scale jitter on Windows/WSL; tighter on
-  Linux), and a network-side adversary with high-resolution
-  latency measurement can still see through the equalization for
-  short-running operations. Operators with strong timing-channel
-  threat models should treat this as a coarse first defense and
-  layer constant-time-discipline cryptographic primitives + a
-  hardened timing primitive (e.g. randomized jitter, ring-buffered
-  release queues) at the perimeter. Full hardening is v2+ work.
-- **§4.9 composite-audit machinery** — class-priority commit
-  order (substrate → moderation → user → channel), rollback
-  fan-out to already-committed sinks, fallback-sink escalation
-  with `catch_unwind` panic catchment.
-- **§5 lexicon strategy** — closed-namespace registry via the
-  companion `kryphocron-lexicons` crate; `Tier::from_nsid`
-  consults the build-time-authoritative
-  `KRYPHOCRON_LEXICON_REGISTRY`.
-- **§6 audit event vocabulary** — 30+ variants across user,
-  channel, substrate, moderation classes; encrypted-layer split
-  via `TargetRepresentation::structural_only` /
-  `TargetRepresentation::with_sensitive`.
-- **§6.7 inspection-notification queue** — moderation-class fan-
-  out alongside the composite-audit emission; outside rollback
-  semantics per the "notifications are diagnostic, not
-  authoritative" discipline.
-- **§7 inter-service auth** — JWT verification (Ed25519 default;
-  ECDSA recognized but not v1-shipped), `CapabilityClaim` wire
-  format with W11/W12/W13 monotonicity invariants, trust
-  declarations, DID resolution + rotation evidence, three-message
-  sync handshake protocol, delegation receipts + chain
-  rehydration.
-- **§8 at-rest hook surfaces** — §8.2 `AuditEncryptionResolver`
-  trait shape (operator plug-ins fill in algorithm variants);
-  §8.3 `ContentCodec` content-codec seam with the
-  encode/decode/validate plumbing. The default baseline
-  (`DefaultAtRestHooks`) installs the built-in `laquna` codec +
-  a single-process rotation oracle — **encoding-at-default**, not
-  a no-op (see Privacy posture).
+Audiences: ATProto-adjacent operators evaluating whether the substrate's design
+fits their threat model; downstream integrators (PDS, AppView, Graph
+substrates) consuming kryphocron as a dependency; and adversarial reviewers
+stress-testing the threat-model commitments. Wire-format and audit-event shapes
+are committed within 0.3.x; consumer-facing API ergonomics may still evolve.
 
 ### Known limitations
 
-**None of these are security bugs.** They're places where the
-current surface is narrower than the spec's full v1 commitment,
-with the gap closed in future enrichment passes. Each item ships
-with a programmatic signal where operators benefit from one
-(`PayloadCompleteness::PartialV01` on the audit-event variants
-below), and a public README disclosure where they don't.
+None of these are security bugs — they're places where the current surface is
+narrower than the full design commitment, with the gap closed in future
+enrichment passes.
 
-A few audit-event payload fields ship with placeholder data
-pending sealed per-class extraction traits in a future release:
+**Coarse timing equalization.** `equalize_timing` equalizes to a
+deployment-configured target via a sleep primitive; it is **not** a
+constant-time discipline. Granularity is bounded by the host scheduler
+(ms-scale jitter on Windows/WSL, tighter on Linux), and a network adversary
+with high-resolution latency measurement can see through it for short
+operations. Treat it as a coarse first defense and layer constant-time crypto
+primitives + a hardened timing primitive at the perimeter for strong
+timing-channel threat models.
 
-- Channel-class `peer ServiceIdentity` and `session_id` on
-  `ChannelBound` / `ChannelReborrowFailed`.
-- Substrate-class `scope_repr` on `ScopeBound`.
-- Moderation-class `case ModerationCaseId` on `ModeratorInspected`
-  / `ModeratorTookDown` / `ModeratorRestored`.
+**Placeholder audit-event payloads.** A few audit-event fields ship with
+placeholder data pending sealed per-class extraction traits: channel-class
+`peer` / `session_id` (`ChannelBound` / `ChannelReborrowFailed`),
+substrate-class `scope_repr` (`ScopeBound`), and moderation-class case id
+(`ModeratorInspected` / `ModeratorTookDown` / `ModeratorRestored`). These
+variants carry a `payload_completeness` field set to `PartialV01`; a future
+release flips it to `Full`. Consumers branch on it to avoid rendering
+placeholder data as real values.
 
-The affected variants carry a `payload_completeness:
-PayloadCompleteness` field. Current releases set this to
-`PartialV01`; a future release flips it to `Full` when the sealed
-extraction traits land. Operators consuming the audit stream branch on this
-discriminator to gate dashboards or alerting that would otherwise
-silently render placeholder data as real values.
+**Deferred enrichments.** User-class bind consults the block-vs-resource-owner
+query and (for audience-gated capabilities) the audience oracle; a generalized
+per-capability multi-query oracle-results-builder is future work.
+`tier::visible_to` is tier-only — an audience-aware overload is future work
+(bind itself consults the audience oracle, so the gap is limited to the
+standalone predicate). Moderation-class reborrow miss is silent at the audit
+layer (no fitting variant yet); a future release adds it.
 
-Other enrichments deferred to a future release:
-
-- User-class bind consults the universal block-vs-resource-owner
-  query and (for audience-gated capabilities) the audience
-  oracle; the generalized per-capability multi-query
-  oracle-results-builder is future work.
-- `tier::visible_to` is tier-only; an audience-aware
-  overload is future work (bind itself consults the audience
-  oracle, so this gap is limited to the standalone predicate).
-- Moderation-class reborrow miss is silent at the audit layer
-  (no fitting variant in the current audit vocabulary); a
-  future release adds the variant.
-
-Wire-format-touching changes are reserved for a future minor
-cycle or the v1.0 cycle. v0.3.x patches are non-breaking only.
+Wire-format-touching changes are reserved for a future minor cycle or the v1.0
+cycle. v0.3.x patches are non-breaking only.
 
 ### Closed-namespace lexicon registry
 
-kryphocron's tier classification is closed-namespace: only NSIDs
-in the `tools.kryphocron.*` namespace are known to the substrate's
-registry. `Tier::from_nsid` consults
-`KRYPHOCRON_LEXICON_REGISTRY` (compiled in from the companion
-`kryphocron-lexicons` crate) and returns
-`Err(UnknownNsid::NotRegistered)` for NSIDs outside that
-namespace — including ATProto-ecosystem NSIDs like
-`app.bsky.feed.post` or `com.atproto.repo.strongRef`. **There is
-no default-to-`Tier::Public`** path; unknown NSIDs are a hard
-error, not a permissive fallback.
+kryphocron's tier classification is closed-namespace: only NSIDs in the
+`tools.kryphocron.*` namespace are known to the registry. `Tier::from_nsid`
+consults `KRYPHOCRON_LEXICON_REGISTRY` and returns
+`Err(UnknownNsid::NotRegistered)` for NSIDs outside it — including
+ATProto-ecosystem NSIDs like `app.bsky.feed.post`. **There is no
+default-to-`Tier::Public`**; unknown NSIDs are a hard error, not a permissive
+fallback.
 
-Operators running kryphocron alongside other ATProto lexicon
-surfaces — for example, a PDS that handles both `app.bsky.*`
-records and `tools.kryphocron.*` records — must be aware that
-kryphocron's tier discipline applies only to its own namespace.
-Non-kryphocron records are not classified by the kryphocron tier
-system; the consuming substrate is responsible for handling
-them per its own discipline (typically a separate
-classification layer, or a routing decision that hands
-non-kryphocron records off before the kryphocron tier check).
-
-This is a deliberate design choice. Cross-namespace
-classification (treating `app.bsky.*` records as `Tier::Public`
-by default, sourcing tier from `app.bsky.*` lexicons' own
-metadata, etc.) is reserved for a future release if downstream
-operators surface concrete demand. The current discipline
-foreclose ambiguity: a NSID either is, or isn't, in the
-substrate's trust boundary, with no silent middle ground.
+Operators running kryphocron alongside other ATProto lexicons (e.g. a PDS
+handling both `app.bsky.*` and `tools.kryphocron.*` records) must handle
+non-kryphocron records via their own classification or routing — kryphocron's
+tier discipline applies only to its own namespace. Cross-namespace
+classification is reserved for a future release if operators surface demand.
 
 ## Feedback and contributing
 
 Three channels, sorted by what you have:
 
-- **Integration pain or substrate-side bug** → open a GitHub
-  issue at <https://github.com/skydeval/kryphocron/issues>.
-  Bug reports against the §4 / §6 / §7 surfaces should include
-  a minimal reproducer (a failing test, a code excerpt) so
-  the issue lands as a concrete fix.
-- **Security issue** → see [SECURITY.md](SECURITY.md). Please
-  don't open a public issue for vulnerabilities; the security
-  policy describes the disclosure path.
-- **Design feedback, threat-model questions, or open questions
-  about future direction** → GitHub Discussions on the
-  `skydeval/kryphocron` repo. The substrate's design discipline
-  is exploratory; questions about *why* a particular shape
-  shipped (or didn't) are welcome and inform future enrichment
-  passes.
+- **Integration pain or substrate-side bug** → open a GitHub issue at
+  <https://github.com/skydeval/kryphocron/issues>. Include a minimal
+  reproducer (a failing test, a code excerpt).
+- **Security issue** → see [SECURITY.md](SECURITY.md). Please don't open a
+  public issue for vulnerabilities; the policy describes the disclosure path.
+- **Design feedback or threat-model questions** → GitHub Discussions on the
+  `skydeval/kryphocron` repo.
 
 The companion lexicon JSON lives in
 [`kryphocron-lexicons`](https://github.com/skydeval/kryphocron-lexicons);
-suggestions on the lexicon vocabulary itself belong there, not
-here.
+lexicon-vocabulary suggestions belong there.
 
 ## License
 
 **MPL-2.0** (Mozilla Public License 2.0). See `LICENSE`.
 
-The MPL is file-level copyleft: modifications to MPL-2.0-licensed
-source files must be released under MPL-2.0; downstream crates
-linking to `kryphocron` are unconstrained and may ship under
-permissive licenses (MIT OR Apache-2.0 recommended for operator
-substrate components like PDS, AppView, etc.).
+The MPL is file-level copyleft: modifications to MPL-2.0-licensed source files
+must be released under MPL-2.0; downstream crates linking to `kryphocron` are
+unconstrained and may ship under permissive licenses (MIT OR Apache-2.0
+recommended for operator substrate components like PDS, AppView, etc.).
 
-The companion `kryphocron-lexicons` crate ships its lexicon JSON
-files under CC0-1.0 (public domain dedication); the wire
-vocabulary is universal and unencumbered.
-
-## Project shape
-
-Kryphocron is a privacy-first ATProto substrate by @skydeval.
-The crate is MPL-2.0; the companion lexicon JSON is CC0-1.0.
-See LICENSE for the full text.
+The companion `kryphocron-lexicons` crate ships its lexicon JSON under CC0-1.0
+(public domain dedication); the wire vocabulary is universal and unencumbered.
 
 ## Related
 
-- `kryphocron-lexicons` — companion crate shipping the v1
-  lexicon JSON + Rust codegen wrappers. Required for
-  consumers using lexicon-validated record types.
+- `kryphocron-lexicons` — companion crate shipping the lexicon JSON + Rust
+  codegen wrappers. Required for consumers using lexicon-validated record types.
