@@ -7,12 +7,15 @@
 //! The vocabulary the kryphocron substrate uses to express its
 //! threat-model commitments in Rust types.
 //!
-//! v0.1.0 ships the substrate's authority discipline end-to-end:
-//! issuance, bind, reborrow, context derivation, tier-aware
+//! The crate ships the substrate's authority discipline
+//! end-to-end: issuance, bind (with stage-3 audience-oracle
+//! consultation), reborrow, context derivation, tier-aware
 //! visibility, audit emission with composite-rollback semantics,
 //! timing-channel equalization, JWT and capability-claim
-//! verification, the three-message sync-handshake protocol, and
-//! the encryption-hook trait surfaces.
+//! verification, and the three-message sync-handshake protocol.
+//! 0.3 adds the §8.3 at-rest content-codec seam with an
+//! encoding-at-default baseline (laquna + a default rotation
+//! oracle).
 //!
 //! This crate provides:
 //!
@@ -103,21 +106,23 @@
 //!   the exception — it is encoding-at-default, not door-open:
 //!   the baseline installs a real codec (rev 3 §2.1).
 //!
-//! ## v0.1 enrichment posture
+//! ## Enrichment posture
 //!
 //! The audit pipeline is wired end-to-end. Certain audit-event
-//! payload fields ship with placeholder data in v0.1 pending
-//! per-class sealed-extraction traits in v0.2 (channel-class
+//! payload fields ship with placeholder data pending per-class
+//! sealed-extraction traits in a future release (channel-class
 //! peer + session id; substrate-class scope kind; moderation-
-//! class case id); user-class oracle consultations consult only
-//! the universal block-vs-resource-owner query in v0.1
-//! (multi-query consultations land alongside a per-capability
-//! oracle-results-builder in v0.2). The
-//! [`AuthContext::derive_for`] [`ingress::NarrowCapabilities`]
-//! narrowing ships recording-only — the [`AuthContext`] gains a
-//! capabilities field in v0.2 for structural superset
-//! enforcement. [`tier::visible_to`] is tier-only in v0.1; an
-//! audience-aware overload lands in v0.2.
+//! class case id). Bind consults the universal
+//! block-vs-resource-owner query and, for audience-gated
+//! capabilities, the audience oracle (§4.5); a generalized
+//! per-capability multi-query oracle-results-builder is future
+//! work. The [`AuthContext::derive_for`]
+//! [`ingress::NarrowCapabilities`] narrowing ships recording-only
+//! — the [`AuthContext`] gains a capabilities field in a future
+//! release for structural superset enforcement.
+//! [`tier::visible_to`] is the tier-only standalone predicate; an
+//! audience-aware overload is future work (bind itself already
+//! consults the audience oracle).
 //!
 //! [`PhantomData`]: core::marker::PhantomData
 
