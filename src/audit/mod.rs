@@ -136,6 +136,72 @@ pub use self::sinks::{
 /// §6.8's ordering guarantees, and §6.9's evolution discipline.
 pub const EVENT_SCHEMA_VERSION: SemVer = SemVer::new(1, 1, 0);
 
+/// The substrate audit-event type names, keyed to [`EVENT_SCHEMA_VERSION`].
+///
+/// Consumers building audit-event filter dropdowns or vocabulary-tracking
+/// surfaces read this to enumerate the current substrate event types without
+/// hardcoding the list. Each entry is the fully-qualified Rust variant path
+/// (`<Enum>::<Variant>`) across all five §6 audit-event enums:
+/// [`UserAuditEvent`] (§6.2), [`ChannelAuditEvent`] (§6.3),
+/// [`SubstrateAuditEvent`] (§6.4), [`ModerationAuditEvent`] (§6.5), and
+/// [`FallbackAuditEvent`] (§6.6).
+///
+/// The path-qualified form is deliberate: `CompositeRollbackMarker` recurs
+/// across four of the five enums, so bare variant names would collide; the
+/// `<Enum>::` prefix keeps every entry unique and maps each name directly to
+/// its source enum.
+///
+/// Grouped by enum (sink class), alphabetical within each group. Updated
+/// alongside any addition to one of the five audit-event enums; the
+/// exhaustive-match `*_variant_set_pinned` tests on those enums are the
+/// build-time forcing function that flags drift here. Additions are a
+/// schema-minor bump to [`EVENT_SCHEMA_VERSION`].
+pub const AUDIT_EVENT_TYPES: &[&str] = &[
+    // §6.2 user-class ([`UserAuditEvent`]).
+    "UserAuditEvent::CapabilityBound",
+    "UserAuditEvent::CapabilityIssuanceDenied",
+    "UserAuditEvent::CompositeRollbackMarker",
+    "UserAuditEvent::ContentDecodeFailed",
+    "UserAuditEvent::ContentEncodeFailed",
+    "UserAuditEvent::ContentEncoded",
+    "UserAuditEvent::DerivedContext",
+    "UserAuditEvent::ReborrowFailed",
+    // §6.3 channel-class ([`ChannelAuditEvent`]).
+    "ChannelAuditEvent::ChannelBound",
+    "ChannelAuditEvent::ChannelClosed",
+    "ChannelAuditEvent::ChannelIssuanceDenied",
+    "ChannelAuditEvent::ChannelReborrowFailed",
+    "ChannelAuditEvent::CompositeRollbackMarker",
+    "ChannelAuditEvent::SyncBatchRejected",
+    "ChannelAuditEvent::UnknownSessionMessage",
+    // §6.4 substrate-class ([`SubstrateAuditEvent`]).
+    "SubstrateAuditEvent::CompositeRollbackMarker",
+    "SubstrateAuditEvent::DeprecatedWriteDuringGrace",
+    "SubstrateAuditEvent::DidDocumentInvalidated",
+    "SubstrateAuditEvent::DidDocumentRotated",
+    "SubstrateAuditEvent::LexiconSetVersionChanged",
+    "SubstrateAuditEvent::MalformedRecordRejected",
+    "SubstrateAuditEvent::OracleFreshnessTransition",
+    "SubstrateAuditEvent::PeerTrustDenied",
+    "SubstrateAuditEvent::PeerTrustGranted",
+    "SubstrateAuditEvent::PeerTrustUnknown",
+    "SubstrateAuditEvent::RateLimitTriggered",
+    "SubstrateAuditEvent::RewriteOnRotateProgress",
+    "SubstrateAuditEvent::RewriteOnRotateStarted",
+    "SubstrateAuditEvent::RewriteOnRotateTerminated",
+    "SubstrateAuditEvent::ScopeBound",
+    "SubstrateAuditEvent::ScopeIssuanceDenied",
+    // §6.5 moderation-class ([`ModerationAuditEvent`]).
+    "ModerationAuditEvent::CompositeRollbackMarker",
+    "ModerationAuditEvent::ModerationIssuanceDenied",
+    "ModerationAuditEvent::ModeratorInspected",
+    "ModerationAuditEvent::ModeratorRestored",
+    "ModerationAuditEvent::ModeratorTookDown",
+    // §6.6 fallback-class ([`FallbackAuditEvent`]).
+    "FallbackAuditEvent::CompositeFailure",
+    "FallbackAuditEvent::SinkPanicked",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +215,22 @@ mod tests {
     #[test]
     fn event_schema_version_pinned_at_1_1_0() {
         assert_eq!(EVENT_SCHEMA_VERSION, SemVer::new(1, 1, 0));
+    }
+
+    /// `AUDIT_EVENT_TYPES` enumerates the five §6 audit-event enums' variants:
+    /// User (8) + Channel (7) + Substrate (16) + Moderation (5) + Fallback (2).
+    /// The count guards against a copy-paste slip in the list itself; the
+    /// per-enum `*_variant_set_pinned` exhaustive-match tests in `events.rs` are
+    /// the forcing function for keeping it in sync with the actual enums.
+    #[test]
+    fn audit_event_types_count_and_uniqueness() {
+        assert_eq!(AUDIT_EVENT_TYPES.len(), 8 + 7 + 16 + 5 + 2);
+        // Every entry is `<Enum>::<Variant>`-qualified, so all entries are
+        // unique even though `CompositeRollbackMarker` recurs across enums.
+        let mut seen = std::collections::HashSet::new();
+        for name in AUDIT_EVENT_TYPES {
+            assert!(name.contains("::"), "entry not enum-qualified: {name}");
+            assert!(seen.insert(*name), "duplicate entry: {name}");
+        }
     }
 }

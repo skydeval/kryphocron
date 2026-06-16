@@ -439,6 +439,41 @@ pub struct DecodeContext {
     pub operator_context: SmallVec<[(String, Vec<u8>); 2]>,
 }
 
+impl DecodeContext {
+    /// Construct a [`DecodeContext`] for a host-driven decode call.
+    ///
+    /// Matches the construction surface of [`RecordContentContext::new`] on the
+    /// encode side — host code building a decode request supplies the record's
+    /// identity tuple, optional audience binding, trace identity, and any
+    /// operator-context tags the codec implementation may consult. Mirrors the
+    /// encode-side symmetry: the encode path returns an [`EncodedRecord`]; the
+    /// decode path expects a [`DecodeContext`] constructed from the same kind of
+    /// stored identity that the encode path already had.
+    ///
+    /// `#[non_exhaustive]` remains on the struct: this adds public *construction*,
+    /// not full field exposure.
+    ///
+    /// [`RecordContentContext::new`]: crate::at_rest::RecordContentContext::new
+    #[must_use]
+    pub fn new(
+        nsid: Nsid,
+        rkey: RecordKey,
+        originator: Did,
+        audience_list: Option<AtUri>,
+        trace_id: TraceId,
+        operator_context: SmallVec<[(String, Vec<u8>); 2]>,
+    ) -> Self {
+        DecodeContext {
+            nsid,
+            rkey,
+            originator,
+            audience_list,
+            trace_id,
+            operator_context,
+        }
+    }
+}
+
 /// Codec-encoded record content as persisted, **constructed by the substrate**
 /// at the encode seam.
 ///
@@ -459,6 +494,40 @@ pub struct EncodedRecord {
     /// the resolved hint (persisted as `encodedContentGeneration`). `None` for
     /// rotation-less deployments.
     pub generation: Option<RotationGenerationMark>,
+}
+
+impl EncodedRecord {
+    /// Construct an [`EncodedRecord`] from stored fields.
+    ///
+    /// Consumers use this to rebuild an [`EncodedRecord`] from persisted lexicon
+    /// field values (`encodedContent` bytes, `encodedContentCodec` string,
+    /// optional `encodedContentGeneration` mark) before passing it to
+    /// [`crate::at_rest::decode_record_content`] /
+    /// [`ContentCodec::decode`]. Mirrors the encode-side
+    /// [`RecordContentContext::new`]: the encode path *returns* an
+    /// [`EncodedRecord`] to the host, so the decode path needs a public way to
+    /// reconstruct one from storage.
+    ///
+    /// The fields carry the same authority semantics as a substrate-stamped
+    /// record: `codec` is the codec id the content was encoded under (verified
+    /// against the installed codec at decode), and `generation` is the rotation
+    /// stamp the record was written under (`None` for rotation-less
+    /// deployments). `#[non_exhaustive]` remains on the struct: this adds public
+    /// *construction*, not full field exposure.
+    ///
+    /// [`RecordContentContext::new`]: crate::at_rest::RecordContentContext::new
+    #[must_use]
+    pub fn new(
+        codec: CodecId,
+        content: Vec<u8>,
+        generation: Option<RotationGenerationMark>,
+    ) -> Self {
+        EncodedRecord {
+            codec,
+            content,
+            generation,
+        }
+    }
 }
 
 /// Transforms private-tier record content at rest. The substrate commits this

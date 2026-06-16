@@ -211,6 +211,15 @@ mod target;
 mod timing;
 mod wire;
 
+/// The kryphocron substrate's crate version, as a static string.
+///
+/// Consumers building substrate-identity surfaces (operator dashboards, logs,
+/// audit headers) read this to surface `"kryphocron <version>"` without
+/// resolving the dependency version through their own build infrastructure.
+/// Sourced from `CARGO_PKG_VERSION` at compile time, so it always reflects the
+/// `Cargo.toml` version of the linked crate.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // Crate-root re-exports of the load-bearing public types.
 
 pub use at_rest::{
@@ -220,6 +229,7 @@ pub use at_rest::{
 pub use audit::{
     AuditError, ChannelAuditSink, FallbackAuditSink, ModerationAuditSink, SinkKind,
     SinkPanicGuard, SubstrateAuditSink, TerminatedSinkGuard, UserAuditSink,
+    AUDIT_EVENT_TYPES,
 };
 pub use authority::{
     check_jwt_scope_for, AuthDenial, AuthorityId, BindError, BindFailureReason,

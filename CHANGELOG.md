@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.1] — 2026-06-16
+
+### Added
+
+- `encryption::EncodedRecord::new(codec, content, generation)` — host-
+  constructible at-rest decode input, mirroring the encode-side
+  `at_rest::RecordContentContext::new`. Hosts rebuild an `EncodedRecord` from
+  persisted lexicon field values (`encodedContent`, `encodedContentCodec`,
+  `encodedContentGeneration`) before passing it to
+  `at_rest::decode_record_content` / `ContentCodec::decode`.
+- `encryption::DecodeContext::new(nsid, rkey, originator, audience_list,
+  trace_id, operator_context)` — host-constructible decode context, completing
+  the symmetry between encode and decode at the host-API surface.
+- `VERSION` — the substrate crate-version static (`env!("CARGO_PKG_VERSION")`),
+  for consumer identity surfaces (dashboards, logs, audit headers).
+- `audit::AUDIT_EVENT_TYPES` (re-exported as `AUDIT_EVENT_TYPES` at the crate
+  root) — enumeration of the substrate audit-event type names, keyed to
+  `audit::EVENT_SCHEMA_VERSION`, for consumer audit-vocabulary tooling. Covers
+  all five §6 audit-event enums (`UserAuditEvent`, `ChannelAuditEvent`,
+  `SubstrateAuditEvent`, `ModerationAuditEvent`, `FallbackAuditEvent`); each
+  entry is the `<Enum>::<Variant>` path so the recurring
+  `CompositeRollbackMarker` variant stays unambiguous.
+
+### Notes
+
+- This is a purely additive patch: no breaking changes, no behavior changes, no
+  field exposure beyond the new public constructors. The `#[non_exhaustive]`
+  attributes on `EncodedRecord` and `DecodeContext` remain — only public
+  construction is added, not full struct exposure.
+- The encode/decode asymmetry at the host-API surface (encode returned
+  `EncodedRecord` to the host; decode required the host to construct one but
+  exposed no constructor) was a 0.3.0 oversight surfaced by first-adopter
+  integration findings. 0.3.1 closes it.
+
 ## [0.3.0] — 2026-06-13
 
 ### Added
