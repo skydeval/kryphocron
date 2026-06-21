@@ -252,7 +252,7 @@ pub use encryption::{
     MAX_ROTATION_GENERATION_MARK_LEN,
 };
 pub use identity::{
-    CorrelationKey, KeyId, PublicKey, RotationChain, RotationEntry,
+    CorrelationKey, IssuerPublicKey, KeyId, PublicKey, RotationChain, RotationEntry,
     ServiceIdentity, SessionDigest, SessionId, SignatureAlgorithm,
     SubstrateSessionDerivationKey, TraceId,
 };

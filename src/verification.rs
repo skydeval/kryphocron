@@ -33,7 +33,7 @@ use thiserror::Error;
 
 use crate::authority::capability::CapabilityKind;
 use crate::identity::{
-    KeyId, PublicKey, ServiceIdentity, SessionId, SignatureAlgorithm, TraceId,
+    IssuerPublicKey, KeyId, PublicKey, ServiceIdentity, SessionId, SignatureAlgorithm, TraceId,
 };
 use crate::proto::Did;
 use crate::resolver::{DidResolutionError, DidResolver};
@@ -209,6 +209,11 @@ pub enum JwtVerificationError {
     /// Signature did not verify.
     #[error("JWT signature invalid")]
     SignatureInvalid,
+    /// ECDSA (ES256 / ES256K) signature was not low-S normalized. ATProto
+    /// canonicality requires low-S; a high-S signature is rejected rather than
+    /// normalized-and-accepted (signature-malleability resistance).
+    #[error("JWT signature not low-S")]
+    HighSSignature,
     /// JWT was expired.
     #[error("JWT expired (exp={exp:?}, now={now:?})")]
     Expired {
@@ -630,7 +635,7 @@ fn select_signing_key(
     document: &crate::resolver::DidDocument,
     kid_hint: Option<&str>,
     algorithm: SignatureAlgorithm,
-) -> Result<PublicKey, JwtVerificationError> {
+) -> Result<IssuerPublicKey, JwtVerificationError> {
     let methods = &document.verification_methods;
     if methods.is_empty() {
         return Err(JwtVerificationError::IssuerKeyNotInDocument);
@@ -640,8 +645,8 @@ fn select_signing_key(
         for (kid, key) in methods {
             let kid_hex = kid_to_hex(kid);
             if kid_matches(hint, &kid_hex) {
-                if key.algorithm == algorithm {
-                    return Ok(*key);
+                if key.algorithm() == algorithm {
+                    return Ok(key.clone());
                 }
                 return Err(JwtVerificationError::IssuerKeyNotInDocument);
             }
@@ -652,8 +657,8 @@ fn select_signing_key(
 
     // No hint — first matching algorithm wins.
     for (_kid, key) in methods {
-        if key.algorithm == algorithm {
-            return Ok(*key);
+        if key.algorithm() == algorithm {
+            return Ok(key.clone());
         }
     }
     Err(JwtVerificationError::IssuerKeyNotInDocument)
@@ -686,38 +691,110 @@ fn kid_to_hex(kid: &KeyId) -> String {
     s
 }
 
-/// Verify a JWT signature for the given algorithm.
+/// Verify a JWT signature for the given algorithm against an issuer key.
 ///
-/// Ed25519 is fully implemented in v0.1. ES256 / ES256K stub
-/// with `UnsupportedAlgorithm` until a future release commits
-/// the `p256` / `k256` crate dependencies; tracked alongside
-/// work.
+/// Dispatches by algorithm to the per-curve verifier. The `public_key`'s
+/// variant must match `algorithm` (the selector enforces this upstream); a
+/// mismatch rejects with `SignatureInvalid` at the verifier's let-else.
+///
+/// All three verifiers compute over the raw `signing_input` (the JWS
+/// `<header>.<payload>` substring); the ECDSA `Verifier` impls prehash SHA-256
+/// internally per RFC 7515 ES256 / ES256K.
 fn verify_signature(
     signing_input: &[u8],
     signature: &[u8],
     algorithm: SignatureAlgorithm,
-    public_key: &PublicKey,
+    public_key: &IssuerPublicKey,
 ) -> Result<(), JwtVerificationError> {
     match algorithm {
-        SignatureAlgorithm::Ed25519 => {
-            if signature.len() != ed25519_dalek::SIGNATURE_LENGTH {
-                return Err(JwtVerificationError::SignatureInvalid);
-            }
-            let mut sig_bytes = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
-            sig_bytes.copy_from_slice(signature);
-            let sig = Ed25519Signature::from_bytes(&sig_bytes);
-            let key = VerifyingKey::from_bytes(&public_key.bytes)
-                .map_err(|_| JwtVerificationError::SignatureInvalid)?;
-            key.verify(signing_input, &sig)
-                .map_err(|_| JwtVerificationError::SignatureInvalid)
+        SignatureAlgorithm::Ed25519 => verify_ed25519(signing_input, signature, public_key),
+        SignatureAlgorithm::Es256 => verify_p256(signing_input, signature, public_key),
+        SignatureAlgorithm::Es256K => verify_k256(signing_input, signature, public_key),
+    }
+}
+
+fn verify_ed25519(
+    signing_input: &[u8],
+    signature: &[u8],
+    public_key: &IssuerPublicKey,
+) -> Result<(), JwtVerificationError> {
+    let IssuerPublicKey::Ed25519(key_bytes) = public_key else {
+        return Err(JwtVerificationError::SignatureInvalid);
+    };
+    if signature.len() != ed25519_dalek::SIGNATURE_LENGTH {
+        return Err(JwtVerificationError::SignatureInvalid);
+    }
+    let mut sig_bytes = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
+    sig_bytes.copy_from_slice(signature);
+    let sig = Ed25519Signature::from_bytes(&sig_bytes);
+    let key =
+        VerifyingKey::from_bytes(key_bytes).map_err(|_| JwtVerificationError::SignatureInvalid)?;
+    key.verify(signing_input, &sig)
+        .map_err(|_| JwtVerificationError::SignatureInvalid)
+}
+
+/// secp256k1 / ES256K. SEC1 key (compressed 33 / uncompressed 65), fixed-width
+/// `r‖s` (64-byte) JWS signature, strict low-S rejection.
+fn verify_k256(
+    signing_input: &[u8],
+    signature: &[u8],
+    public_key: &IssuerPublicKey,
+) -> Result<(), JwtVerificationError> {
+    use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
+    let IssuerPublicKey::Secp256k1(key_bytes) = public_key else {
+        return Err(JwtVerificationError::SignatureInvalid);
+    };
+    let key =
+        VerifyingKey::from_sec1_bytes(key_bytes).map_err(|_| JwtVerificationError::SignatureInvalid)?;
+    // JWS signatures are fixed `r‖s` (64 bytes), NOT ASN.1 DER (RFC 7515 §3.4).
+    let sig = Signature::from_slice(signature).map_err(|_| JwtVerificationError::SignatureInvalid)?;
+    // Strict low-S: `normalize_s` returns `Some` iff the input was high-S.
+    if sig.normalize_s().is_some() {
+        return Err(JwtVerificationError::HighSSignature);
+    }
+    key.verify(signing_input, &sig)
+        .map_err(|_| JwtVerificationError::SignatureInvalid)
+}
+
+/// P-256 / ES256. SEC1 key, fixed-width `r‖s` JWS signature, strict low-S.
+fn verify_p256(
+    signing_input: &[u8],
+    signature: &[u8],
+    public_key: &IssuerPublicKey,
+) -> Result<(), JwtVerificationError> {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
+    let IssuerPublicKey::P256(key_bytes) = public_key else {
+        return Err(JwtVerificationError::SignatureInvalid);
+    };
+    let key =
+        VerifyingKey::from_sec1_bytes(key_bytes).map_err(|_| JwtVerificationError::SignatureInvalid)?;
+    let sig = Signature::from_slice(signature).map_err(|_| JwtVerificationError::SignatureInvalid)?;
+    if sig.normalize_s().is_some() {
+        return Err(JwtVerificationError::HighSSignature);
+    }
+    key.verify(signing_input, &sig)
+        .map_err(|_| JwtVerificationError::SignatureInvalid)
+}
+
+/// Extract the substrate-internal Ed25519 [`PublicKey`] from an
+/// [`IssuerPublicKey`], enforcing the substrate-Ed25519 invariant.
+///
+/// The capability-claim (§4.8) and sync-handshake (§7.5) verifiers resolve
+/// their issuer key from the same `DidDocument.verification_methods` JWT
+/// verification reads, but feed Ed25519-only wire verifiers that take a
+/// substrate [`PublicKey`] — those wire formats stay byte-identical. Substrate
+/// service keys are always Ed25519, so a non-Ed25519 issuer key on a wire path
+/// is a mismatch: this returns `None` (the caller maps to its own
+/// key-not-found / signature-invalid error) rather than truncating bytes or
+/// producing wrong-type confusion.
+fn extract_ed25519_pubkey(issuer_key: &IssuerPublicKey) -> Option<PublicKey> {
+    match issuer_key {
+        IssuerPublicKey::Ed25519(bytes) => {
+            Some(PublicKey::new(SignatureAlgorithm::Ed25519, *bytes))
         }
-        SignatureAlgorithm::Es256 | SignatureAlgorithm::Es256K => {
-            // v0.1 recognizes the variants but does not ship the
-            // `p256` / `k256` crate dependencies. Operators
-            // configuring these in `accepted_algorithms` will see
-            // this error; ECDSA support is a v0.2+ feature gate.
-            Err(JwtVerificationError::UnsupportedAlgorithm(algorithm))
-        }
+        IssuerPublicKey::Secp256k1(_) | IssuerPublicKey::P256(_) => None,
     }
 }
 
@@ -1389,8 +1466,13 @@ fn select_signing_key_for_claim(
         .iter()
         .chain(document.rotation_history.iter())
     {
-        if *kid == expected_key_id && key.algorithm == algorithm {
-            return Ok(*key);
+        // Substrate capability claims are Ed25519-only (§4.8 wire format).
+        // Extract the substrate `PublicKey` from the Ed25519 issuer-key
+        // variant; a non-Ed25519 key on this path is not a valid claim signer.
+        if *kid == expected_key_id && key.algorithm() == algorithm {
+            if let Some(pk) = extract_ed25519_pubkey(key) {
+                return Ok(pk);
+            }
         }
     }
     Err(ClaimVerificationError::IssuerKeyNotInDocument)
@@ -2191,8 +2273,13 @@ fn select_handshake_signing_key(
         .iter()
         .chain(document.rotation_history.iter())
     {
-        if *kid == expected_key_id && key.algorithm == algorithm {
-            return Ok(*key);
+        // Sync-handshake counterparties are substrate services (Ed25519-only,
+        // §7.5 wire format). Extract the substrate `PublicKey` from the Ed25519
+        // issuer-key variant; a non-Ed25519 key is not a valid counterparty.
+        if *kid == expected_key_id && key.algorithm() == algorithm {
+            if let Some(pk) = extract_ed25519_pubkey(key) {
+                return Ok(pk);
+            }
         }
     }
     Err(SyncHandshakeVerificationError::CounterpartyKeyNotInDocument)
@@ -2438,10 +2525,18 @@ async fn verify_hop(
         .chain(document.rotation_history.iter())
     {
         tried_any_key = true;
-        if candidate_key.algorithm != entry.receipt.algorithm {
+        if candidate_key.algorithm() != entry.receipt.algorithm {
             continue;
         }
         tried_matching_alg = true;
+
+        // Delegation receipts are substrate-signed (Ed25519-only, §4.8 W11/W12).
+        // Extract the substrate `PublicKey` from the Ed25519 issuer-key variant
+        // so `verify_delegation_receipt` (which takes `&PublicKey`) and its wire
+        // path stay untouched; a non-Ed25519 key is not a valid receipt signer.
+        let Some(candidate_pk) = extract_ed25519_pubkey(candidate_key) else {
+            continue;
+        };
 
         let payload = DelegationReceiptPayload {
             previous_principal_did: previous_did.clone(),
@@ -2452,7 +2547,7 @@ async fn verify_hop(
             granted_capabilities: entry.granted_capabilities.clone(),
             derived_at: entry.derived_at,
         };
-        if verify_delegation_receipt(&payload, &entry.receipt, candidate_key) {
+        if verify_delegation_receipt(&payload, &entry.receipt, &candidate_pk) {
             // 2f — W13 monotonicity check. Apply AFTER signature
             // verification: a forged signature would be rejected
             // before the monotonicity check has a chance to run.
@@ -2603,7 +2698,11 @@ mod tests {
         fn insert(&self, did: &Did, key_id: KeyId, key: PublicKey) {
             let doc = DidDocument {
                 did: did.clone(),
-                verification_methods: vec![(key_id, key)],
+                // Algorithm-preserving conversion: tests insert keys of varying
+                // algorithms (e.g. an Es256 key to exercise the algorithm-
+                // mismatch path), so the `IssuerPublicKey` variant must follow
+                // the `PublicKey`'s `algorithm` tag, not force Ed25519.
+                verification_methods: vec![(key_id, pubkey_to_issuer(&key))],
                 rotation_history: vec![],
                 services: vec![],
                 also_known_as: vec![],
@@ -2615,6 +2714,20 @@ mod tests {
 
         fn insert_err(&self, did: &Did, err: DidResolutionError) {
             self.documents.lock().unwrap().insert(did.as_str().to_string(), Err(err));
+        }
+    }
+
+    /// Algorithm-preserving `PublicKey` → `IssuerPublicKey` for test fixtures.
+    /// Follows the `algorithm` tag so fixtures exercising the algorithm-mismatch
+    /// path (e.g. an Es256-tagged key against an Ed25519 receipt) keep their
+    /// declared algorithm. The ECDSA variants' bytes need not be valid SEC1 for
+    /// the algorithm-mismatch tests (they're filtered by the algorithm check
+    /// before any key parse).
+    fn pubkey_to_issuer(pk: &PublicKey) -> IssuerPublicKey {
+        match pk.algorithm {
+            SignatureAlgorithm::Ed25519 => IssuerPublicKey::Ed25519(pk.bytes),
+            SignatureAlgorithm::Es256 => IssuerPublicKey::P256(pk.bytes.to_vec()),
+            SignatureAlgorithm::Es256K => IssuerPublicKey::Secp256k1(pk.bytes.to_vec()),
         }
     }
 
@@ -3631,8 +3744,11 @@ mod tests {
         };
         let mut doc = crate::resolver::DidDocument {
             did: issuer.service_did().clone(),
-            verification_methods: vec![(KeyId::from_bytes([0xFF; 32]), rotated_in_pub)],
-            rotation_history: vec![(issuer.key_id(), *issuer.key_material())],
+            verification_methods: vec![(
+                KeyId::from_bytes([0xFF; 32]),
+                IssuerPublicKey::Ed25519(rotated_in_pub.bytes),
+            )],
+            rotation_history: vec![(issuer.key_id(), IssuerPublicKey::Ed25519(issuer.key_material().bytes))],
             services: vec![],
             also_known_as: vec![],
             resolved_at: SystemTime::now(),
@@ -3640,7 +3756,7 @@ mod tests {
         };
         // Also keep the rotation-history field's KeyId aligned
         // with the claim issuer's KeyId so the lookup matches.
-        doc.rotation_history = vec![(issuer.key_id(), *issuer.key_material())];
+        doc.rotation_history = vec![(issuer.key_id(), IssuerPublicKey::Ed25519(issuer.key_material().bytes))];
         r.documents
             .lock()
             .unwrap()
@@ -3684,8 +3800,14 @@ mod tests {
         };
         let doc = crate::resolver::DidDocument {
             did: issuer.service_did().clone(),
-            verification_methods: vec![(KeyId::from_bytes([0x11; 32]), unrelated_pub)],
-            rotation_history: vec![(KeyId::from_bytes([0x22; 32]), unrelated_pub)],
+            verification_methods: vec![(
+                KeyId::from_bytes([0x11; 32]),
+                IssuerPublicKey::Ed25519(unrelated_pub.bytes),
+            )],
+            rotation_history: vec![(
+                KeyId::from_bytes([0x22; 32]),
+                IssuerPublicKey::Ed25519(unrelated_pub.bytes),
+            )],
             services: vec![],
             also_known_as: vec![],
             resolved_at: SystemTime::now(),
@@ -4724,5 +4846,229 @@ mod tests {
             err,
             SyncHandshakeVerificationError::CounterpartyIdentityMismatch
         ));
+    }
+}
+
+#[cfg(test)]
+mod ecdsa_verifier_tests {
+    //! ES256K / ES256 signature-verifier coverage (Action 7). Signing is built
+    //! inline (k256 / p256 `SigningKey`) so the suite runs under a plain
+    //! `cargo test` without the `test-support` feature; the exposed fixtures in
+    //! `identity::fixtures` mirror these for downstream consumers.
+
+    use super::*;
+
+    /// Big-endian 256-bit subtraction `a - b` (a > b assumed). Used to build a
+    /// high-S signature (`s' = n - s`) without depending on the crates' scalar
+    /// API, which varies across minor versions.
+    fn be_sub(a: &[u8; 32], b: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let mut d = a[i] as i16 - b[i] as i16 - borrow;
+            if d < 0 {
+                d += 256;
+                borrow = 1;
+            } else {
+                borrow = 0;
+            }
+            out[i] = d as u8;
+        }
+        out
+    }
+
+    /// Flip a 64-byte `r‖s` signature to its high-S complement `r‖(n - s)`.
+    fn to_high_s(sig64: &[u8], order: &[u8; 32]) -> Vec<u8> {
+        let s_high = be_sub(order, &sig64[32..64]);
+        let mut out = sig64[..32].to_vec();
+        out.extend_from_slice(&s_high);
+        out
+    }
+
+    // secp256k1 group order n.
+    const SECP256K1_N: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36,
+        0x41, 0x41,
+    ];
+    // NIST P-256 group order n.
+    const P256_N: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
+        0x25, 0x51,
+    ];
+
+    const MSG: &[u8] = b"eyJhbGciOiJFUzI1NksifQ.eyJpc3MiOiJkaWQ6cGxjOnRlc3QifQ";
+
+    // ───────────────────────── ES256K (secp256k1) ─────────────────────────
+
+    fn k256_pair(seed: u8) -> (k256::ecdsa::SigningKey, IssuerPublicKey) {
+        let sk = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("seed");
+        let pk = IssuerPublicKey::Secp256k1(
+            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+        );
+        (sk, pk)
+    }
+
+    fn k256_low_s(sk: &k256::ecdsa::SigningKey, msg: &[u8]) -> Vec<u8> {
+        use k256::ecdsa::{signature::Signer, Signature};
+        let sig: Signature = sk.sign(msg);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        sig.to_bytes().to_vec()
+    }
+
+    #[test]
+    fn es256k_happy_path() {
+        let (sk, pk) = k256_pair(1);
+        let sig = k256_low_s(&sk, MSG);
+        assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256K, &pk).is_ok());
+    }
+
+    #[test]
+    fn es256k_rejects_wrong_signature() {
+        let (_sk, pk) = k256_pair(1);
+        let (other, _) = k256_pair(2);
+        let sig = k256_low_s(&other, MSG);
+        assert_eq!(
+            verify_signature(MSG, &sig, SignatureAlgorithm::Es256K, &pk).unwrap_err(),
+            JwtVerificationError::SignatureInvalid
+        );
+    }
+
+    #[test]
+    fn es256k_rejects_malformed_key() {
+        let (sk, _) = k256_pair(1);
+        let sig = k256_low_s(&sk, MSG);
+        let bad = IssuerPublicKey::Secp256k1(vec![0u8; 10]);
+        assert_eq!(
+            verify_signature(MSG, &sig, SignatureAlgorithm::Es256K, &bad).unwrap_err(),
+            JwtVerificationError::SignatureInvalid
+        );
+    }
+
+    #[test]
+    fn es256k_rejects_wrong_alg_on_key() {
+        // Ed25519 key handed to the Es256K verifier → SignatureInvalid (let-else).
+        let key = IssuerPublicKey::Ed25519([3u8; 32]);
+        assert_eq!(
+            verify_signature(MSG, &[0u8; 64], SignatureAlgorithm::Es256K, &key).unwrap_err(),
+            JwtVerificationError::SignatureInvalid
+        );
+    }
+
+    #[test]
+    fn es256k_rejects_high_s() {
+        let (sk, pk) = k256_pair(1);
+        let low = k256_low_s(&sk, MSG);
+        let high = to_high_s(&low, &SECP256K1_N);
+        assert_eq!(
+            verify_signature(MSG, &high, SignatureAlgorithm::Es256K, &pk).unwrap_err(),
+            JwtVerificationError::HighSSignature
+        );
+    }
+
+    #[test]
+    fn es256k_accepts_compressed_and_uncompressed_sec1() {
+        let (sk, _) = k256_pair(1);
+        let sig = k256_low_s(&sk, MSG);
+        let comp = IssuerPublicKey::Secp256k1(
+            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+        );
+        let uncomp = IssuerPublicKey::Secp256k1(
+            sk.verifying_key().to_encoded_point(false).as_bytes().to_vec(),
+        );
+        assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256K, &comp).is_ok());
+        assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256K, &uncomp).is_ok());
+    }
+
+    // ───────────────────────── ES256 (P-256) ─────────────────────────
+
+    fn p256_pair(seed: u8) -> (p256::ecdsa::SigningKey, IssuerPublicKey) {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("seed");
+        let pk = IssuerPublicKey::P256(
+            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+        );
+        (sk, pk)
+    }
+
+    fn p256_low_s(sk: &p256::ecdsa::SigningKey, msg: &[u8]) -> Vec<u8> {
+        use p256::ecdsa::{signature::Signer, Signature};
+        let sig: Signature = sk.sign(msg);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        sig.to_bytes().to_vec()
+    }
+
+    #[test]
+    fn es256_happy_path() {
+        let (sk, pk) = p256_pair(1);
+        let sig = p256_low_s(&sk, MSG);
+        assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256, &pk).is_ok());
+    }
+
+    #[test]
+    fn es256_rejects_wrong_signature() {
+        let (_sk, pk) = p256_pair(1);
+        let (other, _) = p256_pair(2);
+        let sig = p256_low_s(&other, MSG);
+        assert_eq!(
+            verify_signature(MSG, &sig, SignatureAlgorithm::Es256, &pk).unwrap_err(),
+            JwtVerificationError::SignatureInvalid
+        );
+    }
+
+    #[test]
+    fn es256_rejects_malformed_key() {
+        let (sk, _) = p256_pair(1);
+        let sig = p256_low_s(&sk, MSG);
+        let bad = IssuerPublicKey::P256(vec![0u8; 10]);
+        assert_eq!(
+            verify_signature(MSG, &sig, SignatureAlgorithm::Es256, &bad).unwrap_err(),
+            JwtVerificationError::SignatureInvalid
+        );
+    }
+
+    #[test]
+    fn es256_rejects_wrong_alg_on_key() {
+        let key = IssuerPublicKey::Ed25519([3u8; 32]);
+        assert_eq!(
+            verify_signature(MSG, &[0u8; 64], SignatureAlgorithm::Es256, &key).unwrap_err(),
+            JwtVerificationError::SignatureInvalid
+        );
+    }
+
+    #[test]
+    fn es256_rejects_high_s() {
+        let (sk, pk) = p256_pair(1);
+        let low = p256_low_s(&sk, MSG);
+        let high = to_high_s(&low, &P256_N);
+        assert_eq!(
+            verify_signature(MSG, &high, SignatureAlgorithm::Es256, &pk).unwrap_err(),
+            JwtVerificationError::HighSSignature
+        );
+    }
+
+    #[test]
+    fn es256_accepts_compressed_and_uncompressed_sec1() {
+        let (sk, _) = p256_pair(1);
+        let sig = p256_low_s(&sk, MSG);
+        let comp = IssuerPublicKey::P256(
+            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+        );
+        let uncomp = IssuerPublicKey::P256(
+            sk.verifying_key().to_encoded_point(false).as_bytes().to_vec(),
+        );
+        assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256, &comp).is_ok());
+        assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256, &uncomp).is_ok());
+    }
+
+    // ───────────────────── wire-path Ed25519 extraction ─────────────────────
+
+    #[test]
+    fn extract_ed25519_accepts_ed25519_rejects_ecdsa() {
+        // Regression guard for the substrate-Ed25519 invariant: the claim /
+        // handshake / receipt wire paths only accept the Ed25519 variant.
+        assert!(extract_ed25519_pubkey(&IssuerPublicKey::Ed25519([1u8; 32])).is_some());
+        assert!(extract_ed25519_pubkey(&IssuerPublicKey::Secp256k1(vec![2u8; 33])).is_none());
+        assert!(extract_ed25519_pubkey(&IssuerPublicKey::P256(vec![3u8; 33])).is_none());
     }
 }

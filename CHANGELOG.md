@@ -4,6 +4,78 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased] — 0.3.2-dev
+
+### Added
+
+- ES256 / ES256K JWT signature verification (`verification.rs`) on RustCrypto's
+  `k256` (secp256k1) and `p256` (P-256). Pure-Rust, no FFI, no OpenSSL —
+  preserves the substrate's static-musl-friendly posture. Closes the deferred
+  ECDSA gap that limited authenticated-path testing to Ed25519-only synthetic
+  tokens; the forward-looking `SignatureAlgorithm` allowlist (`Es256K`, `Es256`,
+  `Ed25519`) now has matching verification logic for all three. Real ATProto
+  tokens (predominantly secp256k1 via did:plc) verify through the `test-support`
+  fixtures today; end-to-end via real-DID-resolved documents lands once the
+  multicodec curve-detection in `parse_did_document` ships (see Changed).
+- `identity::IssuerPublicKey` enum decoupling the DID-document / JWT-issuer key
+  population from the substrate-internal `PublicKey`. Variants:
+  `Ed25519([u8;32])`, `Secp256k1(Vec<u8>)`, `P256(Vec<u8>)`; SEC1 compressed (33)
+  and uncompressed (65) both accepted, stored as received. `#[non_exhaustive]`
+  for future algorithms. Re-exported at the crate root.
+- Strict low-S signature rejection on both ECDSA verifiers (ATProto canonicality
+  + signature-malleability resistance): `Signature::normalize_s().is_some()`
+  detects high-S, rejected via the new `JwtVerificationError::HighSSignature`
+  variant. JWS signatures parse as fixed `r‖s` (64 bytes), not ASN.1 DER
+  (`Signature::from_slice`).
+- ES256/K signed-JWT fixtures via the existing `test-support` feature
+  (`identity::fixtures::{secp256k1_signing_pair, p256_signing_pair,
+  sign_jwt_es256k, sign_jwt_es256}`). §0.4 keeps them compile-excluded from
+  release builds; downstream consumers enable the feature in `[dev-dependencies]`
+  only.
+
+### Changed
+
+- `DidDocument.verification_methods` and `rotation_history` carry
+  `Vec<(KeyId, IssuerPublicKey)>` (was `Vec<(KeyId, PublicKey)>`);
+  `DidDocument::new`'s public signature adjusts. The substrate-internal
+  `PublicKey`, `ServiceIdentity`, and the §4.8 capability-claim + §7.5
+  sync-handshake wire formats are **unchanged** — the decoupling localizes the
+  widening to the issuer-key path via an `extract_ed25519_pubkey` adapter at the
+  wire-path selector boundaries (substrate service keys are always Ed25519). The
+  adapter is applied at four `verification_methods` consumers: the JWT selector
+  (returns `IssuerPublicKey`) plus the capability-claim, sync-handshake, and
+  attribution-chain-receipt selectors (each extracts an Ed25519 `PublicKey`).
+- `parse_did_document` now produces `IssuerPublicKey::Ed25519` for real DID
+  documents. **The parse path remains Ed25519-only**: `decode_multibase_key`
+  does not yet read the multibase multicodec prefix to detect secp256k1 / P-256
+  keys, so real did:plc / did:web documents carrying ECDSA keys won't reach the
+  new verifiers until the follow-on multicodec-curve-detection arc. ES256K /
+  ES256 verification IS reachable today via the `test-support` fixtures (which
+  construct the ECDSA `IssuerPublicKey` variants directly, bypassing the parser).
+- `JwtVerificationError`: new `HighSSignature` variant (the enum is
+  `#[non_exhaustive]`). All other ECDSA failure modes — malformed key, malformed
+  signature, wrong-algorithm-on-key, verify-fail — consolidate into the existing
+  `SignatureInvalid` per the established convention (no four-variant expansion).
+
+### Dependencies
+
+- `k256 = "~0.13"` (ecdsa feature, default-features off) — secp256k1 / ES256K.
+- `p256 = "~0.13"` (ecdsa feature, default-features off) — P-256 / ES256.
+  Both RustCrypto, pure-Rust, no FFI; integrate via `signature::Verifier`
+  matching `ed25519-dalek 2.x`. `cargo tree -i openssl-sys` / `-i native-tls`
+  remain empty.
+
+### Tests
+
+- `ecdsa_verifier_tests` module in `verification.rs` (13 tests): happy-path,
+  wrong-signature, malformed-key, wrong-algorithm-on-key, high-S rejection, and
+  compressed-vs-uncompressed SEC1 acceptance for each of ES256K and ES256, plus
+  an `extract_ed25519_pubkey` regression guard (Ed25519 accepted; ECDSA
+  variants rejected) for the substrate-Ed25519 wire-path invariant. Signing is
+  inline (no `test-support` needed for the in-crate suite); high-S signatures
+  are built by `n − s` complement so the test is independent of the ECDSA
+  crates' scalar API.
+
 ## [0.3.1] — 2026-06-16
 
 ### Added

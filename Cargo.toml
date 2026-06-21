@@ -30,6 +30,12 @@ async-trait = "0.1"                 # async trait surfaces (§7 resolver, §8 ho
 smallvec = "1.13"                   # bounded inline vectors (capabilities, chains, scopes)
 thiserror = "2"                     # structured error derivation across §4 enums
 ed25519-dalek = "~2.2"              # JWT signature verification per §7.2 (Ed25519 default)
+# §7.2 ECDSA JWT verification (ES256K = secp256k1, ES256 = P-256). RustCrypto,
+# pure-Rust, no FFI/OpenSSL; integrate via signature::Verifier (same trait
+# family as ed25519-dalek 2.x). Tilde-pinned: signature verification is
+# correctness-critical, so minor bumps must be explicit edits.
+k256 = { version = "~0.13", default-features = false, features = ["ecdsa"] }   # ES256K (secp256k1)
+p256 = { version = "~0.13", default-features = false, features = ["ecdsa"] }   # ES256 (P-256)
 base64 = "~0.22"                    # base64url JWT segment decoding (§7.2)
 serde_json = "1"                    # JSON parsing on the §7.2 JWT verification path
 ciborium = "~0.2"                   # canonical CBOR for the §4.8 capability-claim wire format

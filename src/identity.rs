@@ -155,6 +155,59 @@ pub enum SignatureAlgorithm {
     Es256K,
 }
 
+/// External-issuer public key for JWT signature verification.
+///
+/// Distinct from the substrate-internal [`PublicKey`] (which is a fixed
+/// `[u8; 32]` Ed25519 body encoded into the §4.8 capability-claim and §7.5
+/// sync-handshake wire formats at that fixed width). `IssuerPublicKey` carries
+/// the variable-width ECDSA keys real ATProto issuers use — secp256k1 (ES256K,
+/// the did:plc canonical curve) and P-256 (ES256) — alongside Ed25519, sized
+/// per-algorithm.
+///
+/// Used in [`crate::resolver::DidDocument::verification_methods`] and consumed
+/// by the JWT signature verifier. It never enters the substrate's internal key
+/// path or either wire format: the capability-claim / sync-handshake verifiers
+/// extract a substrate [`PublicKey`] from the `Ed25519` variant at their
+/// selector boundary (substrate service keys are always Ed25519), so the wire
+/// formats stay byte-identical.
+///
+/// `#[non_exhaustive]` reserves room for future algorithms without breaking
+/// external matches.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IssuerPublicKey {
+    /// Ed25519 key — 32 raw bytes.
+    Ed25519([u8; 32]),
+    /// secp256k1 (ES256K) key — SEC1-encoded, compressed (33) or uncompressed
+    /// (65) accepted, stored as received.
+    Secp256k1(Vec<u8>),
+    /// P-256 (ES256) key — SEC1-encoded, compressed (33) or uncompressed (65)
+    /// accepted, stored as received.
+    P256(Vec<u8>),
+}
+
+impl IssuerPublicKey {
+    /// The signing algorithm this key material is interpreted under.
+    #[must_use]
+    pub fn algorithm(&self) -> SignatureAlgorithm {
+        match self {
+            Self::Ed25519(_) => SignatureAlgorithm::Ed25519,
+            Self::Secp256k1(_) => SignatureAlgorithm::Es256K,
+            Self::P256(_) => SignatureAlgorithm::Es256,
+        }
+    }
+
+    /// The raw key bytes — Ed25519 is 32 raw bytes; ECDSA variants are SEC1.
+    /// The caller interprets them per [`algorithm`](Self::algorithm).
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Ed25519(b) => b.as_slice(),
+            Self::Secp256k1(b) | Self::P256(b) => b.as_slice(),
+        }
+    }
+}
+
 /// Substrate-internal service principal identity (§4.8).
 ///
 /// Composed of a service DID, a specific signing-key id and
@@ -607,5 +660,78 @@ mod tests {
         let d2 = SessionDigest::compute(&s2, &key);
 
         assert_ne!(d1, d2);
+    }
+}
+
+/// Test-support signing fixtures for ES256K / ES256 (and Ed25519) JWTs.
+///
+/// Exposed under the `test-support` feature so downstream crates can build
+/// signed-JWT happy-path fixtures against the new ECDSA verifiers without
+/// hand-rolling JWS signing. §0.4 keeps `test-support` compile-excluded from
+/// release builds; enable it only in `[dev-dependencies]`.
+#[cfg(feature = "test-support")]
+pub mod fixtures {
+    use super::IssuerPublicKey;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    /// Deterministic secp256k1 signing key + matching `IssuerPublicKey`
+    /// (compressed SEC1), seed-driven for reproducible tests.
+    #[must_use]
+    pub fn secp256k1_signing_pair(seed: [u8; 32]) -> (k256::ecdsa::SigningKey, IssuerPublicKey) {
+        let sk = k256::ecdsa::SigningKey::from_slice(&seed).expect("valid secp256k1 seed");
+        let pk = IssuerPublicKey::Secp256k1(
+            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+        );
+        (sk, pk)
+    }
+
+    /// Deterministic P-256 signing key + matching `IssuerPublicKey` (compressed
+    /// SEC1).
+    #[must_use]
+    pub fn p256_signing_pair(seed: [u8; 32]) -> (p256::ecdsa::SigningKey, IssuerPublicKey) {
+        let sk = p256::ecdsa::SigningKey::from_slice(&seed).expect("valid p256 seed");
+        let pk = IssuerPublicKey::P256(
+            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+        );
+        (sk, pk)
+    }
+
+    /// Build the JWS signing input `b64url(header).b64url(payload)`.
+    fn jws_signing_input(header: &serde_json::Value, payload: &serde_json::Value) -> String {
+        format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(header).expect("header JSON")),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).expect("payload JSON")),
+        )
+    }
+
+    /// Sign a JWT with ES256K (secp256k1). Returns the compact JWS string. The
+    /// signature is low-S normalized (ATProto canonical) and fixed `r‖s`.
+    #[must_use]
+    pub fn sign_jwt_es256k(
+        header: &serde_json::Value,
+        payload: &serde_json::Value,
+        signing_key: &k256::ecdsa::SigningKey,
+    ) -> String {
+        use k256::ecdsa::{signature::Signer, Signature};
+        let signing_input = jws_signing_input(header, payload);
+        let sig: Signature = signing_key.sign(signing_input.as_bytes());
+        let sig = sig.normalize_s().unwrap_or(sig);
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    /// Sign a JWT with ES256 (P-256). See [`sign_jwt_es256k`].
+    #[must_use]
+    pub fn sign_jwt_es256(
+        header: &serde_json::Value,
+        payload: &serde_json::Value,
+        signing_key: &p256::ecdsa::SigningKey,
+    ) -> String {
+        use p256::ecdsa::{signature::Signer, Signature};
+        let signing_input = jws_signing_input(header, payload);
+        let sig: Signature = signing_key.sign(signing_input.as_bytes());
+        let sig = sig.normalize_s().unwrap_or(sig);
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
     }
 }

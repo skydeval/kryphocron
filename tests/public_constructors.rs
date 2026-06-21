@@ -13,12 +13,12 @@ use std::time::{Duration, SystemTime};
 
 use kryphocron::resolver::{DidDocument, DidService};
 use kryphocron::{
-    AtUri, CodecId, DecodeContext, Did, EncodedRecord, KeyId, Nsid, PublicKey, RecordKey,
-    RotationGenerationMark, ServiceIdentity, SignatureAlgorithm, TraceId,
+    AtUri, CodecId, DecodeContext, Did, EncodedRecord, IssuerPublicKey, KeyId, Nsid, PublicKey,
+    RecordKey, RotationGenerationMark, ServiceIdentity, SignatureAlgorithm, TraceId,
 };
 
-fn sample_pubkey() -> PublicKey {
-    PublicKey::new(SignatureAlgorithm::Ed25519, [7u8; 32])
+fn sample_pubkey() -> IssuerPublicKey {
+    IssuerPublicKey::Ed25519([7u8; 32])
 }
 
 #[test]
@@ -27,7 +27,10 @@ fn service_identity_constructible_externally() {
     let identity = ServiceIdentity::new(
         did.clone(),
         KeyId::from_bytes([1u8; 32]),
-        sample_pubkey(),
+        // ServiceIdentity carries the substrate-internal `PublicKey` (Ed25519,
+        // on the wire) — distinct from the `IssuerPublicKey` a DID document
+        // carries (see `did_document_and_service_constructible_externally`).
+        PublicKey::new(SignatureAlgorithm::Ed25519, [7u8; 32]),
         None, // fresh service: no prior rotation chain
     );
     // `verify_jwt`'s audience check consults only `service_did()`; confirm it

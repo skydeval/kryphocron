@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::audit::{SubstrateAuditEvent, SubstrateAuditSink};
-use crate::identity::{KeyId, PublicKey, TraceId};
+use crate::identity::{IssuerPublicKey, KeyId, TraceId};
 use crate::proto::Did;
 
 /// Substrate-side hard ceiling on the per-request DID document
@@ -47,16 +47,20 @@ pub const MAX_TRUST_ROOT_CACHE_AGE: Duration = Duration::from_secs(60);
 ///
 /// The §7.3 prose uses `Vec<VerificationMethod>` for
 /// `verification_methods`; the in-crate shape carries
-/// `Vec<(KeyId, PublicKey)>` for ergonomic key lookup.
+/// `Vec<(KeyId, IssuerPublicKey)>` for ergonomic key lookup. The key type is
+/// [`IssuerPublicKey`] (not the substrate-internal [`PublicKey`]) so the
+/// document can carry the variable-width ECDSA keys real ATProto issuers use;
+/// the substrate-internal wire paths extract an Ed25519 [`PublicKey`] at their
+/// selector boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DidDocument {
     /// The DID this document describes.
     pub did: Did,
     /// Currently-active verification methods keyed by key id.
-    pub verification_methods: Vec<(KeyId, PublicKey)>,
+    pub verification_methods: Vec<(KeyId, IssuerPublicKey)>,
     /// Historical key rotations, oldest first.
-    pub rotation_history: Vec<(KeyId, PublicKey)>,
+    pub rotation_history: Vec<(KeyId, IssuerPublicKey)>,
     /// Service endpoints declared by the document (§7.3). Empty
     /// for documents whose method doesn't expose service entries.
     pub services: Vec<DidService>,
@@ -81,8 +85,8 @@ impl DidDocument {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         did: Did,
-        verification_methods: Vec<(KeyId, PublicKey)>,
-        rotation_history: Vec<(KeyId, PublicKey)>,
+        verification_methods: Vec<(KeyId, IssuerPublicKey)>,
+        rotation_history: Vec<(KeyId, IssuerPublicKey)>,
         services: Vec<DidService>,
         also_known_as: Vec<String>,
         resolved_at: SystemTime,
@@ -99,6 +103,14 @@ impl DidDocument {
         }
     }
 }
+
+// DidDocument must stay `Send + Sync` (resolvers hand it across async
+// boundaries). `IssuerPublicKey`'s `Vec<u8>` variants are `Send + Sync` by std
+// auto-derive, so this carries through; the assert is a regression guard.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<DidDocument>();
+};
 
 /// Service endpoint declared by a DID document (§7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,13 +606,23 @@ fn parse_did_document(
             // placeholder until §7.3's KeyId derivation rule is
             // committed in spec polish.
             let key_id = synthesize_key_id(id, &key_bytes);
-            verification_methods.push((
-                key_id,
-                PublicKey {
-                    algorithm: crate::identity::SignatureAlgorithm::Ed25519,
-                    bytes: key_bytes,
-                },
-            ));
+            // TODO(real-did-resolution arc): multicodec curve-detection.
+            //
+            // This hardcodes Ed25519 because `decode_multibase_key` returns
+            // `[u8; 32]` without reading the multibase multicodec prefix to
+            // detect the curve. did:plc's canonical signing key is secp256k1
+            // (multicodec 0xe7, 33 compressed bytes) and won't parse correctly
+            // through this path until the real-DID-resolution arc (a) widens
+            // `decode_multibase_key`'s return to a per-curve byte vector and
+            // (b) reads the multicodec prefix to dispatch to the right
+            // `IssuerPublicKey` variant.
+            //
+            // ES256K + ES256 *verification* IS reachable today via the
+            // `test-support` fixtures, which construct
+            // `IssuerPublicKey::{Secp256k1, P256}` directly and bypass this
+            // parser. This TODO is about the parse-from-real-DID-document path,
+            // not the verify-the-signature path.
+            verification_methods.push((key_id, IssuerPublicKey::Ed25519(key_bytes)));
         }
     }
 
@@ -852,17 +874,13 @@ pub enum PeerTrustError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::SignatureAlgorithm;
 
     fn sample_did() -> Did {
         Did::new("did:plc:resolverexample").unwrap()
     }
 
-    fn sample_pubkey(byte: u8) -> PublicKey {
-        PublicKey {
-            algorithm: SignatureAlgorithm::Ed25519,
-            bytes: [byte; 32],
-        }
+    fn sample_pubkey(byte: u8) -> IssuerPublicKey {
+        IssuerPublicKey::Ed25519([byte; 32])
     }
 
     fn sample_doc(did: &Did, key_byte: u8) -> DidDocument {
@@ -1202,7 +1220,7 @@ mod tests {
         let doc = parse_did_document(&did, &raw).unwrap();
         assert_eq!(doc.did, did);
         assert_eq!(doc.verification_methods.len(), 1);
-        assert_eq!(doc.verification_methods[0].1.bytes, key);
+        assert_eq!(doc.verification_methods[0].1.bytes(), key);
     }
 
     /// Sample-doc fixture is unused here but pinned so the
