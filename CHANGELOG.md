@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased] — 0.4.0-dev
+## [0.4.0] — 2026-09-25
 
 0.4.0 is a minor-version (breaking under 0.x) release because
 `DidDocument`'s key fields and `DidDocument::new` change type (see Changed).
