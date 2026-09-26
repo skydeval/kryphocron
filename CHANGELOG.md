@@ -4,19 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased] — 0.3.2-dev
+## [Unreleased] — 0.4.0-dev
+
+0.4.0 is a minor-version (breaking under 0.x) release because
+`DidDocument`'s key fields and `DidDocument::new` change type (see Changed).
+The substrate-internal `PublicKey`, `ServiceIdentity`, and both wire formats
+are unchanged.
 
 ### Added
 
+- ATProto service-auth JWT verification end to end: `verify_jwt` now verifies
+  ES256K / ES256 tokens issued by real did:plc / did:web identities (the
+  resolver parses their secp256k1 / P-256 keys, see Changed).
+- `JwtVerificationConfig::atproto_service_auth()` and
+  `verification::ATPROTO_SERVICE_AUTH_ALGORITHMS` (`[Es256K, Es256]`). The
+  `Default` allowlist stays Ed25519-only; ATProto-facing hosts opt in.
+- `VerifiedJwt::lxm() -> Option<&str>` — the ATProto lexicon-method claim.
+  `verify_jwt` extracts it (a non-string `lxm` is `Malformed`) but does not
+  interpret it; the host compares it against the method being served.
+- `VerifiedJwt::audience_fragment() -> Option<&str>` — the `#fragment` of a
+  DID-URL `aud`, for hosts serving several services under one DID.
+- Fragment-tolerant `aud`: `verify_jwt` accepts `aud` equal to the local
+  service DID or `<local service DID>#<fragment>` (the form ATProto clients
+  use when proxying to a named service, e.g. `#bsky_appview`). Any non-empty
+  fragment is accepted; an empty fragment (`<did>#`) is `Malformed`; a
+  different DID with any fragment is `WrongAudience`.
 - ES256 / ES256K JWT signature verification (`verification.rs`) on RustCrypto's
   `k256` (secp256k1) and `p256` (P-256). Pure-Rust, no FFI, no OpenSSL —
   preserves the substrate's static-musl-friendly posture. Closes the deferred
   ECDSA gap that limited authenticated-path testing to Ed25519-only synthetic
   tokens; the forward-looking `SignatureAlgorithm` allowlist (`Es256K`, `Es256`,
-  `Ed25519`) now has matching verification logic for all three. Real ATProto
-  tokens (predominantly secp256k1 via did:plc) verify through the `test-support`
-  fixtures today; end-to-end via real-DID-resolved documents lands once the
-  multicodec curve-detection in `parse_did_document` ships (see Changed).
+  `Ed25519`) now has matching verification logic for all three.
 - `identity::IssuerPublicKey` enum decoupling the DID-document / JWT-issuer key
   population from the substrate-internal `PublicKey`. Variants:
   `Ed25519([u8;32])`, `Secp256k1(Vec<u8>)`, `P256(Vec<u8>)`; SEC1 compressed (33)
@@ -45,13 +63,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   adapter is applied at four `verification_methods` consumers: the JWT selector
   (returns `IssuerPublicKey`) plus the capability-claim, sync-handshake, and
   attribution-chain-receipt selectors (each extracts an Ed25519 `PublicKey`).
-- `parse_did_document` now produces `IssuerPublicKey::Ed25519` for real DID
-  documents. **The parse path remains Ed25519-only**: `decode_multibase_key`
-  does not yet read the multibase multicodec prefix to detect secp256k1 / P-256
-  keys, so real did:plc / did:web documents carrying ECDSA keys won't reach the
-  new verifiers until the follow-on multicodec-curve-detection arc. ES256K /
-  ES256 verification IS reachable today via the `test-support` fixtures (which
-  construct the ECDSA `IssuerPublicKey` variants directly, bypassing the parser).
+- `DefaultDidResolver` DID-document parsing reads the multicodec prefix of
+  `publicKeyMultibase` and produces the matching `IssuerPublicKey`:
+  `0xed 0x01` ed25519-pub (32 bytes), `0xe7 0x01` secp256k1-pub and
+  `0x80 0x24` p256-pub (33-byte compressed SEC1). Covers the `Multikey` type
+  (and `Ed25519VerificationKey2020` / untyped entries, as before) plus the
+  legacy ATProto `EcdsaSecp256k1VerificationKey2019` /
+  `EcdsaSecp256r1VerificationKey2019` forms (raw SEC1, no multicodec prefix).
+  ECDSA keys are checked to be valid curve points at parse time.
+- Behavior change: a verification method with an unsupported type, encoding,
+  curve, or an invalid key is now **skipped** instead of failing the whole
+  document as `DidResolutionError::Malformed`. Previously any non-Ed25519 key —
+  i.e. every did:plc `#atproto` key — made the document unresolvable. A
+  document with no usable key surfaces at the verifier as its key-not-found
+  error. An entry missing `id` is still `Malformed`.
+- The `#atproto` verification method is ordered first in
+  `DidDocument.verification_methods`, so `verify_jwt`'s no-`kid` selection
+  (first key matching the JWT algorithm — the ATProto service-auth norm) picks
+  the account signing key ahead of other same-curve keys such as a labeler's
+  `#atproto_label`.
 - `JwtVerificationError`: new `HighSSignature` variant (the enum is
   `#[non_exhaustive]`). All other ECDSA failure modes — malformed key, malformed
   signature, wrong-algorithm-on-key, verify-fail — consolidate into the existing
@@ -67,6 +97,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Tests
 
+- End-to-end `verify_jwt` coverage for ES256K / ES256: valid token accepted,
+  high-S rejected, wrong key rejected; allowlist filtering in each direction;
+  `lxm` present / absent / non-string; `aud` exact, `#fragment` on the local
+  DID (any fragment), fragment on another DID, empty fragment; Ed25519
+  regression (no `lxm` / fragment surfaced).
+- Resolver Multikey coverage: secp256k1, P-256, Ed25519 prefixes; the ATProto
+  cryptography spec's example `did:key` multibase values; legacy ECDSA types;
+  `#atproto` ordering; unknown prefix / wrong length / off-curve point /
+  unsupported type / non-base58btc entries skipped without failing the
+  document.
 - `ecdsa_verifier_tests` module in `verification.rs` (13 tests): happy-path,
   wrong-signature, malformed-key, wrong-algorithm-on-key, high-S rejection, and
   compressed-vs-uncompressed SEC1 acceptance for each of ES256K and ES256, plus

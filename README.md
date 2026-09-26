@@ -132,7 +132,7 @@ Substituting a coordinated oracle restores correctness.
 
 ```toml
 [dependencies]
-kryphocron = "0.3"
+kryphocron = "0.4"
 ```
 
 A minimal substrate-side integration sketch:
@@ -141,7 +141,7 @@ A minimal substrate-side integration sketch:
 use kryphocron::{
     AuditSinks, DefaultAtRestHooks, OracleSet, TraceId,
     authority::{NoInspectionNotifications, issue_user, v1::ViewPrivate},
-    verification::verify_jwt,
+    verification::{JwtVerificationConfig, verify_jwt},
 };
 
 // At substrate startup, install audit sinks, oracles, the DID
@@ -155,6 +155,10 @@ let inspection_queue = NoInspectionNotifications;  // no-op default.
 // `ContentCodec` (laquna by default). See "Privacy posture" above.
 let at_rest_hooks = DefaultAtRestHooks::for_data_dir(data_dir)?;
 
+// ATProto service-auth JWTs are ES256K / ES256; the default allowlist is
+// Ed25519-only, so ATProto-facing hosts opt in explicitly.
+let jwt_config = JwtVerificationConfig::atproto_service_auth();
+
 // Per-request: verify a JWT, build an AuthContext.
 let trace_id = TraceId::from_bytes(/* fresh per-request */);
 let verified = verify_jwt(
@@ -165,6 +169,9 @@ let verified = verify_jwt(
     deadline,
     trace_id,
 ).await?;
+// `aud` may be the local service DID or `<did>#<service>`; `lxm` binds the
+// token to one XRPC method, and checking it is the host's job.
+if verified.lxm() != Some("com.example.getThing") { /* reject */ }
 let ctx = kryphocron::ingress::from_xrpc_request(
     verified, trace_id, sinks, oracles,
 );

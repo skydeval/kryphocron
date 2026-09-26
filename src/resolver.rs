@@ -48,9 +48,9 @@ pub const MAX_TRUST_ROOT_CACHE_AGE: Duration = Duration::from_secs(60);
 /// The §7.3 prose uses `Vec<VerificationMethod>` for
 /// `verification_methods`; the in-crate shape carries
 /// `Vec<(KeyId, IssuerPublicKey)>` for ergonomic key lookup. The key type is
-/// [`IssuerPublicKey`] (not the substrate-internal [`PublicKey`]) so the
+/// [`IssuerPublicKey`] (not the substrate-internal [`PublicKey`](crate::identity::PublicKey)) so the
 /// document can carry the variable-width ECDSA keys real ATProto issuers use;
-/// the substrate-internal wire paths extract an Ed25519 [`PublicKey`] at their
+/// the substrate-internal wire paths extract an Ed25519 [`PublicKey`](crate::identity::PublicKey) at their
 /// selector boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
