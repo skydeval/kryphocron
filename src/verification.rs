@@ -83,6 +83,8 @@ pub struct VerifiedJwt {
     scope: JwtScope,
     nonce: Option<JwtNonce>,
     algorithm: SignatureAlgorithm,
+    lxm: Option<String>,
+    audience_fragment: Option<String>,
     _private: PhantomData<sealed::Token>,
 }
 
@@ -99,6 +101,8 @@ impl VerifiedJwt {
         scope: JwtScope,
         nonce: Option<JwtNonce>,
         algorithm: SignatureAlgorithm,
+        lxm: Option<String>,
+        audience_fragment: Option<String>,
     ) -> Self {
         VerifiedJwt {
             issuer,
@@ -108,6 +112,8 @@ impl VerifiedJwt {
             scope,
             nonce,
             algorithm,
+            lxm,
+            audience_fragment,
             _private: PhantomData,
         }
     }
@@ -153,6 +159,31 @@ impl VerifiedJwt {
     pub fn algorithm(&self) -> SignatureAlgorithm {
         self.algorithm
     }
+
+    /// The `lxm` (lexicon method) claim, if present.
+    ///
+    /// ATProto service-auth tokens bind themselves to the called
+    /// XRPC method NSID via `lxm`. [`verify_jwt`] extracts the claim
+    /// but does not interpret it: the host knows which method is
+    /// being served, so the host compares `lxm` against it (and
+    /// decides whether an absent `lxm` is acceptable) to stop a
+    /// token minted for one endpoint being replayed against another.
+    #[must_use]
+    pub fn lxm(&self) -> Option<&str> {
+        self.lxm.as_deref()
+    }
+
+    /// The `#fragment` of the `aud` claim, without the `#`, if the
+    /// token addressed a specific service of the local DID (e.g.
+    /// `bsky_appview` for `aud = did:web:host#bsky_appview`).
+    ///
+    /// [`verify_jwt`] accepts any fragment on the local service DID;
+    /// hosts that serve more than one service identity under one DID
+    /// can check it here.
+    #[must_use]
+    pub fn audience_fragment(&self) -> Option<&str> {
+        self.audience_fragment.as_deref()
+    }
 }
 
 /// JWT verification configuration (§7.2).
@@ -168,8 +199,30 @@ pub struct JwtVerificationConfig {
     /// for stateless reads, `true` for state-changing operations.
     pub require_nonce: bool,
     /// Algorithm allowlist. Recommended default:
-    /// `&[SignatureAlgorithm::Ed25519]`.
+    /// `&[SignatureAlgorithm::Ed25519]`; ATProto service auth uses
+    /// [`ATPROTO_SERVICE_AUTH_ALGORITHMS`].
     pub accepted_algorithms: &'static [SignatureAlgorithm],
+}
+
+/// The algorithms ATProto service-auth JWTs are signed with:
+/// `ES256K` (secp256k1) and `ES256` (P-256).
+pub const ATPROTO_SERVICE_AUTH_ALGORITHMS: &[SignatureAlgorithm] =
+    &[SignatureAlgorithm::Es256K, SignatureAlgorithm::Es256];
+
+impl JwtVerificationConfig {
+    /// Configuration for verifying ATProto service-auth JWTs: the
+    /// [`Default`] timing values with the allowlist set to
+    /// [`ATPROTO_SERVICE_AUTH_ALGORITHMS`].
+    ///
+    /// The [`Default`] allowlist stays Ed25519-only (the substrate's
+    /// own signing algorithm); ATProto-facing hosts opt in here.
+    #[must_use]
+    pub fn atproto_service_auth() -> Self {
+        JwtVerificationConfig {
+            accepted_algorithms: ATPROTO_SERVICE_AUTH_ALGORITHMS,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for JwtVerificationConfig {
@@ -468,11 +521,21 @@ impl<'a> ParsedJwt<'a> {
         // convention uses a single string DID. v1 accepts only the
         // string form — array support is a future-extension
         // for the broader-ATProto-compatibility roll-out.
+        //
+        // ATProto clients proxying to a specific service address it
+        // as a DID URL (`did:web:host#bsky_appview`). The DID part
+        // must equal the local service DID; any non-empty fragment
+        // is accepted and surfaced via `VerifiedJwt::audience_fragment`.
         let aud_str = p
             .get("aud")
             .and_then(serde_json::Value::as_str)
             .ok_or(JwtVerificationError::Malformed)?;
-        let aud_did = Did::new(aud_str).map_err(|_| JwtVerificationError::Malformed)?;
+        let (aud_did_str, audience_fragment) = match aud_str.split_once('#') {
+            Some((_, "")) => return Err(JwtVerificationError::Malformed),
+            Some((did, fragment)) => (did, Some(fragment.to_string())),
+            None => (aud_str, None),
+        };
+        let aud_did = Did::new(aud_did_str).map_err(|_| JwtVerificationError::Malformed)?;
         if aud_did != *local_audience.service_did() {
             // Construct a placeholder `ServiceIdentity` for the
             // `got` field — the JWT `aud` claim is a DID string,
@@ -568,6 +631,14 @@ impl<'a> ParsedJwt<'a> {
         // `NonceTracker` integration.
         let nonce = parse_nonce_field(p, config.require_nonce)?;
 
+        // `lxm` (optional). ATProto's lexicon-method binding: when
+        // present it must be a string; the host compares it against
+        // the method being served.
+        let lxm = match p.get("lxm") {
+            None => None,
+            Some(v) => Some(v.as_str().ok_or(JwtVerificationError::Malformed)?.to_string()),
+        };
+
         Ok(VerifiedJwt::new_internal(
             issuer,
             local_audience.clone(),
@@ -576,6 +647,8 @@ impl<'a> ParsedJwt<'a> {
             scope,
             nonce,
             self.algorithm,
+            lxm,
+            audience_fragment,
         ))
     }
 }
@@ -2923,6 +2996,255 @@ mod tests {
         assert_eq!(v.algorithm(), SignatureAlgorithm::Ed25519);
         assert_eq!(v.scope().scopes.as_slice(), &["tools.kryphocron.feed.read"]);
         assert!(v.nonce().is_none());
+    }
+
+    // ============================================================
+    // ATProto service auth: ES256K / ES256 end to end, `lxm`,
+    // fragment `aud`, algorithm allowlist.
+    // ============================================================
+
+    fn atproto_issuer() -> Did {
+        Did::new("did:plc:atprotoissuer").unwrap()
+    }
+
+    fn resolver_with(key: IssuerPublicKey) -> Arc<MockResolver> {
+        let r = Arc::new(MockResolver::new());
+        let doc = DidDocument::new(
+            atproto_issuer(),
+            vec![(KeyId::from_bytes([4u8; 32]), key)],
+            vec![],
+            vec![],
+            vec![],
+            SystemTime::now(),
+            Duration::from_secs(3600),
+        );
+        r.documents.lock().unwrap().insert(atproto_issuer().as_str().to_string(), Ok(doc));
+        r
+    }
+
+    fn atproto_payload(aud: &str) -> serde_json::Value {
+        let now = now_secs();
+        serde_json::json!({
+            "iss": atproto_issuer().as_str(),
+            "aud": aud,
+            "iat": now,
+            "exp": now + 60,
+            "lxm": "app.bsky.feed.getTimeline",
+            "jti": "0123456789abcdef",
+        })
+    }
+
+    fn jwt_segments(alg: &str, payload: &serde_json::Value) -> String {
+        let header = serde_json::json!({ "alg": alg, "typ": "JWT" });
+        format!(
+            "{}.{}",
+            b64u(&serde_json::to_vec(&header).unwrap()),
+            b64u(&serde_json::to_vec(payload).unwrap())
+        )
+    }
+
+    fn es256k_jwt(seed: u8, payload: &serde_json::Value) -> (String, IssuerPublicKey) {
+        use k256::ecdsa::{signature::Signer, Signature, SigningKey};
+        let sk = SigningKey::from_slice(&[seed; 32]).unwrap();
+        let input = jwt_segments("ES256K", payload);
+        let sig: Signature = sk.sign(input.as_bytes());
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let pk = IssuerPublicKey::Secp256k1(
+            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+        );
+        (format!("{input}.{}", b64u(&sig.to_bytes())), pk)
+    }
+
+    fn es256_jwt(seed: u8, payload: &serde_json::Value) -> (String, IssuerPublicKey) {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        let sk = SigningKey::from_slice(&[seed; 32]).unwrap();
+        let input = jwt_segments("ES256", payload);
+        let sig: Signature = sk.sign(input.as_bytes());
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let pk = IssuerPublicKey::P256(
+            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+        );
+        (format!("{input}.{}", b64u(&sig.to_bytes())), pk)
+    }
+
+    async fn verify_atproto(
+        token: &str,
+        r: &MockResolver,
+        cfg: &JwtVerificationConfig,
+    ) -> Result<VerifiedJwt, JwtVerificationError> {
+        verify_jwt(token, &local_audience(), r, cfg, deadline(), TraceId::from_bytes([0u8; 16])).await
+    }
+
+    fn local_aud() -> String {
+        local_audience().service_did().as_str().to_string()
+    }
+
+    #[test]
+    fn atproto_service_auth_config_allows_es256k_and_es256_only() {
+        let c = JwtVerificationConfig::atproto_service_auth();
+        assert_eq!(c.accepted_algorithms, &[SignatureAlgorithm::Es256K, SignatureAlgorithm::Es256]);
+        let d = JwtVerificationConfig::default();
+        assert_eq!(c.max_clock_skew, d.max_clock_skew);
+        assert_eq!(c.max_validity_window, d.max_validity_window);
+        assert_eq!(c.require_nonce, d.require_nonce);
+    }
+
+    #[tokio::test]
+    async fn es256k_jwt_verifies_end_to_end() {
+        let (token, pk) = es256k_jwt(11, &atproto_payload(&local_aud()));
+        let r = resolver_with(pk);
+        let v = verify_atproto(&token, &r, &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap();
+        assert_eq!(v.issuer(), &atproto_issuer());
+        assert_eq!(v.algorithm(), SignatureAlgorithm::Es256K);
+        assert_eq!(v.lxm(), Some("app.bsky.feed.getTimeline"));
+        assert_eq!(v.audience_fragment(), None);
+    }
+
+    #[tokio::test]
+    async fn es256_jwt_verifies_end_to_end() {
+        let (token, pk) = es256_jwt(12, &atproto_payload(&local_aud()));
+        let r = resolver_with(pk);
+        let v = verify_atproto(&token, &r, &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap();
+        assert_eq!(v.algorithm(), SignatureAlgorithm::Es256);
+    }
+
+    #[tokio::test]
+    async fn ecdsa_jwt_high_s_rejected_end_to_end() {
+        const SECP256K1_N: [u8; 32] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C,
+            0xD0, 0x36, 0x41, 0x41,
+        ];
+        let (token, pk) = es256k_jwt(13, &atproto_payload(&local_aud()));
+        let (input, sig_b64) = token.rsplit_once('.').unwrap();
+        let sig = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
+        // s' = n - s (big-endian subtraction).
+        let mut high = sig[..32].to_vec();
+        let mut s_high = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let mut d = SECP256K1_N[i] as i16 - sig[32 + i] as i16 - borrow;
+            borrow = i16::from(d < 0);
+            if d < 0 {
+                d += 256;
+            }
+            s_high[i] = d as u8;
+        }
+        high.extend_from_slice(&s_high);
+        let high_token = format!("{input}.{}", b64u(&high));
+        let r = resolver_with(pk);
+        let err = verify_atproto(&high_token, &r, &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap_err();
+        assert_eq!(err, JwtVerificationError::HighSSignature);
+    }
+
+    #[tokio::test]
+    async fn ecdsa_jwt_signed_by_other_key_rejected() {
+        let (token, _) = es256k_jwt(14, &atproto_payload(&local_aud()));
+        let (_, other_pk) = es256k_jwt(15, &atproto_payload(&local_aud()));
+        let r = resolver_with(other_pk);
+        let err = verify_atproto(&token, &r, &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap_err();
+        assert_eq!(err, JwtVerificationError::SignatureInvalid);
+    }
+
+    #[tokio::test]
+    async fn allowlist_filters_by_configured_set() {
+        // ES256K under the Ed25519-only default → UnsupportedAlgorithm.
+        let (token, pk) = es256k_jwt(16, &atproto_payload(&local_aud()));
+        let r = resolver_with(pk);
+        let err = verify_atproto(&token, &r, &JwtVerificationConfig::default()).await.unwrap_err();
+        assert_eq!(err, JwtVerificationError::UnsupportedAlgorithm(SignatureAlgorithm::Es256K));
+
+        // ES256 under an ES256K-only allowlist → UnsupportedAlgorithm.
+        let (token, pk) = es256_jwt(17, &atproto_payload(&local_aud()));
+        let r = resolver_with(pk);
+        let cfg = JwtVerificationConfig {
+            accepted_algorithms: &[SignatureAlgorithm::Es256K],
+            ..JwtVerificationConfig::default()
+        };
+        let err = verify_atproto(&token, &r, &cfg).await.unwrap_err();
+        assert_eq!(err, JwtVerificationError::UnsupportedAlgorithm(SignatureAlgorithm::Es256));
+
+        // Ed25519 under the ATProto preset → UnsupportedAlgorithm.
+        let token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        let err = verify_atproto(&token, &populated_resolver(), &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap_err();
+        assert_eq!(err, JwtVerificationError::UnsupportedAlgorithm(SignatureAlgorithm::Ed25519));
+    }
+
+    #[tokio::test]
+    async fn aud_with_fragment_on_local_did_accepted() {
+        for fragment in ["bsky_appview", "some_other_service"] {
+            let aud = format!("{}#{fragment}", local_aud());
+            let (token, pk) = es256k_jwt(18, &atproto_payload(&aud));
+            let r = resolver_with(pk);
+            let v = verify_atproto(&token, &r, &JwtVerificationConfig::atproto_service_auth())
+                .await
+                .unwrap();
+            assert_eq!(v.audience_fragment(), Some(fragment));
+            assert_eq!(v.audience().service_did(), local_audience().service_did());
+        }
+    }
+
+    #[tokio::test]
+    async fn aud_with_fragment_on_other_did_rejected() {
+        let (token, pk) = es256k_jwt(19, &atproto_payload("did:web:elsewhere.example#bsky_appview"));
+        let r = resolver_with(pk);
+        let err = verify_atproto(&token, &r, &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JwtVerificationError::WrongAudience { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn aud_with_empty_fragment_is_malformed() {
+        let aud = format!("{}#", local_aud());
+        let (token, pk) = es256k_jwt(20, &atproto_payload(&aud));
+        let r = resolver_with(pk);
+        let err = verify_atproto(&token, &r, &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap_err();
+        assert_eq!(err, JwtVerificationError::Malformed);
+    }
+
+    #[tokio::test]
+    async fn lxm_absent_is_none_and_non_string_is_malformed() {
+        let mut payload = atproto_payload(&local_aud());
+        payload.as_object_mut().unwrap().remove("lxm");
+        let (token, pk) = es256k_jwt(21, &payload);
+        let r = resolver_with(pk);
+        let v = verify_atproto(&token, &r, &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap();
+        assert_eq!(v.lxm(), None);
+
+        payload["lxm"] = serde_json::json!(42);
+        let (token, pk) = es256k_jwt(21, &payload);
+        let r = resolver_with(pk);
+        let err = verify_atproto(&token, &r, &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap_err();
+        assert_eq!(err, JwtVerificationError::Malformed);
+    }
+
+    #[tokio::test]
+    async fn ed25519_jwt_has_no_lxm_or_fragment() {
+        // Regression: the 0.3.x Ed25519 path is unchanged by the ATProto
+        // additions.
+        let token = build_jwt(&ed25519_header(), &standard_payload(now_secs()));
+        let v = verify_atproto(&token, &populated_resolver(), &JwtVerificationConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(v.lxm(), None);
+        assert_eq!(v.audience_fragment(), None);
     }
 
     #[tokio::test]

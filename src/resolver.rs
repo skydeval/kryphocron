@@ -590,41 +590,37 @@ fn parse_did_document(
         for entry in arr {
             // ATProto convention: verificationMethod entries carry
             // an `id` URI fragment, a `controller` DID, and either
-            // `publicKeyMultibase` or `publicKeyJwk`. v0.1 accepts
-            // the multibase form (proto-blue's existing shape) and
-            // synthesizes a KeyId by hashing the public-key bytes —
-            // note for spec polish on the KeyId-derivation rule.
+            // `publicKeyMultibase` or `publicKeyJwk`. The multibase
+            // form is accepted; the KeyId is synthesized from the id
+            // fragment + key bytes (see `synthesize_key_id`).
             let id = entry
                 .get("id")
                 .and_then(|v| v.as_str())
                 .ok_or(DidResolutionError::Malformed)?;
-            let key_bytes = decode_multibase_key(entry).ok_or(DidResolutionError::Malformed)?;
-            // Synthesize a KeyId from the id-fragment suffix where
-            // possible; otherwise from a Blake3-equivalent stand-
-            // in. v0.1 uses the first 32 bytes of a SHA-2-style
-            // mixing of the key bytes by zero-padding — this is a
-            // placeholder until §7.3's KeyId derivation rule is
-            // committed in spec polish.
-            let key_id = synthesize_key_id(id, &key_bytes);
-            // TODO(real-did-resolution arc): multicodec curve-detection.
-            //
-            // This hardcodes Ed25519 because `decode_multibase_key` returns
-            // `[u8; 32]` without reading the multibase multicodec prefix to
-            // detect the curve. did:plc's canonical signing key is secp256k1
-            // (multicodec 0xe7, 33 compressed bytes) and won't parse correctly
-            // through this path until the real-DID-resolution arc (a) widens
-            // `decode_multibase_key`'s return to a per-curve byte vector and
-            // (b) reads the multicodec prefix to dispatch to the right
-            // `IssuerPublicKey` variant.
-            //
-            // ES256K + ES256 *verification* IS reachable today via the
-            // `test-support` fixtures, which construct
-            // `IssuerPublicKey::{Secp256k1, P256}` directly and bypass this
-            // parser. This TODO is about the parse-from-real-DID-document path,
-            // not the verify-the-signature path.
-            verification_methods.push((key_id, IssuerPublicKey::Ed25519(key_bytes)));
+            // Entries whose key material is absent, in an unsupported
+            // encoding, or on an unsupported curve are skipped rather
+            // than failing the whole document: DID documents may carry
+            // verification methods for purposes the substrate does not
+            // consume, and a key it cannot parse can never verify
+            // anything. A document left with no usable key surfaces
+            // downstream as the verifier's key-not-found error.
+            let Some(key) = decode_multibase_key(entry) else {
+                continue;
+            };
+            let key_id = synthesize_key_id(id, key.bytes());
+            verification_methods.push((id_fragment(id) == "atproto", key_id, key));
         }
     }
+    // The `#atproto` method is the ATProto account signing key. Stable-
+    // partition it to the front so verifiers that select "first key of
+    // the JWT's algorithm" (no `kid` — the ATProto service-auth norm)
+    // pick it ahead of any other same-curve key in the document (e.g. a
+    // labeler's `#atproto_label` key).
+    verification_methods.sort_by_key(|(is_atproto, _, _)| !*is_atproto);
+    let verification_methods: Vec<(KeyId, IssuerPublicKey)> = verification_methods
+        .into_iter()
+        .map(|(_, key_id, key)| (key_id, key))
+        .collect();
 
     // services array.
     let mut services = Vec::new();
@@ -676,29 +672,66 @@ fn parse_did_document(
     })
 }
 
+/// The fragment of a verification-method id (`did:plc:x#atproto` →
+/// `atproto`; a bare `#atproto` → `atproto`). Ids without `#` return
+/// the whole id.
+fn id_fragment(id_uri: &str) -> &str {
+    id_uri.rsplit_once('#').map_or(id_uri, |(_, frag)| frag)
+}
+
+/// Multicodec varint prefix: ed25519-pub (0xed).
+const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+/// Multicodec varint prefix: secp256k1-pub (0xe7).
+const MULTICODEC_SECP256K1_PUB: [u8; 2] = [0xe7, 0x01];
+/// Multicodec varint prefix: p256-pub (0x1200).
+const MULTICODEC_P256_PUB: [u8; 2] = [0x80, 0x24];
+
 /// Decode the `publicKeyMultibase` value from a verification-
-/// method entry. v0.1 handles the `z`-prefixed base58btc form
-/// ATProto uses; other multibase variants surface as `None` →
-/// `Malformed`.
-fn decode_multibase_key(entry: &serde_json::Value) -> Option<[u8; 32]> {
+/// method entry into an [`IssuerPublicKey`].
+///
+/// Only the `z`-prefixed base58btc multibase form ATProto uses is
+/// accepted. Dispatch is by the entry's `type`:
+///
+/// - `Multikey` (current ATProto form): the payload is a 2-byte
+///   multicodec varint prefix followed by the key — `0xed 0x01`
+///   ed25519-pub (32 bytes), `0xe7 0x01` secp256k1-pub or
+///   `0x80 0x24` p256-pub (33-byte SEC1 compressed).
+/// - `EcdsaSecp256k1VerificationKey2019` /
+///   `EcdsaSecp256r1VerificationKey2019` (legacy ATProto forms): the
+///   payload is the raw SEC1 key with no multicodec prefix.
+/// - `Ed25519VerificationKey2020` or absent `type`: treated as
+///   `Multikey` (same multicodec-prefixed encoding).
+///
+/// ECDSA keys are checked to be valid curve points here, so a bad
+/// point is dropped at parse time rather than surfacing later as an
+/// opaque signature failure. Anything unsupported returns `None`.
+fn decode_multibase_key(entry: &serde_json::Value) -> Option<IssuerPublicKey> {
     let mb = entry.get("publicKeyMultibase").and_then(|v| v.as_str())?;
-    if !mb.starts_with('z') {
-        return None;
-    }
-    // Strip the `z` prefix; the remainder is base58btc.
-    let payload = &mb[1..];
-    // v0.1 uses a minimal base58btc decoder rather than pulling
-    // in another crypto crate. The payload encodes the
-    // public-key bytes with a 2-byte multicodec prefix
-    // (0xed 0x01 for Ed25519). Strip the prefix and accept the
-    // 32 bytes that follow.
-    let decoded = base58btc_decode(payload)?;
-    if decoded.len() != 34 || decoded[0] != 0xed || decoded[1] != 0x01 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded[2..]);
-    Some(key)
+    // Strip the `z` (base58btc) multibase prefix. A minimal in-tree
+    // base58btc decoder avoids pulling in a multibase crate.
+    let decoded = base58btc_decode(mb.strip_prefix('z')?)?;
+    let key = match entry.get("type").and_then(|v| v.as_str()) {
+        None | Some("Multikey" | "Ed25519VerificationKey2020") => {
+            let (prefix, body) = decoded.split_at_checked(2)?;
+            match (<[u8; 2]>::try_from(prefix).ok()?, body.len()) {
+                (MULTICODEC_ED25519_PUB, 32) => {
+                    IssuerPublicKey::Ed25519(body.try_into().ok()?)
+                }
+                (MULTICODEC_SECP256K1_PUB, 33) => IssuerPublicKey::Secp256k1(body.to_vec()),
+                (MULTICODEC_P256_PUB, 33) => IssuerPublicKey::P256(body.to_vec()),
+                _ => return None,
+            }
+        }
+        Some("EcdsaSecp256k1VerificationKey2019") => IssuerPublicKey::Secp256k1(decoded),
+        Some("EcdsaSecp256r1VerificationKey2019") => IssuerPublicKey::P256(decoded),
+        Some(_) => return None,
+    };
+    let point_ok = match &key {
+        IssuerPublicKey::Ed25519(_) => true,
+        IssuerPublicKey::Secp256k1(b) => k256::ecdsa::VerifyingKey::from_sec1_bytes(b).is_ok(),
+        IssuerPublicKey::P256(b) => p256::ecdsa::VerifyingKey::from_sec1_bytes(b).is_ok(),
+    };
+    point_ok.then_some(key)
 }
 
 const BASE58_ALPHABET: &[u8] =
@@ -735,9 +768,9 @@ fn base58btc_decode(s: &str) -> Option<Vec<u8>> {
 /// 32 bytes via a deterministic mixing scheme. The derivation
 /// rule is stable across the v0.1.x line and may be revisited
 /// alongside a §7.3 derivation-rule clarification.
-fn synthesize_key_id(id_uri: &str, key_bytes: &[u8; 32]) -> KeyId {
+fn synthesize_key_id(id_uri: &str, key_bytes: &[u8]) -> KeyId {
     // Take the suffix after '#' (e.g., `#atproto`).
-    let suffix = id_uri.rsplit('#').next().unwrap_or(id_uri);
+    let suffix = id_fragment(id_uri);
     let mut out = [0u8; 32];
     let suffix_bytes = suffix.as_bytes();
     // Mix: first 16 bytes from the suffix (zero-padded); next 16
@@ -1221,6 +1254,136 @@ mod tests {
         assert_eq!(doc.did, did);
         assert_eq!(doc.verification_methods.len(), 1);
         assert_eq!(doc.verification_methods[0].1.bytes(), key);
+    }
+
+    // ============================================================
+    // Multikey curve dispatch (ed25519 / secp256k1 / P-256).
+    // ============================================================
+
+    fn k256_compressed(seed: u8) -> Vec<u8> {
+        let sk = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        sk.verifying_key().to_encoded_point(true).as_bytes().to_vec()
+    }
+
+    fn p256_compressed(seed: u8) -> Vec<u8> {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        sk.verifying_key().to_encoded_point(true).as_bytes().to_vec()
+    }
+
+    fn multibase(prefix: &[u8], key: &[u8]) -> String {
+        let mut payload = prefix.to_vec();
+        payload.extend_from_slice(key);
+        format!("z{}", base58btc_encode(&payload))
+    }
+
+    fn vm_entry(id: &str, ty: &str, mb: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "type": ty, "controller": "did:plc:x", "publicKeyMultibase": mb,
+        })
+    }
+
+    fn parse_methods(methods: Vec<serde_json::Value>) -> DidDocument {
+        let body = serde_json::json!({ "verificationMethod": methods });
+        let raw = RawDidDoc {
+            bytes: serde_json::to_vec(&body).unwrap(),
+            content_type: ContentType::ApplicationJson,
+        };
+        parse_did_document(&sample_did(), &raw).unwrap()
+    }
+
+    #[test]
+    fn multikey_secp256k1_parses_to_secp256k1() {
+        let key = k256_compressed(3);
+        let mb = multibase(&MULTICODEC_SECP256K1_PUB, &key);
+        let doc = parse_methods(vec![vm_entry("did:plc:x#atproto", "Multikey", &mb)]);
+        assert_eq!(doc.verification_methods, vec![(
+            synthesize_key_id("#atproto", &key),
+            IssuerPublicKey::Secp256k1(key),
+        )]);
+    }
+
+    #[test]
+    fn multikey_p256_parses_to_p256() {
+        let key = p256_compressed(4);
+        let mb = multibase(&MULTICODEC_P256_PUB, &key);
+        let doc = parse_methods(vec![vm_entry("did:plc:x#atproto", "Multikey", &mb)]);
+        assert_eq!(doc.verification_methods[0].1, IssuerPublicKey::P256(key));
+    }
+
+    #[test]
+    fn multikey_ed25519_still_parses() {
+        let mb = multibase(&MULTICODEC_ED25519_PUB, &[5u8; 32]);
+        let doc = parse_methods(vec![vm_entry("#atproto", "Multikey", &mb)]);
+        assert_eq!(doc.verification_methods[0].1, IssuerPublicKey::Ed25519([5u8; 32]));
+    }
+
+    /// The example `did:key` values from the ATProto cryptography spec.
+    /// The multibase part of a `did:key` is the same encoding as a
+    /// Multikey `publicKeyMultibase`: `zQ3s…` is secp256k1, `zDna…` P-256.
+    #[test]
+    fn atproto_spec_example_multikeys_parse() {
+        let k = "zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc";
+        let p = "zDnaembgSGUhZULN2Caob4HLJPaxBh92N7rtH21TErzqf8HQo";
+        let doc = parse_methods(vec![
+            vm_entry("#atproto", "Multikey", k),
+            vm_entry("#other", "Multikey", p),
+        ]);
+        assert!(matches!(&doc.verification_methods[0].1, IssuerPublicKey::Secp256k1(b) if b.len() == 33));
+        assert!(matches!(&doc.verification_methods[1].1, IssuerPublicKey::P256(b) if b.len() == 33));
+    }
+
+    #[test]
+    fn legacy_ecdsa_types_parse_raw_sec1() {
+        let k = k256_compressed(6);
+        let p = p256_compressed(7);
+        let doc = parse_methods(vec![
+            vm_entry("#atproto", "EcdsaSecp256k1VerificationKey2019", &format!("z{}", base58btc_encode(&k))),
+            vm_entry("#other", "EcdsaSecp256r1VerificationKey2019", &format!("z{}", base58btc_encode(&p))),
+        ]);
+        assert_eq!(doc.verification_methods[0].1, IssuerPublicKey::Secp256k1(k));
+        assert_eq!(doc.verification_methods[1].1, IssuerPublicKey::P256(p));
+    }
+
+    #[test]
+    fn atproto_method_is_ordered_first() {
+        let label = multibase(&MULTICODEC_SECP256K1_PUB, &k256_compressed(8));
+        let signing_key = k256_compressed(9);
+        let signing = multibase(&MULTICODEC_SECP256K1_PUB, &signing_key);
+        let doc = parse_methods(vec![
+            vm_entry("did:plc:x#atproto_label", "Multikey", &label),
+            vm_entry("did:plc:x#atproto", "Multikey", &signing),
+        ]);
+        assert_eq!(doc.verification_methods.len(), 2);
+        assert_eq!(doc.verification_methods[0].1, IssuerPublicKey::Secp256k1(signing_key));
+    }
+
+    #[test]
+    fn unsupported_or_invalid_methods_are_skipped_not_fatal() {
+        let good = k256_compressed(10);
+        let mut off_curve = vec![0x02];
+        off_curve.extend_from_slice(&[0xff; 32]);
+        let doc = parse_methods(vec![
+            // Unknown multicodec prefix.
+            vm_entry("#a", "Multikey", &multibase(&[0x12, 0x00], &[1u8; 32])),
+            // Right prefix, wrong length.
+            vm_entry("#b", "Multikey", &multibase(&MULTICODEC_SECP256K1_PUB, &[2u8; 32])),
+            // Right prefix and length, not a curve point.
+            vm_entry("#c", "Multikey", &multibase(&MULTICODEC_SECP256K1_PUB, &off_curve)),
+            // Unsupported verification-method type.
+            vm_entry("#d", "JsonWebKey2020", &multibase(&MULTICODEC_SECP256K1_PUB, &good)),
+            // Non-base58btc multibase.
+            vm_entry("#e", "Multikey", "mAAAA"),
+            vm_entry("#atproto", "Multikey", &multibase(&MULTICODEC_SECP256K1_PUB, &good)),
+        ]);
+        assert_eq!(doc.verification_methods.len(), 1);
+        assert_eq!(doc.verification_methods[0].1, IssuerPublicKey::Secp256k1(good));
+    }
+
+    #[test]
+    fn id_fragment_extraction() {
+        assert_eq!(id_fragment("did:plc:x#atproto"), "atproto");
+        assert_eq!(id_fragment("#atproto"), "atproto");
+        assert_eq!(id_fragment("atproto"), "atproto");
     }
 
     /// Sample-doc fixture is unused here but pinned so the
