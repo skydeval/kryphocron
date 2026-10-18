@@ -562,9 +562,10 @@ fn read_state_file(path: &Path) -> Option<RotationState> {
     }
     let mut slug = [0u8; 32];
     hex::decode_to_slice(hex_slug, &mut slug).ok()?;
+    let generated_at = UNIX_EPOCH.checked_add(Duration::from_secs(secs))?;
     Some(RotationState {
         current_slug: slug,
-        generated_at: UNIX_EPOCH + Duration::from_secs(secs),
+        generated_at,
     })
 }
 
@@ -808,6 +809,16 @@ mod tests {
             .build()
             .unwrap();
         assert!(oracle.current_generation(&rot_ctx()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_state_file_with_out_of_range_secs_returns_none() {
+        let dir = unique_tmp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rotation.state");
+        std::fs::write(&path, format!("{}\n{}\n", u64::MAX, "ab".repeat(32))).unwrap();
+        assert!(read_state_file(&path).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -477,7 +477,9 @@ fn decode_system_time(v: &Value) -> Result<SystemTime, TrustDeclarationError> {
             let secs: u64 = (*i)
                 .try_into()
                 .map_err(|_| TrustDeclarationError::Malformed("time integer out of range".into()))?;
-            Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(secs))
+                .ok_or_else(|| TrustDeclarationError::Malformed("time out of range".into()))
         }
         _ => Err(TrustDeclarationError::Malformed("time field not integer".into())),
     }
@@ -1092,5 +1094,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, TrustDeclarationError::SignatureInvalid));
+    }
+
+    #[test]
+    fn decode_system_time_out_of_range_returns_malformed() {
+        let err = decode_system_time(&Value::Integer(u64::MAX.into())).unwrap_err();
+        assert!(matches!(err, TrustDeclarationError::Malformed(_)));
     }
 }

@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.1] — 2026-10-18
+
+Patch release. No API change: inputs that used to panic now return the
+decoder's existing error.
+
+### Fixed
+
+- `verify_jwt` panicked ("overflow when adding duration to instant") on a
+  correctly signed token whose `exp`, `iat` or `nbf` exceeds the platform's
+  `SystemTime` range, and on an `exp` close enough to that maximum that adding
+  `max_clock_skew` overflowed. Any issuer able to sign for its own DID could
+  trigger it. All four cases now return `JwtVerificationError::Malformed`; an
+  out-of-range `nbf` is `Malformed`, not treated as absent.
+- The same overflow in the CBOR time decoders for trust declarations
+  (`TrustDeclarationError::Malformed`) and for peer-supplied sync-handshake and
+  capability-claim wire messages (decode error), and in the laquna rotation
+  oracle's state-file reader (treated as an unreadable state file; a fresh
+  batch starts instead of a crash at startup).
+
 ## [0.4.0] — 2026-09-25
 
 0.4.0 is a minor-version (breaking under 0.x) release because

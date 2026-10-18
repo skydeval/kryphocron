@@ -563,20 +563,30 @@ impl<'a> ParsedJwt<'a> {
             .get("iat")
             .and_then(serde_json::Value::as_u64)
             .ok_or(JwtVerificationError::Malformed)?;
-        let iat = SystemTime::UNIX_EPOCH + Duration::from_secs(iat_secs);
+        let iat = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(iat_secs))
+            .ok_or(JwtVerificationError::Malformed)?;
 
         // `exp` (required).
         let exp_secs = p
             .get("exp")
             .and_then(serde_json::Value::as_u64)
             .ok_or(JwtVerificationError::Malformed)?;
-        let exp = SystemTime::UNIX_EPOCH + Duration::from_secs(exp_secs);
+        let exp = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(exp_secs))
+            .ok_or(JwtVerificationError::Malformed)?;
 
-        // `nbf` (optional).
+        // `nbf` (optional). An out-of-range `nbf` is `Malformed`, not
+        // treated as absent.
         let nbf = p
             .get("nbf")
             .and_then(serde_json::Value::as_u64)
-            .map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+            .map(|s| {
+                SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(s))
+                    .ok_or(JwtVerificationError::Malformed)
+            })
+            .transpose()?;
 
         // Validity window: exp − iat ≤ max_validity_window. The
         // check uses unsigned-saturating subtraction since `iat`
@@ -592,7 +602,12 @@ impl<'a> ParsedJwt<'a> {
 
         // Expiry. `exp` must be in the future (or within
         // `max_clock_skew` of now). Equivalent: now ≤ exp + skew.
-        if now > exp + config.max_clock_skew {
+        // `exp` is attacker-chosen: a representable `exp` near the
+        // platform maximum can still overflow when skew is added.
+        let exp_with_skew = exp
+            .checked_add(config.max_clock_skew)
+            .ok_or(JwtVerificationError::Malformed)?;
+        if now > exp_with_skew {
             return Err(JwtVerificationError::Expired { exp, now });
         }
 
@@ -5168,6 +5183,69 @@ mod tests {
             err,
             SyncHandshakeVerificationError::CounterpartyIdentityMismatch
         ));
+    }
+
+    // ============================================================
+    // Out-of-range time claims: `Malformed`, never a panic.
+    // ============================================================
+
+    /// Largest seconds count that converts to a `SystemTime` on this
+    /// platform.
+    fn max_representable_unix_secs() -> u64 {
+        let (mut lo, mut hi) = (0u64, u64::MAX);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2 + 1;
+            if SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(mid)).is_some() {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
+    async fn verify_payload(payload: &serde_json::Value) -> Result<VerifiedJwt, JwtVerificationError> {
+        let r = populated_resolver();
+        let cfg = JwtVerificationConfig::default();
+        let token = build_jwt(&ed25519_header(), payload);
+        verify_jwt(&token, &local_audience(), &*r, &cfg, deadline(), TraceId::from_bytes([0u8; 16])).await
+    }
+
+    #[tokio::test]
+    async fn exp_out_of_range_returns_malformed() {
+        let mut payload = standard_payload(now_secs());
+        payload["exp"] = serde_json::json!(u64::MAX);
+        let err = verify_payload(&payload).await.unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn iat_out_of_range_returns_malformed() {
+        let mut payload = standard_payload(now_secs());
+        payload["iat"] = serde_json::json!(u64::MAX);
+        let err = verify_payload(&payload).await.unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn nbf_out_of_range_returns_malformed() {
+        let mut payload = standard_payload(now_secs());
+        payload["nbf"] = serde_json::json!(u64::MAX);
+        let err = verify_payload(&payload).await.unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn exp_at_platform_max_overflowing_skew_returns_malformed() {
+        // `exp` converts, and `iat` sits just below it so the validity
+        // window check passes; adding `max_clock_skew` to `exp` is what
+        // overflows.
+        let max = max_representable_unix_secs();
+        let mut payload = standard_payload(now_secs());
+        payload["exp"] = serde_json::json!(max);
+        payload["iat"] = serde_json::json!(max - 60);
+        let err = verify_payload(&payload).await.unwrap_err();
+        assert!(matches!(err, JwtVerificationError::Malformed));
     }
 }
 

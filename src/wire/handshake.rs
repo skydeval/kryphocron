@@ -1000,7 +1000,9 @@ fn decode_system_time(v: &Value) -> Result<SystemTime, ()> {
         Value::Integer(i) => {
             let n: i128 = (*i).into();
             let secs = u64::try_from(n).map_err(|_| ())?;
-            Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(secs))
+                .ok_or(())
         }
         _ => Err(()),
     }
@@ -1288,5 +1290,10 @@ mod tests {
     #[test]
     fn default_federation_time_window_pinned_at_7_days() {
         assert_eq!(DEFAULT_FEDERATION_TIME_WINDOW, Duration::from_secs(7 * 86400));
+    }
+
+    #[test]
+    fn decode_system_time_out_of_range_returns_err() {
+        assert!(decode_system_time(&Value::Integer(u64::MAX.into())).is_err());
     }
 }
