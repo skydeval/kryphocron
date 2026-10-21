@@ -3,3 +3,5 @@ docs/internal/
 .claude/
 .chainlink/
 kryphocron-sealed-probe
+/wasm/target
+/wasm/pkg-*

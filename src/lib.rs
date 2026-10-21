@@ -175,6 +175,8 @@ pub mod ingress;
 /// commitments and per-query worst-case latency reporting.
 pub mod oracle;
 
+pub mod post_content;
+
 /// §5.4 / rev6 §4.2 private-record structural validation and the read-side
 /// post-authorization witness ([`read_pipeline::ReadAuthorization`]).
 pub mod read_pipeline;

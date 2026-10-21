@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.4] — 2026-10-21
+
+Additive only: existing callers behave exactly as before. Adds what an
+encoder outside a kryphocron deployment needs (such as a member's own
+client in a browser) and the shared `postPrivate` payload rules.
+
+### Added
+
+- `post_content` module: the `tools.kryphocron.feed.postPrivate` payload as
+  the lexicon defines it.
+  - `PostContent` builds the content-form payload (`0xFF` + JSON `{text,
+    facets?, embed?}`) and reads either form.
+  - `derive_clear_fields` / `ClearFields` derive `embedBlobs`,
+    `mentionDids`, `quote` and `mediaKinds` from the facets and embed.
+    `ClearFields::apply_to` writes them into a record, removing any stale
+    or empty ones.
+
+  A reader that decodes the content can re-derive the clear fields and
+  check what the encoder asserted.
+- `laquna::encode_standalone(plaintext, did, nsid, rkey, unix_secs)`:
+  encode without a rotation oracle or an async runtime.
+  - Synchronous, and reads no clock: the caller passes the time.
+    `Instant::now()` / `SystemTime::now()` panic on
+    `wasm32-unknown-unknown`.
+  - kryphocron stamps the result: codec `laquna/0.2`, a fresh CSRNG slug,
+    and the generation `laquna/{unix_secs:020}/{hex slug}`.
+  - The record decodes under `Codec::default()`.
+  - Identifiers are `&str`, checked against the ATProto syntax rules by
+    hand rather than with the full validators, which add about 800 KB of
+    regex tables to a WebAssembly build.
+  - Errors are `StandaloneEncodeError`.
+- `wasm/` in the repository (not part of the published crate): an
+  encode-only WebAssembly package (`kryphocron-web`) exporting
+  `preparePrivatePost`. It turns a post's content and record identity into
+  the record fields to write. It exports no decode and no way to choose
+  the slug. About 386 KB (136 KB gzipped). Built with `wasm/build.sh`;
+  needs clang for the wasm32 target.
+
+### Notes
+
+- kryphocron builds for `wasm32-unknown-unknown` unchanged. A module
+  exports only what it calls, and unused server code is stripped at
+  link time.
+
 ## [0.4.3] — 2026-10-21
 
 Patch release. No API change. Records written by 0.4.3 decode with earlier

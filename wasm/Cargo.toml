@@ -1,0 +1,29 @@
+[package]
+name = "kryphocron-web"
+version = "0.4.4"
+edition = "2024"
+license = "MPL-2.0"
+description = "Browser (WebAssembly) encode for tools.kryphocron.feed.postPrivate records"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kryphocron = { path = ".." }
+# The browser CSRNG (crypto.getRandomValues). Enabled here, not in
+# kryphocron, so native builds never use it. No fallback RNG.
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+serde_json = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Standalone: not a member of the kryphocron package or a workspace.
+[workspace]

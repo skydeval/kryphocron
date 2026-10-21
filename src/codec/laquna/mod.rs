@@ -133,6 +133,152 @@ impl Codec {
     }
 }
 
+/// Encode `plaintext` for the record at (`originator`, `nsid`, `rkey`)
+/// without a rotation oracle or an async runtime, for an encoder that is not a
+/// kryphocron deployment, such as a member's own client.
+///
+/// Synchronous, and reads no clock: `unix_secs` is the encode time, supplied
+/// by the caller (on `wasm32-unknown-unknown`, `Instant::now()` and
+/// `SystemTime::now()` panic). The result is stamped here, not by the caller:
+/// - `codec` is `laquna/0.2`, as [`Codec`] stamps;
+/// - `content` uses a fresh CSRNG slug, as every [`Codec`] encode does;
+/// - `generation` is `laquna/{unix_secs:020}/{hex slug}`, the same
+///   lex-sortable format the default rotation oracle uses, so rotation's
+///   "older than the period" check works across both. Readers must treat it
+///   as asserted by the encoder: the time is the caller's.
+///
+/// Uses the default `{originator}||{nsid}||{rkey}` seed, so the record
+/// decodes under [`Codec::default`]. Write the record at exactly this DID,
+/// collection and rkey; anywhere else it does not decode.
+///
+/// The identifiers are plain strings, checked against the ATProto syntax
+/// rules by hand: the full [`Did`] / [`Nsid`] / [`RecordKey`] validators bring
+/// a regex engine and its Unicode tables, about 800 KB in a WebAssembly build.
+/// The check is enough to keep the seed well-formed; the repository that
+/// stores the record validates it fully.
+///
+/// # Errors
+///
+/// - [`StandaloneEncodeError::InvalidIdentifier`] if the DID, NSID or rkey
+///   breaks the syntax rules.
+/// - [`StandaloneEncodeError::Csrng`] if the CSRNG fails. There is no
+///   fallback source of randomness.
+pub fn encode_standalone(
+    plaintext: &[u8],
+    originator: &str,
+    nsid: &str,
+    rkey: &str,
+    unix_secs: u64,
+) -> Result<EncodedRecord, StandaloneEncodeError> {
+    use StandaloneEncodeError::InvalidIdentifier;
+    if !identifier_syntax::is_did(originator) {
+        return Err(InvalidIdentifier("did"));
+    }
+    if !identifier_syntax::is_nsid(nsid) {
+        return Err(InvalidIdentifier("nsid"));
+    }
+    if !identifier_syntax::is_record_key(rkey) {
+        return Err(InvalidIdentifier("rkey"));
+    }
+    let seed = format!("{originator}||{nsid}||{rkey}").into_bytes();
+    let slug = generate_slug().map_err(|_| StandaloneEncodeError::Csrng)?;
+    Ok(EncodedRecord {
+        codec: laquna_codec_id(),
+        content: internal::encode(plaintext, &seed, &slug),
+        generation: Some(format_mark_secs(unix_secs, &slug)),
+    })
+}
+
+/// Error from [`encode_standalone`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StandaloneEncodeError {
+    /// The named identifier (`did`, `nsid` or `rkey`) breaks the ATProto
+    /// syntax rules.
+    #[error("invalid {0}")]
+    InvalidIdentifier(&'static str),
+    /// The CSRNG failed; nothing was encoded.
+    #[error("CSRNG unavailable")]
+    Csrng,
+}
+
+/// Hand-written ATProto identifier syntax checks for [`encode_standalone`]
+/// (no regex engine). They follow the ATProto DID, NSID and record-key
+/// syntax specifications.
+mod identifier_syntax {
+    /// `did:<method>:<id>`: method lowercase ASCII letters; id from
+    /// `[A-Za-z0-9._:%-]`, not ending in `:`; at most 2048 characters.
+    pub(super) fn is_did(s: &str) -> bool {
+        let Some(rest) = s.strip_prefix("did:") else {
+            return false;
+        };
+        let Some((method, id)) = rest.split_once(':') else {
+            return false;
+        };
+        s.len() <= 2048
+            && !method.is_empty()
+            && method.bytes().all(|b| b.is_ascii_lowercase())
+            && !id.is_empty()
+            && !id.ends_with(':')
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:%-".contains(&b))
+    }
+
+    /// At least three `.`-separated segments, at most 317 characters. Domain
+    /// segments: 1–63 of `[A-Za-z0-9-]`, not starting or ending with `-`, the
+    /// first not starting with a digit. Name segment: 1–63 of
+    /// `[A-Za-z0-9]`, starting with a letter.
+    pub(super) fn is_nsid(s: &str) -> bool {
+        let segments: Vec<&str> = s.split('.').collect();
+        if s.len() > 317 || segments.len() < 3 {
+            return false;
+        }
+        let (name, domain) = segments.split_last().expect("at least three segments");
+        let domain_ok = domain.iter().enumerate().all(|(i, seg)| {
+            (1..=63).contains(&seg.len())
+                && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !seg.starts_with('-')
+                && !seg.ends_with('-')
+                && !(i == 0 && seg.as_bytes()[0].is_ascii_digit())
+        });
+        domain_ok
+            && (1..=63).contains(&name.len())
+            && name.as_bytes()[0].is_ascii_alphabetic()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric())
+    }
+
+    /// 1–512 of `[A-Za-z0-9._:~-]`, and not `.` or `..`.
+    pub(super) fn is_record_key(s: &str) -> bool {
+        (1..=512).contains(&s.len())
+            && s != "."
+            && s != ".."
+            && s
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:~-".contains(&b))
+    }
+}
+
+/// The codec id every laquna encode is stamped with.
+fn laquna_codec_id() -> CodecId {
+    // Stable for the lifetime of records encoded under it (§3.6). Future
+    // byte-compatible laquna-internals bumps keep `"laquna/0.2"`.
+    CodecId::new("laquna/0.2").expect("\"laquna/0.2\" is a valid codec id")
+}
+
+/// A fresh 32-byte CSRNG slug for one encode.
+///
+/// The seed is fixed per record identity (DID, NSID, rkey), so a slug shared
+/// across encodes would give two different plaintexts at the same identity
+/// the same keystream. A per-encode slug is a rotation batch of one: never
+/// reused, not secret, and carried inline in the artifact, where decode
+/// reads it.
+fn fresh_slug() -> Result<[u8; 32], CodecError> {
+    generate_slug().map_err(|_| CodecError::BackendUnavailable {
+        detail: "CSRNG unavailable for laquna slug".to_owned(),
+    })
+}
+
 // `SeedPolicy::Custom` holds a closure (not `Debug`); hand-write `Debug` so
 // `Codec` stays diagnostic-printable without exposing the closure.
 impl std::fmt::Debug for Codec {
@@ -184,9 +330,7 @@ fn decode_ctx_as_encode_ctx(ctx: &DecodeContext) -> EncodeContext {
 #[async_trait]
 impl ContentCodec for Codec {
     fn codec_id(&self) -> CodecId {
-        // Stable for the lifetime of records encoded under it (§3.6). Future
-        // byte-compatible laquna-internals bumps keep `"laquna/0.2"`.
-        CodecId::new("laquna/0.2").expect("\"laquna/0.2\" is a valid codec id")
+        laquna_codec_id()
     }
 
     fn requires_rotation(&self) -> bool {
@@ -236,15 +380,7 @@ impl ContentCodec for Codec {
             });
         }
 
-        // A fresh CSRNG slug for every encode. The seed is fixed per record
-        // identity (DID, NSID, rkey), so a slug shared across encodes would
-        // give two different plaintexts at the same identity — a re-create at
-        // a reused rkey, or an edit — the same keystream. A per-encode slug is
-        // a rotation batch of one: never reused, not secret, and carried
-        // inline in the artifact, where decode reads it.
-        let slug = generate_slug().map_err(|_| CodecError::BackendUnavailable {
-            detail: "CSRNG unavailable for laquna slug".to_owned(),
-        })?;
+        let slug = fresh_slug()?;
 
         // Laquna's encode is sync + CPU-bound (zstd). At typical record sizes
         // (a few KB) the blocking compression is microseconds; ~1MB lexicon
@@ -568,6 +704,12 @@ fn format_mark(generated_at: SystemTime, slug: &[u8; 32]) -> RotationGenerationM
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    format_mark_secs(unix_secs, slug)
+}
+
+/// [`format_mark`] from a Unix-seconds value. A `u64` is at most 20 digits,
+/// so the zero-padded field never grows and the mark stays lex-sortable.
+fn format_mark_secs(unix_secs: u64, slug: &[u8; 32]) -> RotationGenerationMark {
     RotationGenerationMark::new(format!("laquna/{:020}/{}", unix_secs, hex::encode(slug)))
         .expect("rotation mark (92 bytes) fits BoundedString<128>")
 }
@@ -714,6 +856,98 @@ mod tests {
             let out = codec.decode(&record, &dec_ctx("3kabcdefghij2"), deadline).await;
             assert_eq!(out.unwrap(), plaintext);
         }
+    }
+
+    /// `encode_standalone` output decodes under `Codec::default()`; it is
+    /// stamped with the codec id and a generation whose time is the caller's
+    /// and whose batch id is the artifact's own slug; and each call draws a
+    /// fresh slug.
+    #[tokio::test]
+    async fn standalone_encode_decodes_and_is_stamped() {
+        let (did, nsid, rkey) = (
+            "did:plc:exampleexampleexample",
+            "tools.kryphocron.feed.postPrivate",
+            "3kabcdefghij2",
+        );
+        let a = encode_standalone(b"from a client", did, nsid, rkey, 1_700_000_123).unwrap();
+        let b = encode_standalone(b"from a client", did, nsid, rkey, 1_700_000_123).unwrap();
+        assert_eq!(a.codec.as_str(), "laquna/0.2");
+        let mark = a.generation.as_ref().unwrap().as_str().to_owned();
+        assert_eq!(
+            mark,
+            format!("laquna/{:020}/{}", 1_700_000_123u64, hex::encode(artifact_slug(&a.content)))
+        );
+        assert_ne!(artifact_slug(&a.content), artifact_slug(&b.content));
+
+        let out = Codec::default()
+            .decode(&a, &dec_ctx("3kabcdefghij2"), Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(out, b"from a client");
+
+        // The largest time still makes a well-formed, fixed-width mark.
+        let max = encode_standalone(b"x", did, nsid, rkey, u64::MAX).unwrap();
+        assert_eq!(max.generation.unwrap().as_str().len(), 92);
+    }
+
+    /// The hand-written identifier checks agree with the full validators on
+    /// valid and invalid samples, and invalid identifiers are refused.
+    #[test]
+    fn standalone_identifier_checks_match_full_validators() {
+        use identifier_syntax::{is_did, is_nsid, is_record_key};
+        let dids = [
+            "did:plc:exampleexampleexample",
+            "did:web:example.com",
+            "did:web:localhost%3A8080",
+            "did:method:a:b",
+            "did:plc:",
+            "did:PLC:abc",
+            "did::abc",
+            "did:plc:abc:",
+            "did:plc:ab cd",
+            "dId:plc:abc",
+            "plc:abc",
+            "",
+        ];
+        for d in dids {
+            assert_eq!(is_did(d), Did::new(d).is_ok(), "did {d:?}");
+        }
+        let nsids = [
+            "tools.kryphocron.feed.postPrivate",
+            "app.bsky.feed.post",
+            "com.example.fooBar",
+            "a-b.c-d.e",
+            "com.example",
+            "com.example.3foo",
+            "com.example.foo-bar",
+            "com..example.foo",
+            "-com.example.foo",
+            "com.example-.foo",
+            "1com.example.foo",
+            "com.example.foo.",
+            "",
+        ];
+        for n in nsids {
+            assert_eq!(is_nsid(n), Nsid::new(n).is_ok(), "nsid {n:?}");
+        }
+        let rkeys = ["3kabcdefghij2", "self", "a.b:c~d-e_f", ".", "..", "", "a/b", "a b", "a#b"];
+        for r in rkeys {
+            assert_eq!(is_record_key(r), RecordKey::new(r).is_ok(), "rkey {r:?}");
+        }
+
+        let ok = ("did:plc:abc", "tools.kryphocron.feed.postPrivate", "3k");
+        assert_eq!(
+            encode_standalone(b"x", "plc:abc", ok.1, ok.2, 0).unwrap_err(),
+            StandaloneEncodeError::InvalidIdentifier("did")
+        );
+        assert_eq!(
+            encode_standalone(b"x", ok.0, "feed.post", ok.2, 0).unwrap_err(),
+            StandaloneEncodeError::InvalidIdentifier("nsid")
+        );
+        assert_eq!(
+            encode_standalone(b"x", ok.0, ok.1, "..", 0).unwrap_err(),
+            StandaloneEncodeError::InvalidIdentifier("rkey")
+        );
     }
 
     /// The codec reads no slug from the generation mark, so a mark in a

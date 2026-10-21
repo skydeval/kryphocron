@@ -1,6 +1,6 @@
 [package]
 name = "kryphocron"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.85"
 license = "MPL-2.0"
@@ -11,6 +11,8 @@ authors = ["skydeval <skydeval@mail.nearhorizon.app>"]
 repository = "https://github.com/skydeval/kryphocron"
 homepage = "https://github.com/skydeval/kryphocron"
 readme = "README.md"
+# The browser package (wasm/) is built from this repo, not shipped in the crate.
+exclude = ["wasm/"]
 
 # License: MPL-2.0 (file-level copyleft) per §9.8. Per-file
 # headers point at the LICENSE file at the crate root.
