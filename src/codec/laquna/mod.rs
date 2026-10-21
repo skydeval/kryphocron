@@ -47,12 +47,15 @@ pub use internal::DecodeError;
 ///   seed-derivation recipe (§3.3).
 /// - [`Codec::new`] — custom seed-derivation policy for operators with
 ///   non-default deployment constraints.
+/// - [`Codec::with_max_decoded_len`] — optional bound on decoded size, for
+///   hosts that decode content they did not write. Unbounded by default.
 ///
-/// Stateful only in the configured seed-derivation policy; no per-encode
-/// mutable state.
+/// Stateful only in its configuration (seed-derivation policy, decoded-size
+/// bound); no per-encode mutable state.
 #[derive(Clone)]
 pub struct Codec {
     seed_policy: SeedPolicy,
+    max_decoded_len: Option<usize>,
 }
 
 /// Seed-derivation policy. The substrate computes the per-record seed by
@@ -88,9 +91,7 @@ pub enum SeedPolicy {
 
 impl Default for Codec {
     fn default() -> Self {
-        Self {
-            seed_policy: SeedPolicy::DidNsidRkey,
-        }
+        Self::new(SeedPolicy::DidNsidRkey)
     }
 }
 
@@ -98,7 +99,35 @@ impl Codec {
     /// Construct a codec with a custom [`SeedPolicy`].
     #[must_use]
     pub fn new(seed_policy: SeedPolicy) -> Self {
-        Self { seed_policy }
+        Self {
+            seed_policy,
+            max_decoded_len: None,
+        }
+    }
+
+    /// Bound the decoded (plaintext) length to `max_decoded_len` bytes.
+    ///
+    /// A record whose plaintext would be longer fails as
+    /// [`CodecError::Malformed`], and decompression stops early instead of
+    /// materialising the whole output: a compressed record a few kilobytes
+    /// long can otherwise expand to gigabytes. Peak memory for a refused
+    /// record stays within a small multiple of the bound.
+    ///
+    /// The bound applies to decode only; encode is unaffected. Without this
+    /// call there is no bound. The substrate sets no default because the right
+    /// value is host policy; a host decoding records written by parties it
+    /// does not trust should set one and install the codec via
+    /// `DefaultAtRestHooksBuilder::with_codec`.
+    #[must_use]
+    pub fn with_max_decoded_len(mut self, max_decoded_len: usize) -> Self {
+        self.max_decoded_len = Some(max_decoded_len);
+        self
+    }
+
+    /// The configured decoded-length bound, if any.
+    #[must_use]
+    pub fn max_decoded_len(&self) -> Option<usize> {
+        self.max_decoded_len
     }
 }
 
@@ -108,6 +137,7 @@ impl std::fmt::Debug for Codec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Codec")
             .field("seed_policy", &self.seed_policy)
+            .field("max_decoded_len", &self.max_decoded_len)
             .finish()
     }
 }
@@ -259,8 +289,9 @@ impl ContentCodec for Codec {
         // Decode failure maps to the existing rev-6 `CodecError::Malformed`
         // (wrong seed, wrong slug, or corruption). The laquna-side `DecodeError`
         // carries no detail by design; the adapter introduces no
-        // `DecodeFailed(String)` variant (§3.4).
-        internal::decode(&encoded.content, &seed)
+        // `DecodeFailed(String)` variant (§3.4). Exceeding the optional
+        // decoded-length bound is one more such failure.
+        internal::decode_with_limit(&encoded.content, &seed, self.max_decoded_len)
             .map_err(|_e| CodecError::Malformed {
                 codec: self.codec_id(),
             })
@@ -649,6 +680,41 @@ mod tests {
             .await
             .expect("decode succeeds");
         assert_eq!(recovered, plaintext);
+    }
+
+    /// `with_max_decoded_len` bounds decode: a record at the bound decodes,
+    /// one byte over fails `Malformed`, and the default codec stays unbounded.
+    #[tokio::test]
+    async fn max_decoded_len_bounds_decode() {
+        let mark = mark_with_slug([0x5a; 32]);
+        let plaintext = vec![0x42u8; 4096];
+        let deadline = Instant::now();
+        let content = Codec::default()
+            .encode(&plaintext, &enc_ctx("3kabcdefghij2", mark.clone()), deadline)
+            .await
+            .expect("encode succeeds");
+        let record = EncodedRecord {
+            codec: Codec::default().codec_id(),
+            content,
+            generation: Some(mark),
+        };
+        let ctx = dec_ctx("3kabcdefghij2");
+
+        assert_eq!(Codec::default().max_decoded_len(), None);
+        let at = Codec::default().with_max_decoded_len(4096);
+        assert_eq!(at.max_decoded_len(), Some(4096));
+        assert_eq!(at.decode(&record, &ctx, deadline).await.unwrap(), plaintext);
+
+        let under = Codec::default().with_max_decoded_len(4095);
+        assert!(matches!(
+            under.decode(&record, &ctx, deadline).await,
+            Err(CodecError::Malformed { .. })
+        ));
+
+        assert_eq!(
+            Codec::default().decode(&record, &ctx, deadline).await.unwrap(),
+            plaintext
+        );
     }
 
     /// Decoding with a different record-identity seed (different rkey →

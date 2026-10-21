@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.2] — 2026-10-21
+
+Patch release. Additive only: existing callers behave exactly as before.
+
+### Added
+
+- `laquna::Codec::with_max_decoded_len(n)` and `Codec::max_decoded_len()`: an
+  optional, caller-chosen bound on decoded size. Unbounded by default; the
+  substrate sets no value, since the right one is host policy. Hosts that
+  decode records written by parties they do not trust should set one and
+  install the codec via `DefaultAtRestHooksBuilder::with_codec`.
+
+  Without a bound, a small crafted record (zstd RLE blocks, or a frame
+  declaring a large window) can decompress to gigabytes before the checksum is
+  checked. With a bound, a frame whose header declares a content size or
+  window over it is refused before any block is decoded, and decoding stops as
+  soon as output passes it. Either case fails as `CodecError::Malformed`, and
+  peak memory stays within a small multiple of the bound.
+
 ## [0.4.1] — 2026-10-18
 
 Patch release. No API change: inputs that used to panic now return the
