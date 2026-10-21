@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.3] — 2026-10-21
+
+Patch release. No API change. Records written by 0.4.3 decode with earlier
+0.4.x releases, and earlier records decode with 0.4.3.
+
+### Fixed
+
+- The laquna codec took its slug from the rotation generation, so every
+  encode in one generation window shared a slug. Its seed is fixed per record
+  identity (DID, NSID, rkey), so two different contents encoded at the same
+  identity in one window — a record deleted and re-created at the same rkey —
+  shared a keystream, and anyone holding both artifacts could combine them.
+  `laquna::Codec` now draws a fresh 32-byte CSRNG slug for every encode. The
+  slug still travels in the artifact, where decode reads it.
+
+### Changed
+
+- Encoding is no longer deterministic: encoding the same content twice gives
+  different bytes. Compare records by `encodedContentGeneration` or by decoded
+  content, not by encoded bytes.
+- The generation mark stamped on each record is unchanged and is still what
+  rotation keys on, but its batch id is no longer the artifact's slug. Nothing
+  should compare the two.
+- `laquna::Codec` no longer reads anything from the generation mark, so a
+  rotation oracle with a different mark format no longer panics on encode.
+  CSRNG failure on encode returns `CodecError::BackendUnavailable`.
+
 ## [0.4.2] — 2026-10-21
 
 Patch release. Additive only: existing callers behave exactly as before.

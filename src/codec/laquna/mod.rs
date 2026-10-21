@@ -18,7 +18,9 @@
 //! `internal`; this module is the [`ContentCodec`] adapter that bridges
 //! laquna's stateless sync free functions to the substrate's stateful async
 //! trait, deriving the per-record seed from the record-identity tuple and
-//! recovering the rotation slug from the rotation oracle's generation mark.
+//! drawing a fresh CSRNG slug for every encode. The rotation oracle's
+//! generation mark is stamped on each record as its generation (what rotation
+//! keys on); it is not the slug. Decode reads the slug from the artifact.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -179,28 +181,6 @@ fn decode_ctx_as_encode_ctx(ctx: &DecodeContext) -> EncodeContext {
     }
 }
 
-/// Parse the 32-byte rotation slug from a [`RotationGenerationMark`].
-///
-/// Internal to the laquna adapter — adds no public method on
-/// `RotationGenerationMark`. Parses the mark format committed by the default
-/// rotation oracle (§4.7): `"laquna/{:020}/{hex64}"`. Returns `None` on any
-/// malformed input; the caller treats `None` as a substrate-invariant
-/// violation (`expect`), since the default oracle always produces this shape.
-fn parse_slug_from_mark(mark: &RotationGenerationMark) -> Option<[u8; 32]> {
-    let s: &str = mark.as_str();
-    // Expect ["laquna", "<unix_secs>", "<hex_slug>"].
-    let mut parts = s.splitn(3, '/');
-    let prefix = parts.next()?;
-    let _unix_secs = parts.next()?; // present for lex ordering; only the slug is needed here
-    let hex_slug = parts.next()?;
-    if prefix != "laquna" || hex_slug.len() != 64 {
-        return None;
-    }
-    let mut slug = [0u8; 32];
-    hex::decode_to_slice(hex_slug, &mut slug).ok()?;
-    Some(slug)
-}
-
 #[async_trait]
 impl ContentCodec for Codec {
     fn codec_id(&self) -> CodecId {
@@ -210,9 +190,10 @@ impl ContentCodec for Codec {
     }
 
     fn requires_rotation(&self) -> bool {
-        // The slug is laquna's rotation-batch identifier; friction degrades
-        // when one slug stamps many records (§3.5). The install seam
-        // fail-closes if no rotation oracle is installed.
+        // Every record carries a generation so rotation can find records
+        // older than the period and re-encode them. (The laquna slug itself
+        // is drawn fresh per encode, not taken from the generation.) The
+        // install seam fail-closes if no rotation oracle is installed.
         true
     }
 
@@ -244,19 +225,26 @@ impl ContentCodec for Codec {
         // here is the runtime-transient case (an oracle healthy at install
         // returns `None` later — backend unavailability, cold cache, rate
         // limit): return a clean, fail-closed error rather than panicking.
-        let mark = context.current_generation_hint.as_ref().ok_or_else(|| {
-            CodecError::RotationStateUnavailable {
+        //
+        // The generation is required because the substrate stamps it on the
+        // record and rotation keys on it ("older than the period"). It is not
+        // the slug source: the codec reads no slug from the mark, so any mark
+        // format is accepted.
+        if context.current_generation_hint.is_none() {
+            return Err(CodecError::RotationStateUnavailable {
                 codec: self.codec_id(),
-            }
+            });
+        }
+
+        // A fresh CSRNG slug for every encode. The seed is fixed per record
+        // identity (DID, NSID, rkey), so a slug shared across encodes would
+        // give two different plaintexts at the same identity — a re-create at
+        // a reused rkey, or an edit — the same keystream. A per-encode slug is
+        // a rotation batch of one: never reused, not secret, and carried
+        // inline in the artifact, where decode reads it.
+        let slug = generate_slug().map_err(|_| CodecError::BackendUnavailable {
+            detail: "CSRNG unavailable for laquna slug".to_owned(),
         })?;
-        // A mark that fails to parse, by contrast, is a deliberate operator
-        // configuration error — pairing laquna's codec with an oracle that
-        // emits a non-laquna mark format (§4.7) — not a runtime transient.
-        // That stays a substrate-invariant panic.
-        let slug = parse_slug_from_mark(mark).expect(
-            "substrate invariant: rotation mark must match the default \
-             oracle's format (§4.7)",
-        );
 
         // Laquna's encode is sync + CPU-bound (zstd). At typical record sizes
         // (a few KB) the blocking compression is microseconds; ~1MB lexicon
@@ -357,8 +345,10 @@ struct PersistRequest {
 /// workers — substitute a coordinated `RotationOracle` (DB-backed, KMS-backed,
 /// etc.) from day one to keep rotation cadence correct across processes.
 ///
-/// Rotation is wall-clock: a fresh CSRNG slug is generated when the configured
-/// cadence (default 24h) elapses past the current slug's generation time.
+/// Rotation is wall-clock: a fresh generation (timestamp plus a CSRNG batch
+/// id) is started when the configured cadence (default 24h) elapses past the
+/// current one's start. The batch id in the mark is a generation identifier
+/// only; [`Codec`] draws its own fresh slug for every encode.
 /// Rotation does the in-memory swap synchronously and dispatches the file
 /// write to a background thread (rev 3 §4.6), so a slow filesystem does not
 /// stall encode calls.
@@ -563,7 +553,8 @@ fn default_state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("kryphocron").join("rotation.state")
 }
 
-/// Generate a fresh 32-byte slug from the OS CSRNG (rev 3 §4.3).
+/// Generate a fresh 32-byte value from the OS CSRNG (rev 3 §4.3): a laquna
+/// slug for each encode, and the oracle's generation batch id.
 fn generate_slug() -> Result<[u8; 32], getrandom::Error> {
     let mut slug = [0u8; 32];
     getrandom::getrandom(&mut slug)?;
@@ -680,6 +671,70 @@ mod tests {
             .await
             .expect("decode succeeds");
         assert_eq!(recovered, plaintext);
+    }
+
+    /// The slug at the tail of a laquna artifact.
+    fn artifact_slug(content: &[u8]) -> [u8; 32] {
+        content[content.len() - 32..].try_into().unwrap()
+    }
+
+    /// Every encode draws a fresh slug, so two encodes at the same record
+    /// identity under the same generation never share a keystream (the
+    /// delete-then-re-create-at-the-same-rkey case). Neither slug is the
+    /// generation's batch id, and both records decode.
+    #[tokio::test]
+    async fn each_encode_uses_a_fresh_slug() {
+        let codec = Codec::default();
+        let batch = [0x5a; 32];
+        let mark = mark_with_slug(batch);
+        let deadline = Instant::now();
+        let ctx = enc_ctx("3kabcdefghij2", mark.clone());
+
+        let first = codec.encode(b"first post", &ctx, deadline).await.unwrap();
+        let second = codec.encode(b"re-created post", &ctx, deadline).await.unwrap();
+        let again = codec.encode(b"first post", &ctx, deadline).await.unwrap();
+
+        let slugs = [artifact_slug(&first), artifact_slug(&second), artifact_slug(&again)];
+        assert_ne!(slugs[0], slugs[1]);
+        assert_ne!(slugs[0], slugs[2]);
+        assert_ne!(slugs[1], slugs[2]);
+        assert!(slugs.iter().all(|s| *s != batch), "slug is not the generation's batch id");
+        assert_ne!(first, again, "same content re-encodes to different bytes");
+
+        for (content, plaintext) in [
+            (first, &b"first post"[..]),
+            (second, &b"re-created post"[..]),
+            (again, &b"first post"[..]),
+        ] {
+            let record = EncodedRecord {
+                codec: codec.codec_id(),
+                content,
+                generation: Some(mark.clone()),
+            };
+            let out = codec.decode(&record, &dec_ctx("3kabcdefghij2"), deadline).await;
+            assert_eq!(out.unwrap(), plaintext);
+        }
+    }
+
+    /// The codec reads no slug from the generation mark, so a mark in a
+    /// format other than the default oracle's encodes and decodes (it used to
+    /// panic).
+    #[tokio::test]
+    async fn any_generation_mark_format_is_accepted() {
+        let codec = Codec::default();
+        let mark = RotationGenerationMark::new("custom-generation-7").unwrap();
+        let deadline = Instant::now();
+        let content = codec
+            .encode(b"a post", &enc_ctx("3kabcdefghij2", mark.clone()), deadline)
+            .await
+            .expect("encode succeeds with a non-default mark");
+        let record = EncodedRecord {
+            codec: codec.codec_id(),
+            content,
+            generation: Some(mark),
+        };
+        let out = codec.decode(&record, &dec_ctx("3kabcdefghij2"), deadline).await;
+        assert_eq!(out.unwrap(), b"a post");
     }
 
     /// `with_max_decoded_len` bounds decode: a record at the bound decodes,
