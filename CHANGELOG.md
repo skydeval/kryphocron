@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.5] — 2026-10-29
+
+Build-only: the crate's code and behavior are unchanged.
+
+### Changed
+
+- `wasm/build.sh`: the browser `.wasm` no longer embeds build-host paths
+  or source file paths. Panic locations carry no file, line or column
+  (`-Zlocation-detail=none`, with std rebuilt the same way through
+  `-Zbuild-std`), panics trap without formatting a message
+  (`panic_immediate_abort`), and `--remap-path-prefix` maps the cargo home,
+  the toolchain sysroot and the source root to neutral prefixes. A
+  byte-identical rebuild still needs the same absolute source path, since
+  cargo hashes the dependency's path into symbol names. The `-Z` flags
+  run on the stable toolchain through `RUSTC_BOOTSTRAP=1`, and the build
+  now needs the `rust-src` component. No panic hook was installed, so
+  panic messages never reached JavaScript; a panic was already a trap.
+  The `.wasm` is about 11% smaller.
+
 ## [0.4.4] — 2026-10-21
 
 Additive only: existing callers behave exactly as before. Adds what an
