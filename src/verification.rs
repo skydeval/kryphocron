@@ -85,6 +85,7 @@ pub struct VerifiedJwt {
     algorithm: SignatureAlgorithm,
     lxm: Option<String>,
     audience_fragment: Option<String>,
+    issuer_fragment: Option<String>,
     _private: PhantomData<sealed::Token>,
 }
 
@@ -103,6 +104,7 @@ impl VerifiedJwt {
         algorithm: SignatureAlgorithm,
         lxm: Option<String>,
         audience_fragment: Option<String>,
+        issuer_fragment: Option<String>,
     ) -> Self {
         VerifiedJwt {
             issuer,
@@ -114,11 +116,13 @@ impl VerifiedJwt {
             algorithm,
             lxm,
             audience_fragment,
+            issuer_fragment,
             _private: PhantomData,
         }
     }
 
-    /// Borrow the issuer DID.
+    /// Borrow the issuer DID. Always the bare DID, without any `iss`
+    /// fragment (see [`VerifiedJwt::issuer_fragment`]).
     #[must_use]
     pub fn issuer(&self) -> &Did {
         &self.issuer
@@ -184,6 +188,18 @@ impl VerifiedJwt {
     pub fn audience_fragment(&self) -> Option<&str> {
         self.audience_fragment.as_deref()
     }
+
+    /// The `#fragment` of the `iss` claim, without the `#`, if the
+    /// token named a specific service of the issuer DID (e.g.
+    /// `atproto_labeler` for `iss = did:plc:x#atproto_labeler`).
+    ///
+    /// Only fragments listed in
+    /// [`JwtVerificationConfig::issuer_key_fragments`] verify, and
+    /// only against the verification method that rule names.
+    #[must_use]
+    pub fn issuer_fragment(&self) -> Option<&str> {
+        self.issuer_fragment.as_deref()
+    }
 }
 
 /// JWT verification configuration (§7.2).
@@ -202,6 +218,19 @@ pub struct JwtVerificationConfig {
     /// `&[SignatureAlgorithm::Ed25519]`; ATProto service auth uses
     /// [`ATPROTO_SERVICE_AUTH_ALGORITHMS`].
     pub accepted_algorithms: &'static [SignatureAlgorithm],
+    /// Accepted `iss` fragments, each paired with the fragment of the
+    /// verification method that must sign such tokens:
+    /// `(iss_fragment, method_fragment)`, both without the `#`.
+    ///
+    /// Empty by default, and then an `iss` carrying a fragment is
+    /// [`JwtVerificationError::Malformed`]. With
+    /// `("atproto_labeler", "atproto_label")`, a token with
+    /// `iss = <did>#atproto_labeler` resolves `<did>` and verifies only
+    /// against the method whose id fragment is `atproto_label`
+    /// ([`JwtVerificationError::IssuerKeyNotInDocument`] if the
+    /// document has none). A fragment not listed is `Malformed`.
+    /// See [`JwtVerificationConfig::with_issuer_key_fragment`].
+    pub issuer_key_fragments: Vec<(String, String)>,
 }
 
 /// The algorithms ATProto service-auth JWTs are signed with:
@@ -223,6 +252,31 @@ impl JwtVerificationConfig {
             ..Self::default()
         }
     }
+
+    /// Accept tokens whose `iss` carries `#iss_fragment`, verified only
+    /// against the issuer's verification method `#method_fragment`
+    /// (see [`JwtVerificationConfig::issuer_key_fragments`]). For
+    /// ATProto labeler service auth:
+    /// `.with_issuer_key_fragment("atproto_labeler", "atproto_label")`.
+    #[must_use]
+    pub fn with_issuer_key_fragment(
+        mut self,
+        iss_fragment: impl Into<String>,
+        method_fragment: impl Into<String>,
+    ) -> Self {
+        self.issuer_key_fragments
+            .push((iss_fragment.into(), method_fragment.into()));
+        self
+    }
+
+    /// The method fragment that must sign tokens with this `iss`
+    /// fragment, if the fragment is accepted.
+    fn method_fragment_for(&self, iss_fragment: &str) -> Option<&str> {
+        self.issuer_key_fragments
+            .iter()
+            .find(|(iss, _)| iss == iss_fragment)
+            .map(|(_, method)| method.as_str())
+    }
 }
 
 impl Default for JwtVerificationConfig {
@@ -232,6 +286,7 @@ impl Default for JwtVerificationConfig {
             max_validity_window: Duration::from_secs(3600),
             require_nonce: false,
             accepted_algorithms: &[SignatureAlgorithm::Ed25519],
+            issuer_key_fragments: Vec::new(),
         }
     }
 }
@@ -378,12 +433,29 @@ pub async fn verify_jwt(
     //    method from the resolved DID document; absent `kid` means
     //    "any verification method is acceptable" — try them in
     //    document order.
-    let issuer = parsed.payload_iss()?;
+    //
+    //    An `iss` fragment (`did#atproto_labeler`) is accepted only if
+    //    `config.issuer_key_fragments` lists it, and then only the
+    //    method that rule names may sign.
+    let (issuer, issuer_fragment) = parsed.payload_iss()?;
+    let required_method_fragment = match issuer_fragment.as_deref() {
+        None => None,
+        Some(fragment) => Some(
+            config
+                .method_fragment_for(fragment)
+                .ok_or(JwtVerificationError::Malformed)?,
+        ),
+    };
     let document = resolver
         .resolve(&issuer, deadline, trace_id)
         .await
         .map_err(JwtVerificationError::IssuerResolutionFailed)?;
-    let public_key = select_signing_key(&document, parsed.kid_hint(), parsed.algorithm)?;
+    let public_key = select_signing_key(
+        &document,
+        parsed.kid_hint(),
+        parsed.algorithm,
+        required_method_fragment,
+    )?;
 
     // 4. Signature verification. Dispatch by algorithm.
     verify_signature(parsed.signing_input(), &parsed.signature, parsed.algorithm, &public_key)?;
@@ -391,7 +463,7 @@ pub async fn verify_jwt(
     // 5. Claims verification. Constructs the `VerifiedJwt` on
     //    success.
     let now = SystemTime::now();
-    parsed.verify_claims_and_construct(local_audience, config, issuer, now)
+    parsed.verify_claims_and_construct(local_audience, config, issuer, issuer_fragment, now)
 }
 
 // ============================================================
@@ -499,13 +571,22 @@ impl<'a> ParsedJwt<'a> {
         self.header.get("kid")?.as_str()
     }
 
-    fn payload_iss(&self) -> Result<Did, JwtVerificationError> {
+    /// The `iss` claim as (bare DID, optional fragment without `#`).
+    /// An empty fragment (`did#`) is `Malformed`; whether a non-empty
+    /// fragment is acceptable is the caller's check.
+    fn payload_iss(&self) -> Result<(Did, Option<String>), JwtVerificationError> {
         let iss = self
             .payload
             .get("iss")
             .and_then(serde_json::Value::as_str)
             .ok_or(JwtVerificationError::Malformed)?;
-        Did::new(iss).map_err(|_| JwtVerificationError::Malformed)
+        let (did_str, fragment) = match iss.split_once('#') {
+            Some((_, "")) => return Err(JwtVerificationError::Malformed),
+            Some((did, fragment)) => (did, Some(fragment.to_string())),
+            None => (iss, None),
+        };
+        let did = Did::new(did_str).map_err(|_| JwtVerificationError::Malformed)?;
+        Ok((did, fragment))
     }
 
     fn verify_claims_and_construct(
@@ -513,6 +594,7 @@ impl<'a> ParsedJwt<'a> {
         local_audience: &ServiceIdentity,
         config: &JwtVerificationConfig,
         issuer: Did,
+        issuer_fragment: Option<String>,
         now: SystemTime,
     ) -> Result<VerifiedJwt, JwtVerificationError> {
         let p = &self.payload;
@@ -664,6 +746,7 @@ impl<'a> ParsedJwt<'a> {
             self.algorithm,
             lxm,
             audience_fragment,
+            issuer_fragment,
         ))
     }
 }
@@ -723,9 +806,30 @@ fn select_signing_key(
     document: &crate::resolver::DidDocument,
     kid_hint: Option<&str>,
     algorithm: SignatureAlgorithm,
+    required_method_fragment: Option<&str>,
 ) -> Result<IssuerPublicKey, JwtVerificationError> {
     let methods = &document.verification_methods;
     if methods.is_empty() {
+        return Err(JwtVerificationError::IssuerKeyNotInDocument);
+    }
+
+    // An `iss`-fragment rule pins the signer to one named method: no
+    // fallback to other same-algorithm keys. A `kid`, if present, must
+    // name that same method.
+    if let Some(required) = required_method_fragment {
+        for (kid, key) in methods {
+            if document.verification_method_fragment(kid) != Some(required) {
+                continue;
+            }
+            if let Some(hint) = kid_hint {
+                if !kid_matches(hint, &kid_to_hex(kid)) {
+                    continue;
+                }
+            }
+            if key.algorithm() == algorithm {
+                return Ok(key.clone());
+            }
+        }
         return Err(JwtVerificationError::IssuerKeyNotInDocument);
     }
 
@@ -2796,6 +2900,7 @@ mod tests {
                 also_known_as: vec![],
                 resolved_at: SystemTime::now(),
                 resolver_cache_max_age: Duration::from_secs(3600),
+                verification_method_fragments: vec![],
             };
             self.documents.lock().unwrap().insert(did.as_str().to_string(), Ok(doc));
         }
@@ -3230,6 +3335,134 @@ mod tests {
         assert_eq!(err, JwtVerificationError::Malformed);
     }
 
+    // ------------------------------------------------------------
+    // `iss` fragment → named signing method (labeler service auth).
+    // ------------------------------------------------------------
+
+    const REPO_SEED: u8 = 30;
+    const LABEL_SEED: u8 = 31;
+
+    fn secp_pub(seed: u8) -> IssuerPublicKey {
+        let sk = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        IssuerPublicKey::Secp256k1(sk.verifying_key().to_encoded_point(true).as_bytes().to_vec())
+    }
+
+    /// An issuer whose document holds two secp256k1 keys, `#atproto`
+    /// first (as the parser orders it) and `#atproto_label` second.
+    fn labeler_resolver() -> Arc<MockResolver> {
+        let repo_kid = KeyId::from_bytes([5u8; 32]);
+        let label_kid = KeyId::from_bytes([6u8; 32]);
+        let doc = DidDocument::new(
+            atproto_issuer(),
+            vec![(repo_kid, secp_pub(REPO_SEED)), (label_kid, secp_pub(LABEL_SEED))],
+            vec![],
+            vec![],
+            vec![],
+            SystemTime::now(),
+            Duration::from_secs(3600),
+        )
+        .with_verification_method_fragments(vec![
+            (repo_kid, "atproto".to_string()),
+            (label_kid, "atproto_label".to_string()),
+        ]);
+        let r = Arc::new(MockResolver::new());
+        r.documents.lock().unwrap().insert(atproto_issuer().as_str().to_string(), Ok(doc));
+        r
+    }
+
+    fn labeler_payload(fragment: &str) -> serde_json::Value {
+        let mut p = atproto_payload(&local_aud());
+        p["iss"] = serde_json::json!(format!("{}#{fragment}", atproto_issuer()));
+        p
+    }
+
+    fn labeler_config() -> JwtVerificationConfig {
+        JwtVerificationConfig::atproto_service_auth()
+            .with_issuer_key_fragment("atproto_labeler", "atproto_label")
+    }
+
+    #[tokio::test]
+    async fn labeler_iss_verifies_against_label_key() {
+        let (token, _) = es256k_jwt(LABEL_SEED, &labeler_payload("atproto_labeler"));
+        let v = verify_atproto(&token, &labeler_resolver(), &labeler_config()).await.unwrap();
+        assert_eq!(v.issuer(), &atproto_issuer());
+        assert_eq!(v.issuer().as_str(), "did:plc:atprotoissuer");
+        assert_eq!(v.issuer_fragment(), Some("atproto_labeler"));
+    }
+
+    #[tokio::test]
+    async fn labeler_iss_signed_with_repo_key_is_refused() {
+        // The `#atproto` key is first and same-curve; the rule must not
+        // fall back to it.
+        let (token, _) = es256k_jwt(REPO_SEED, &labeler_payload("atproto_labeler"));
+        let err = verify_atproto(&token, &labeler_resolver(), &labeler_config()).await.unwrap_err();
+        assert_eq!(err, JwtVerificationError::SignatureInvalid);
+    }
+
+    #[tokio::test]
+    async fn labeler_iss_without_table_is_malformed() {
+        let (token, _) = es256k_jwt(LABEL_SEED, &labeler_payload("atproto_labeler"));
+        let err = verify_atproto(&token, &labeler_resolver(), &JwtVerificationConfig::atproto_service_auth())
+            .await
+            .unwrap_err();
+        assert_eq!(err, JwtVerificationError::Malformed);
+    }
+
+    #[tokio::test]
+    async fn iss_fragment_not_in_table_is_malformed() {
+        for fragment in ["atproto", "atproto_label", "other_service"] {
+            let (token, _) = es256k_jwt(LABEL_SEED, &labeler_payload(fragment));
+            let err = verify_atproto(&token, &labeler_resolver(), &labeler_config()).await.unwrap_err();
+            assert_eq!(err, JwtVerificationError::Malformed, "fragment {fragment}");
+        }
+    }
+
+    #[tokio::test]
+    async fn iss_with_empty_fragment_is_malformed() {
+        let mut payload = atproto_payload(&local_aud());
+        payload["iss"] = serde_json::json!(format!("{}#", atproto_issuer()));
+        let (token, _) = es256k_jwt(LABEL_SEED, &payload);
+        let err = verify_atproto(&token, &labeler_resolver(), &labeler_config()).await.unwrap_err();
+        assert_eq!(err, JwtVerificationError::Malformed);
+    }
+
+    #[tokio::test]
+    async fn labeler_iss_without_label_method_is_key_not_in_document() {
+        // Document has only `#atproto`: the rule finds no `#atproto_label`.
+        let repo_kid = KeyId::from_bytes([5u8; 32]);
+        let doc = DidDocument::new(
+            atproto_issuer(),
+            vec![(repo_kid, secp_pub(REPO_SEED))],
+            vec![],
+            vec![],
+            vec![],
+            SystemTime::now(),
+            Duration::from_secs(3600),
+        )
+        .with_verification_method_fragments(vec![(repo_kid, "atproto".to_string())]);
+        let r = Arc::new(MockResolver::new());
+        r.documents.lock().unwrap().insert(atproto_issuer().as_str().to_string(), Ok(doc));
+        let (token, _) = es256k_jwt(REPO_SEED, &labeler_payload("atproto_labeler"));
+        let err = verify_atproto(&token, &r, &labeler_config()).await.unwrap_err();
+        assert_eq!(err, JwtVerificationError::IssuerKeyNotInDocument);
+    }
+
+    #[tokio::test]
+    async fn bare_iss_unchanged_when_table_is_set() {
+        // No `iss` fragment: today's first-key-of-algorithm selection
+        // (`#atproto` first), and no issuer fragment reported.
+        let (token, _) = es256k_jwt(REPO_SEED, &atproto_payload(&local_aud()));
+        let v = verify_atproto(&token, &labeler_resolver(), &labeler_config()).await.unwrap();
+        assert_eq!(v.issuer(), &atproto_issuer());
+        assert_eq!(v.issuer_fragment(), None);
+    }
+
+    #[test]
+    fn default_config_has_no_issuer_key_fragments() {
+        assert!(JwtVerificationConfig::default().issuer_key_fragments.is_empty());
+        assert!(JwtVerificationConfig::atproto_service_auth().issuer_key_fragments.is_empty());
+    }
+
     #[tokio::test]
     async fn lxm_absent_is_none_and_non_string_is_malformed() {
         let mut payload = atproto_payload(&local_aud());
@@ -3260,6 +3493,7 @@ mod tests {
             .unwrap();
         assert_eq!(v.lxm(), None);
         assert_eq!(v.audience_fragment(), None);
+        assert_eq!(v.issuer_fragment(), None);
     }
 
     #[tokio::test]
@@ -3445,6 +3679,7 @@ mod tests {
             also_known_as: vec![],
             resolved_at: SystemTime::now(),
             resolver_cache_max_age: Duration::from_secs(3600),
+            verification_method_fragments: vec![],
         };
         r.documents.lock().unwrap().insert(issuer_did().as_str().to_string(), Ok(empty_doc));
         let cfg = JwtVerificationConfig::default();
@@ -4090,6 +4325,7 @@ mod tests {
             also_known_as: vec![],
             resolved_at: SystemTime::now(),
             resolver_cache_max_age: Duration::from_secs(3600),
+            verification_method_fragments: vec![],
         };
         // Also keep the rotation-history field's KeyId aligned
         // with the claim issuer's KeyId so the lookup matches.
@@ -4149,6 +4385,7 @@ mod tests {
             also_known_as: vec![],
             resolved_at: SystemTime::now(),
             resolver_cache_max_age: Duration::from_secs(3600),
+            verification_method_fragments: vec![],
         };
         r.documents
             .lock()

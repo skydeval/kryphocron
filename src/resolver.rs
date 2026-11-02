@@ -72,6 +72,16 @@ pub struct DidDocument {
     /// Document-declared maximum cache age, capped by
     /// [`MAX_DID_DOCUMENT_CACHE_AGE`] downstream.
     pub resolver_cache_max_age: Duration,
+    /// The `id` fragment of each entry in `verification_methods`
+    /// (`atproto` for `did:plc:x#atproto`), keyed by its [`KeyId`].
+    ///
+    /// The built-in parser fills it. [`DidDocument::new`] leaves it
+    /// empty; set it with
+    /// [`DidDocument::with_verification_method_fragments`]. Read by
+    /// [`crate::verification::verify_jwt`] when an issuer-key fragment
+    /// rule ([`crate::verification::JwtVerificationConfig::issuer_key_fragments`])
+    /// applies.
+    pub verification_method_fragments: Vec<(KeyId, String)>,
 }
 
 impl DidDocument {
@@ -100,7 +110,26 @@ impl DidDocument {
             also_known_as,
             resolved_at,
             resolver_cache_max_age,
+            verification_method_fragments: Vec::new(),
         }
+    }
+
+    /// Set the `id` fragment of each verification method, keyed by
+    /// [`KeyId`] (see [`DidDocument::verification_method_fragments`]).
+    #[must_use]
+    pub fn with_verification_method_fragments(mut self, fragments: Vec<(KeyId, String)>) -> Self {
+        self.verification_method_fragments = fragments;
+        self
+    }
+
+    /// The `id` fragment recorded for the verification method with
+    /// this [`KeyId`], if any.
+    #[must_use]
+    pub fn verification_method_fragment(&self, key_id: &KeyId) -> Option<&str> {
+        self.verification_method_fragments
+            .iter()
+            .find(|(k, _)| k == key_id)
+            .map(|(_, f)| f.as_str())
     }
 }
 
@@ -608,15 +637,19 @@ fn parse_did_document(
                 continue;
             };
             let key_id = synthesize_key_id(id, key.bytes());
-            verification_methods.push((id_fragment(id) == "atproto", key_id, key));
+            verification_methods.push((id_fragment(id).to_string(), key_id, key));
         }
     }
+    let verification_method_fragments: Vec<(KeyId, String)> = verification_methods
+        .iter()
+        .map(|(fragment, key_id, _)| (*key_id, fragment.clone()))
+        .collect();
     // The `#atproto` method is the ATProto account signing key. Stable-
     // partition it to the front so verifiers that select "first key of
     // the JWT's algorithm" (no `kid` — the ATProto service-auth norm)
     // pick it ahead of any other same-curve key in the document (e.g. a
     // labeler's `#atproto_label` key).
-    verification_methods.sort_by_key(|(is_atproto, _, _)| !*is_atproto);
+    verification_methods.sort_by_key(|(fragment, _, _)| fragment != "atproto");
     let verification_methods: Vec<(KeyId, IssuerPublicKey)> = verification_methods
         .into_iter()
         .map(|(_, key_id, key)| (key_id, key))
@@ -669,6 +702,7 @@ fn parse_did_document(
         // Default per-document TTL; downstream cache caps at
         // MAX_DID_DOCUMENT_CACHE_AGE.
         resolver_cache_max_age: MAX_DID_DOCUMENT_CACHE_AGE,
+        verification_method_fragments,
     })
 }
 
@@ -925,6 +959,7 @@ mod tests {
             also_known_as: vec![],
             resolved_at: SystemTime::now(),
             resolver_cache_max_age: Duration::from_secs(3600),
+            verification_method_fragments: vec![],
         }
     }
 
@@ -1355,6 +1390,43 @@ mod tests {
         ]);
         assert_eq!(doc.verification_methods.len(), 2);
         assert_eq!(doc.verification_methods[0].1, IssuerPublicKey::Secp256k1(signing_key));
+    }
+
+    #[test]
+    fn parser_records_each_method_fragment() {
+        let label = multibase(&MULTICODEC_SECP256K1_PUB, &k256_compressed(8));
+        let signing = multibase(&MULTICODEC_SECP256K1_PUB, &k256_compressed(9));
+        let doc = parse_methods(vec![
+            vm_entry("did:plc:x#atproto_label", "Multikey", &label),
+            vm_entry("did:plc:x#atproto", "Multikey", &signing),
+        ]);
+        let fragments: Vec<Option<&str>> = doc
+            .verification_methods
+            .iter()
+            .map(|(kid, _)| doc.verification_method_fragment(kid))
+            .collect();
+        // Ordering puts `#atproto` first; each key keeps its own fragment.
+        assert_eq!(fragments, vec![Some("atproto"), Some("atproto_label")]);
+    }
+
+    #[test]
+    fn new_builds_a_document_without_fragments() {
+        let did = sample_did();
+        let kid = KeyId::from_bytes([1u8; 32]);
+        let doc = DidDocument::new(
+            did.clone(),
+            vec![(kid, sample_pubkey(1))],
+            vec![],
+            vec![],
+            vec![],
+            SystemTime::now(),
+            Duration::from_secs(60),
+        );
+        assert_eq!(doc.did, did);
+        assert!(doc.verification_method_fragments.is_empty());
+        assert_eq!(doc.verification_method_fragment(&kid), None);
+        let doc = doc.with_verification_method_fragments(vec![(kid, "atproto".to_string())]);
+        assert_eq!(doc.verification_method_fragment(&kid), Some("atproto"));
     }
 
     #[test]

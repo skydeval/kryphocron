@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+Additive only: callers that set no issuer-key fragment rule behave
+exactly as before.
+
+### Added
+
+- `JwtVerificationConfig::issuer_key_fragments` (empty by default) and
+  `JwtVerificationConfig::with_issuer_key_fragment(iss_fragment,
+  method_fragment)`. A rule such as `("atproto_labeler", "atproto_label")`
+  lets `verify_jwt` accept `iss = <did>#atproto_labeler`: it resolves
+  `<did>` and verifies only against the method `#atproto_label`, with no
+  fallback to other keys (`IssuerKeyNotInDocument` if the document has
+  none). An `iss` fragment with no rule, or an empty one, is `Malformed`,
+  as before.
+- `VerifiedJwt::issuer_fragment()`. `VerifiedJwt::issuer()` stays the
+  bare DID.
+- `DidDocument::verification_method_fragments` (each method's id
+  fragment, keyed by `KeyId`), filled by the built-in parser, plus
+  `DidDocument::with_verification_method_fragments` and
+  `DidDocument::verification_method_fragment`. `DidDocument::new` keeps
+  its arguments and leaves the field empty.
+
 ## [0.4.5] — 2026-10-29
 
 Build-only: the crate's code and behavior are unchanged.
