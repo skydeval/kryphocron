@@ -681,7 +681,7 @@ pub mod fixtures {
     pub fn secp256k1_signing_pair(seed: [u8; 32]) -> (k256::ecdsa::SigningKey, IssuerPublicKey) {
         let sk = k256::ecdsa::SigningKey::from_slice(&seed).expect("valid secp256k1 seed");
         let pk = IssuerPublicKey::Secp256k1(
-            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         );
         (sk, pk)
     }
@@ -692,7 +692,7 @@ pub mod fixtures {
     pub fn p256_signing_pair(seed: [u8; 32]) -> (p256::ecdsa::SigningKey, IssuerPublicKey) {
         let sk = p256::ecdsa::SigningKey::from_slice(&seed).expect("valid p256 seed");
         let pk = IssuerPublicKey::P256(
-            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         );
         (sk, pk)
     }
@@ -717,7 +717,7 @@ pub mod fixtures {
         use k256::ecdsa::{signature::Signer, Signature};
         let signing_input = jws_signing_input(header, payload);
         let sig: Signature = signing_key.sign(signing_input.as_bytes());
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
     }
 
@@ -731,7 +731,7 @@ pub mod fixtures {
         use p256::ecdsa::{signature::Signer, Signature};
         let signing_input = jws_signing_input(header, payload);
         let sig: Signature = signing_key.sign(signing_input.as_bytes());
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
     }
 }

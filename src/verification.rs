@@ -941,8 +941,8 @@ fn verify_k256(
         VerifyingKey::from_sec1_bytes(key_bytes).map_err(|_| JwtVerificationError::SignatureInvalid)?;
     // JWS signatures are fixed `r‖s` (64 bytes), NOT ASN.1 DER (RFC 7515 §3.4).
     let sig = Signature::from_slice(signature).map_err(|_| JwtVerificationError::SignatureInvalid)?;
-    // Strict low-S: `normalize_s` returns `Some` iff the input was high-S.
-    if sig.normalize_s().is_some() {
+    // Strict low-S: `normalize_s` changes the signature only if it was high-S.
+    if sig.normalize_s() != sig {
         return Err(JwtVerificationError::HighSSignature);
     }
     key.verify(signing_input, &sig)
@@ -963,7 +963,7 @@ fn verify_p256(
     let key =
         VerifyingKey::from_sec1_bytes(key_bytes).map_err(|_| JwtVerificationError::SignatureInvalid)?;
     let sig = Signature::from_slice(signature).map_err(|_| JwtVerificationError::SignatureInvalid)?;
-    if sig.normalize_s().is_some() {
+    if sig.normalize_s() != sig {
         return Err(JwtVerificationError::HighSSignature);
     }
     key.verify(signing_input, &sig)
@@ -3168,9 +3168,9 @@ mod tests {
         let sk = SigningKey::from_slice(&[seed; 32]).unwrap();
         let input = jwt_segments("ES256K", payload);
         let sig: Signature = sk.sign(input.as_bytes());
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         let pk = IssuerPublicKey::Secp256k1(
-            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         );
         (format!("{input}.{}", b64u(&sig.to_bytes())), pk)
     }
@@ -3180,9 +3180,9 @@ mod tests {
         let sk = SigningKey::from_slice(&[seed; 32]).unwrap();
         let input = jwt_segments("ES256", payload);
         let sig: Signature = sk.sign(input.as_bytes());
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         let pk = IssuerPublicKey::P256(
-            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         );
         (format!("{input}.{}", b64u(&sig.to_bytes())), pk)
     }
@@ -3344,7 +3344,7 @@ mod tests {
 
     fn secp_pub(seed: u8) -> IssuerPublicKey {
         let sk = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
-        IssuerPublicKey::Secp256k1(sk.verifying_key().to_encoded_point(true).as_bytes().to_vec())
+        IssuerPublicKey::Secp256k1(sk.verifying_key().to_sec1_point(true).as_bytes().to_vec())
     }
 
     /// An issuer whose document holds two secp256k1 keys, `#atproto`
@@ -5542,7 +5542,7 @@ mod ecdsa_verifier_tests {
     fn k256_pair(seed: u8) -> (k256::ecdsa::SigningKey, IssuerPublicKey) {
         let sk = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("seed");
         let pk = IssuerPublicKey::Secp256k1(
-            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         );
         (sk, pk)
     }
@@ -5550,7 +5550,7 @@ mod ecdsa_verifier_tests {
     fn k256_low_s(sk: &k256::ecdsa::SigningKey, msg: &[u8]) -> Vec<u8> {
         use k256::ecdsa::{signature::Signer, Signature};
         let sig: Signature = sk.sign(msg);
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         sig.to_bytes().to_vec()
     }
 
@@ -5609,10 +5609,10 @@ mod ecdsa_verifier_tests {
         let (sk, _) = k256_pair(1);
         let sig = k256_low_s(&sk, MSG);
         let comp = IssuerPublicKey::Secp256k1(
-            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         );
         let uncomp = IssuerPublicKey::Secp256k1(
-            sk.verifying_key().to_encoded_point(false).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
         );
         assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256K, &comp).is_ok());
         assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256K, &uncomp).is_ok());
@@ -5623,7 +5623,7 @@ mod ecdsa_verifier_tests {
     fn p256_pair(seed: u8) -> (p256::ecdsa::SigningKey, IssuerPublicKey) {
         let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("seed");
         let pk = IssuerPublicKey::P256(
-            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         );
         (sk, pk)
     }
@@ -5631,7 +5631,7 @@ mod ecdsa_verifier_tests {
     fn p256_low_s(sk: &p256::ecdsa::SigningKey, msg: &[u8]) -> Vec<u8> {
         use p256::ecdsa::{signature::Signer, Signature};
         let sig: Signature = sk.sign(msg);
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         sig.to_bytes().to_vec()
     }
 
@@ -5689,10 +5689,10 @@ mod ecdsa_verifier_tests {
         let (sk, _) = p256_pair(1);
         let sig = p256_low_s(&sk, MSG);
         let comp = IssuerPublicKey::P256(
-            sk.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(true).as_bytes().to_vec(),
         );
         let uncomp = IssuerPublicKey::P256(
-            sk.verifying_key().to_encoded_point(false).as_bytes().to_vec(),
+            sk.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
         );
         assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256, &comp).is_ok());
         assert!(verify_signature(MSG, &sig, SignatureAlgorithm::Es256, &uncomp).is_ok());

@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.7] — 2026-11-07
+
+### Security
+
+- k256 and p256 0.13 → 0.14, for RUSTSEC-2026-0387 (crypto-bigint 0.5).
+  kryphocron itself only verifies signatures, so every input it hands
+  these crates is public. Dependents that also sign with them can now
+  drop elliptic-curve 0.13 and crypto-bigint 0.5 from their graph.
+
+### Changed
+
+- No change to kryphocron's own API or behavior. The ES256K / ES256
+  verifiers still reject high-S signatures and accept the same SEC1 keys.
+- Under the `test-support` feature, the `identity::fixtures` signing
+  helpers now take and return the 0.14 `k256::ecdsa::SigningKey` and
+  `p256::ecdsa::SigningKey` types.
+
 ## [0.4.6] — 2026-11-07
 
 A security fix in the decode path, plus additive issuer-key fragment

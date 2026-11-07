@@ -1297,12 +1297,12 @@ mod tests {
 
     fn k256_compressed(seed: u8) -> Vec<u8> {
         let sk = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
-        sk.verifying_key().to_encoded_point(true).as_bytes().to_vec()
+        sk.verifying_key().to_sec1_point(true).as_bytes().to_vec()
     }
 
     fn p256_compressed(seed: u8) -> Vec<u8> {
         let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
-        sk.verifying_key().to_encoded_point(true).as_bytes().to_vec()
+        sk.verifying_key().to_sec1_point(true).as_bytes().to_vec()
     }
 
     fn multibase(prefix: &[u8], key: &[u8]) -> String {
