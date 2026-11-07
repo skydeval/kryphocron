@@ -14,10 +14,11 @@
 //! submodule (`crate::DecodeError` → `super::DecodeError`,
 //! `crate::materials` → `super::super::materials`). Function bodies, error
 //! types, stream generators, and the inline reference-vector tests are
-//! byte-for-byte verbatim, with one kryphocron-side addition: an optional
+//! byte-for-byte verbatim, with two kryphocron-side changes: an optional
 //! caller-chosen bound on decoded size ([`decode_with_limit`]; [`decode`]
-//! keeps the original unbounded behaviour). The public `ContentCodec` adapter
-//! lives in the parent module (`super`).
+//! keeps the original unbounded behaviour), and the decode path ported from
+//! ruzstd 0.7 to 0.9.1 (RUSTSEC-2026-0344). The artifact format is unchanged.
+//! The public `ContentCodec` adapter lives in the parent module (`super`).
 //!
 //! laquna — a deterministic, reversible byte transform for at-rest content
 //! opacity. Given a plaintext, an opaque `seed`, and a 32-byte `slug`,
@@ -173,14 +174,8 @@ fn decompress(
     max_decoded_len: Option<usize>,
 ) -> Result<Vec<u8>, DecodeError> {
     use ruzstd::io::Read;
-    use ruzstd::StreamingDecoder;
 
-    if let Some(limit) = max_decoded_len {
-        check_frame_header_within(payload_input, limit)?;
-    }
-
-    let mut decoder =
-        StreamingDecoder::new(payload_input).map_err(|_| DecodeError::DecompressionFailed)?;
+    let mut decoder = open_decoder(payload_input, max_decoded_len)?;
 
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
@@ -210,37 +205,55 @@ fn decompress(
     Ok(out)
 }
 
-/// Refuse a frame whose header already shows it cannot fit in `limit` bytes.
-///
-/// ruzstd keeps a full window of output buffered before it hands any bytes back,
-/// and a frame may declare a window of up to 100 MiB; the read-loop count in
-/// [`decompress`] alone would therefore let a small frame occupy that much
-/// memory first. Two header checks close this:
-///
-/// - a declared content size larger than `limit` is refused outright;
-/// - a window larger than `limit` (floored at zstd's 1 KiB minimum window) is
-///   refused. Frames from [`compress`] are single-segment, so their window
-///   equals their content size and passes whenever the content does.
-///
-/// A header that fails to parse is left for the decoder to reject as before.
-fn check_frame_header_within(payload_input: &[u8], limit: usize) -> Result<(), DecodeError> {
-    let Ok((frame, _)) = ruzstd::frame::read_frame_header(payload_input) else {
-        return Ok(());
-    };
-    let header = &frame.header;
-    let limit = limit as u64;
+/// zstd's minimum window size (RFC 8878); ruzstd keeps its own copy private.
+const MIN_WINDOW_SIZE: u64 = 1024;
 
-    let declares_content_size =
-        matches!(header.descriptor.frame_content_size_bytes(), Ok(n) if n > 0);
-    if declares_content_size && header.frame_content_size() > limit {
+type Decoder<'a> = ruzstd::decoding::StreamingDecoder<&'a [u8], ruzstd::decoding::FrameDecoder>;
+
+/// Read the frame header and open a decoder, refusing a frame whose header
+/// already shows it cannot fit in `max_decoded_len` bytes.
+///
+/// ruzstd buffers up to a window of output before it hands bytes back, so the
+/// read-loop count in [`decompress`] alone would let a small frame claim that
+/// much memory first. With `Some(limit)`, two header checks close this before
+/// any block is decoded:
+///
+/// - a window larger than `limit` (floored at zstd's 1 KiB minimum window) is
+///   refused by the decoder itself, before it allocates the window. Frames from
+///   [`compress`] are single-segment, so their window equals their content size
+///   and passes whenever the content does;
+/// - a declared content size larger than `limit` is refused.
+///
+/// Each block's output is bounded by the decoder (at most the smaller of the
+/// window and 128 KiB, per RFC 8878; enforced since ruzstd 0.9.1), so between
+/// reads the decoder holds at most a window plus one block.
+///
+/// With `None`, ruzstd's default window bound applies. Any header error maps to
+/// [`DecodeError::DecompressionFailed`].
+fn open_decoder(
+    payload_input: &[u8],
+    max_decoded_len: Option<usize>,
+) -> Result<Decoder<'_>, DecodeError> {
+    use ruzstd::decoding::StreamingDecoder;
+
+    let Some(limit) = max_decoded_len else {
+        return StreamingDecoder::new(payload_input).map_err(|_| DecodeError::DecompressionFailed);
+    };
+    let limit = limit as u64;
+    let decoder = StreamingDecoder::new_with_max_window_size(payload_input, limit.max(MIN_WINDOW_SIZE))
+        .map_err(|_| DecodeError::DecompressionFailed)?;
+    // `content_size` is 0 when the header declares none; such a frame is
+    // bounded by the read-loop count instead.
+    if decoder.decoder.content_size() > limit {
         return Err(DecodeError::DecompressionFailed);
     }
-    if let Ok(window) = header.window_size() {
-        if window > limit.max(ruzstd::frame::MIN_WINDOW_SIZE) {
-            return Err(DecodeError::DecompressionFailed);
-        }
-    }
-    Ok(())
+    Ok(decoder)
+}
+
+/// The header checks of [`open_decoder`] alone, for tests.
+#[cfg(test)]
+fn check_frame_header_within(payload_input: &[u8], limit: usize) -> Result<(), DecodeError> {
+    open_decoder(payload_input, Some(limit)).map(|_| ())
 }
 
 #[cfg(test)]
@@ -321,6 +334,70 @@ mod decode_limit_tests {
         assert!(bomb.len() < 64 * 1024);
         let start = Instant::now();
         // `matches!`, not `assert_eq!`: a regression would otherwise print 1 GiB.
+        assert!(matches!(
+            decode_with_limit(&bomb, SEED, Some(1_000_000)),
+            Err(DecodeError::DecompressionFailed)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+    }
+
+    /// A frame of an 8-byte raw block, then one compressed block of `sequences`
+    /// identical sequences: no literals, a repeat offset into the raw block, and
+    /// match-length code `ml_code` with `ml_extra_bits` zero extra bits. All three
+    /// sequence tables are RLE mode, so each sequence costs only its extra bits.
+    /// Window 64 KiB, no content size, no checksum.
+    fn sequence_block_frame(sequences: usize, ml_code: u8, ml_extra_bits: usize) -> Vec<u8> {
+        assert!(sequences < 0x7F00);
+        assert_eq!(sequences * ml_extra_bits % 8, 0);
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, WINDOW_64_KIB];
+        // Raw block (type 0), not last.
+        f.extend_from_slice(&(8u32 << 3).to_le_bytes()[..3]);
+        f.extend_from_slice(b"abcdefgh");
+
+        let mut block = vec![0x00]; // literals section: raw, size 0
+        if sequences < 128 {
+            block.push(sequences as u8);
+        } else {
+            block.push((128 + (sequences >> 8)) as u8);
+            block.push(sequences as u8);
+        }
+        block.push(0b01_01_01_00); // literal-length, offset, match-length tables: RLE
+        // Literal-length code 0 (none); offset code 0 (value 1: a repeat
+        // offset, 4 then 1, both inside the raw block); then the match code.
+        block.extend_from_slice(&[0, 0, ml_code]);
+        block.resize(block.len() + sequences * ml_extra_bits / 8, 0);
+        block.push(0x01); // bitstream end marker, no padding bits
+
+        // Compressed block (type 2), last.
+        let header = ((block.len() as u32) << 3) | (2 << 1) | 1;
+        f.extend_from_slice(&header.to_le_bytes()[..3]);
+        f.extend_from_slice(&block);
+        f
+    }
+
+    /// The sequence-block frame is well-formed: one 34-byte match (code 31, no
+    /// extra bits) decodes to 8 + 34 bytes.
+    #[test]
+    fn sequence_block_frame_decodes_when_small() {
+        let out = decode(&artifact_from_zstd(&sequence_block_frame(1, 31, 0)), SEED).unwrap();
+        assert_eq!(out.len(), 8 + 34);
+        assert_eq!(&out[..12], b"abcdefghefgh");
+    }
+
+    /// RUSTSEC-2026-0344: one compressed block whose sequences expand to about
+    /// 65 MB, far past zstd's per-block maximum (the smaller of the window and
+    /// 128 KiB). The window is small, so the header checks pass; before ruzstd
+    /// 0.9.1 the decoder built the whole block in memory before returning a byte,
+    /// past both the window bound and the read-loop count. The decoder must
+    /// refuse the block itself, with or without a decoded-size bound.
+    #[test]
+    fn oversized_block_refused_by_decoder() {
+        // Match-length code 52: 65 539 bytes plus 16 extra bits (zero here).
+        let bomb = artifact_from_zstd(&sequence_block_frame(1000, 52, 16));
+        assert!(bomb.len() < 4096);
+        let start = Instant::now();
+        // `matches!`, not `assert_eq!`: a regression would otherwise print 65 MB.
+        assert!(matches!(decode(&bomb, SEED), Err(DecodeError::DecompressionFailed)));
         assert!(matches!(
             decode_with_limit(&bomb, SEED, Some(1_000_000)),
             Err(DecodeError::DecompressionFailed)

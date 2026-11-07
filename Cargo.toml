@@ -1,8 +1,8 @@
 [package]
 name = "kryphocron"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MPL-2.0"
 description = "Privacy-first ATProto substrate primitives: type architecture, audit vocabulary, inter-service auth, and encryption hook surfaces"
 keywords = ["atproto", "substrate", "privacy", "bluesky", "federation"]
@@ -52,7 +52,7 @@ tokio = { version = "1", features = ["time"] }  # §4.6 timing-equalization slee
 chacha20 = { version = "0.9", default-features = false }    # anchor-stream keystream
 hkdf = { version = "0.12", default-features = false }       # per-stream HKDF-SHA256 keying
 sha2 = { version = "0.10", default-features = false }       # HKDF-SHA256 hash
-ruzstd = { version = "0.7", default-features = false, features = ["hash"] }  # decode-side zstd
+ruzstd = { version = "0.9.1", default-features = false, features = ["hash"] }  # decode-side zstd; >= 0.9.1 for RUSTSEC-2026-0344
 zstd = "0.13"                       # encode-side zstd compressor (C libzstd via zstd-sys)
 hex = "0.4"                         # rotation-mark slug parse/format (§3.4/§4.7)
 

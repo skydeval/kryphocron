@@ -4,10 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.4.6] — 2026-11-07
 
-Additive only: callers that set no issuer-key fragment rule behave
-exactly as before.
+A security fix in the decode path, plus additive issuer-key fragment
+rules. Callers that set no fragment rule behave exactly as before. The
+laquna artifact format is unchanged: every record that decoded under
+0.4.5 decodes under 0.4.6, and vice versa.
+
+### Security
+
+- ruzstd 0.7 → 0.9.1, for RUSTSEC-2026-0344 (decompression bomb: one
+  zstd block could expand to gigabytes). ruzstd before 0.9.1 never
+  checked a block's decompressed size against zstd's per-block maximum
+  (the smaller of the window and 128 KiB). It built the whole block in
+  memory before returning a byte. That bypassed the
+  `Codec::with_max_decoded_len` bound, which only counts bytes as they
+  come out: a frame of under 4 KB with a 1 MB bound still reached about
+  74 MB of memory. With 0.9.1 the decoder refuses the block itself, with
+  or without a bound. A test feeding such a frame pins this
+  (`oversized_block_refused_by_decoder`).
+
+### Changed
+
+- Minimum supported Rust version 1.85 → 1.88. ruzstd 0.9.1 needs 1.87.
+  The `proto-blue-*` crates under kryphocron-lexicons already needed
+  1.88 in practice, so 1.85 was never buildable.
+- The decode path is ported to ruzstd 0.9.1's API. The window check now
+  runs inside the decoder (`new_with_max_window_size`) rather than in a
+  separate header parse; behavior is the same.
+- Repo lockfiles only (the version requirements are unchanged, so
+  dependents pick these up with `cargo update`): zstd 0.13.4, zstd-safe
+  7.4.0, zstd-sys 2.1.2 and tokio 1.54.1. These clear RUSTSEC-2026-0391,
+  -0398, -0403 and -0410, plus the unsound notices on those crates.
+- Not fixed here: RUSTSEC-2026-0387 (crypto-bigint 0.5, through k256 and
+  p256 0.13). It concerns timing on secret integers, and kryphocron uses
+  k256 and p256 only to verify signatures, where every input is public.
+  The fix needs the 0.14 line of those crates.
 
 ### Added
 
